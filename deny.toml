@@ -1,0 +1,37 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-2-Clause-Patent",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-3.0-or-later",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# `implied-vol` declares a bundled license file instead of an SPDX manifest field. The file is an
+# MIT license followed by attribution for permissively licensed upstream numerical routines.
+[[licenses.clarify]]
+crate = "implied-vol@2.0.0"
+expression = "MIT"
+license-files = [{ path = "LICENSE", hash = 0xb0803f0e }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/nautechsystems/nautilus_trader.git",
+]

@@ -1,0 +1,11 @@
+source: T-Bank Invest API proto contracts
+source_url: https://opensource.tbank.ru/invest/invest-contracts.git
+downloaded_at: 2026-07-08
+source_revision: ef3337c71b7d6dffe61dfdef814fc4e603004f8b
+source_revision_date: 2026-05-22T09:10:28Z
+source_revision_subject: Release_1.49
+notes:
+  - Vendored snapshot for tbank-nt-community v0.1.0.
+  - File checksums are pinned in proto/contracts.sha256.
+  - Update only through a separate task.
+  - Official GitLab contracts include signals.proto and google/api/field_behavior.proto.

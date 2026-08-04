@@ -1,0 +1,74 @@
+[package]
+name = "tbank-nt-community"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+authors = ["lusever"]
+license = "Apache-2.0"
+description = "Independent Rust-native T-Bank Invest API adapter for NautilusTrader"
+readme = "README.md"
+publish = false
+exclude = [".github/**", "AGENTS.md"]
+repository = "https://github.com/lusever/tbank-nt-community"
+homepage = "https://github.com/lusever/tbank-nt-community"
+documentation = "https://github.com/lusever/tbank-nt-community#readme"
+categories = ["api-bindings", "asynchronous", "finance"]
+keywords = ["trading", "nautilus", "tbank", "moex"]
+
+[workspace]
+resolver = "3"
+
+[lib]
+name = "tbank_nt_community"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "tbank-accounts"
+path = "src/bin/tbank_accounts.rs"
+required-features = ["tools"]
+
+[features]
+default = ["high-precision"]
+high-precision = ["nautilus-model/high-precision"]
+sandbox-tests = []
+tools = [
+    "dep:clap",
+    "dep:dotenvy",
+]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bon = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+futures-util = "0.3"
+http = "1"
+nautilus-common = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0", features = ["live", "tracing-bridge"] }
+nautilus-core = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
+nautilus-execution = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
+nautilus-live = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
+nautilus-model = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
+prost = { version = "0.14.4", default-features = false, features = ["std"] }
+prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
+rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen", "tls-aws-lc", "tls-webpki-roots"] }
+tonic-prost = "0.14.6"
+tracing = "0.1"
+ustr = "1"
+uuid = { version = "1", features = ["v4", "v5"] }
+zeroize = "1"
+
+[dev-dependencies]
+serde_json = "1"
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14.6", default-features = false, features = ["router", "server"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14.6"
