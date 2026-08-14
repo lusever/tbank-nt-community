@@ -17,5 +17,6 @@ pub fn sber_metadata() -> TbankInstrumentMetadata {
         exchange: "MOEX".to_string(),
         price_precision: 2,
         quantity_precision: 0,
+        ..Default::default()
     }
 }

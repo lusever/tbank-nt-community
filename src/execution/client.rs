@@ -12,7 +12,12 @@ use std::{
 };
 
 use crate::{
-    common::{Result, TbankAdapterError, time::unix_nanos_to_timestamp},
+    common::{
+        Result, TbankAdapterError,
+        error::REDACTED_BROKER_IDENTITY,
+        time::unix_nanos_to_timestamp,
+        venue::{TbankInstrumentType, TbankVenue},
+    },
     config::TbankExecutionClientConfig,
     execution::{
         TbankExecutionService, TbankSubmitOrder, build_post_order_request,
@@ -22,19 +27,20 @@ use crate::{
         TbankAuthInterceptor, TbankGrpcClients, connect_channel,
         generated::{
             CancelOrderRequest, CancelOrderResponse, CancelStopOrderRequest,
-            CancelStopOrderResponse, GetOperationsByCursorRequest, GetOperationsByCursorResponse,
-            GetOrderStateRequest, GetOrdersRequest, GetOrdersResponse, GetStopOrdersRequest,
-            GetStopOrdersResponse, InstrumentIdType, InstrumentRequest, MoneyValue, OperationItem,
-            OperationState, OperationType as TbankOperationType, OrderDirection,
+            CancelStopOrderResponse, GetFuturesMarginRequest, GetOperationsByCursorRequest,
+            GetOperationsByCursorResponse, GetOrderStateRequest, GetOrdersRequest,
+            GetOrdersResponse, GetStopOrdersRequest, GetStopOrdersResponse, InstrumentIdType,
+            InstrumentRequest, InstrumentType, MoneyValue, OperationItem, OperationState,
+            OperationType as TbankOperationType, OrderDirection,
             OrderExecutionReportStatus as TbankOrderExecutionReportStatus, OrderIdType, OrderState,
             OrderStateStreamRequest, OrderStateStreamResponse, PortfolioPosition, PortfolioRequest,
-            PortfolioResponse, PortfolioStreamRequest, PortfolioStreamResponse, PositionsRequest,
-            PositionsResponse, PositionsSecurities, PositionsStreamRequest,
+            PortfolioResponse, PortfolioStreamRequest, PortfolioStreamResponse, PositionsFutures,
+            PositionsRequest, PositionsResponse, PositionsSecurities, PositionsStreamRequest,
             PositionsStreamResponse, PostOrderResponse, PostStopOrderResponse, PriceType,
-            Quotation, StopOrder, StopOrderDirection, StopOrderStatusOption, StopOrderType,
-            TimeInForceType as TbankTimeInForceType, TradesStreamRequest, TradesStreamResponse,
-            get_orders_request, order_state_stream_response, portfolio_stream_response,
-            positions_stream_response, trades_stream_response,
+            Quotation, StopOrder, StopOrderStatusOption, TimeInForceType as TbankTimeInForceType,
+            TradesStreamRequest, TradesStreamResponse, get_orders_request,
+            order_state_stream_response, portfolio_stream_response, positions_stream_response,
+            trades_stream_response,
         },
         with_timeout,
     },
@@ -45,8 +51,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use nautilus_common::{
     clients::ExecutionClient,
-    live::{runner::get_exec_event_sender, runtime::get_runtime},
-    messages::execution::ExecutionReport,
+    live::{
+        runner::{get_exec_event_sender, try_get_data_event_sender},
+        runtime::get_runtime,
+    },
+    messages::{DataEvent, execution::ExecutionReport},
+    msgbus::{self, TypedHandler, switchboard},
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_execution::client::core::ExecutionClientCore;
@@ -59,12 +69,12 @@ use nautilus_model::{
     },
     events::{OrderCanceled, OrderEventAny},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue, VenueOrderId},
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 
 mod nautilus;
 mod reconciliation;
@@ -80,6 +90,57 @@ use translation::*;
 /// Nautilus execution parameter controlling T-Bank margin-trade confirmation.
 pub const TBANK_CONFIRM_MARGIN_TRADE_PARAM: &str = "tbank_confirm_margin_trade";
 
+fn log_tbank_rpc_failure(rpc: &'static str, error: &TbankAdapterError) {
+    match error {
+        TbankAdapterError::GrpcStatus { code, message } => {
+            let broker_code = message.trim();
+            let broker_code = if !broker_code.is_empty()
+                && broker_code.len() <= 16
+                && broker_code.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                broker_code
+            } else {
+                "<redacted>"
+            };
+            tracing::event!(
+                target: "tbank.rpc",
+                tracing::Level::WARN,
+                rpc,
+                grpc_code = ?code,
+                broker_code,
+                "T-Bank RPC failed"
+            );
+        }
+        TbankAdapterError::PermissionDenied(_) => {
+            tracing::event!(
+                target: "tbank.rpc",
+                tracing::Level::WARN,
+                rpc,
+                error_kind = "permission_denied",
+                "T-Bank RPC failed"
+            );
+        }
+        TbankAdapterError::RateLimited(_) => {
+            tracing::event!(
+                target: "tbank.rpc",
+                tracing::Level::WARN,
+                rpc,
+                error_kind = "rate_limited",
+                "T-Bank RPC failed"
+            );
+        }
+        _ => {
+            tracing::event!(
+                target: "tbank.rpc",
+                tracing::Level::WARN,
+                rpc,
+                error_kind = "adapter_error",
+                "T-Bank RPC failed"
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TbankExecutionRuntime {
     client_id: ClientId,
@@ -87,6 +148,10 @@ struct TbankExecutionRuntime {
     pub config: TbankExecutionClientConfig,
     clients: Option<TbankGrpcClients<TbankAuthInterceptor>>,
     instruments: Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
+    futures_margin_refreshed_at: Arc<Mutex<HashMap<String, Instant>>>,
+    futures_margin_inflight: TbankFuturesMarginFlights,
+    futures_margin_generation: Arc<Mutex<u64>>,
+    futures_margin_generation_id: u64,
     broker_order_index: Arc<Mutex<TbankBrokerOrderIndex>>,
     fill_projection: Arc<Mutex<TbankFillProjection>>,
     order_status_projection: Arc<Mutex<HashMap<String, TbankProjectedOrderStatus>>>,
@@ -99,6 +164,69 @@ struct TbankExecutionRuntime {
     command_tasks: Arc<Mutex<Vec<TbankCommandTask>>>,
     lifecycle_active: Arc<TbankLifecycleToken>,
     emitter: ExecutionEventEmitter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TbankInstrumentMetadataResolution {
+    Enabled,
+    OutOfScope,
+    Rejected,
+}
+
+fn instrument_metadata_identity(
+    instrument_uid: &str,
+    figi: &str,
+    ticker: &str,
+    class_code: &str,
+) -> String {
+    if !ticker.is_empty() && !class_code.is_empty() {
+        format!("ticker:{ticker}:{class_code}")
+    } else if !ticker.is_empty() {
+        format!("ticker:{ticker}")
+    } else if !class_code.is_empty() {
+        format!("class_code:{class_code}")
+    } else if !instrument_uid.is_empty() {
+        format!("instrument_uid:{instrument_uid}")
+    } else if !figi.is_empty() {
+        format!("figi:{figi}")
+    } else {
+        REDACTED_BROKER_IDENTITY.to_string()
+    }
+}
+
+#[cfg(test)]
+fn unresolved_instrument_metadata_error(ticker: &str, class_code: &str) -> TbankAdapterError {
+    TbankAdapterError::InstrumentMetadataUnresolved(instrument_metadata_identity(
+        "", "", ticker, class_code,
+    ))
+}
+
+fn invalid_instrument_identity_error(
+    instrument_uid: &str,
+    figi: &str,
+    ticker: &str,
+    class_code: &str,
+    reason: &str,
+) -> TbankAdapterError {
+    TbankAdapterError::InvalidInstrumentIdentity(format!(
+        "{}: {reason}",
+        instrument_metadata_identity(instrument_uid, figi, ticker, class_code)
+    ))
+}
+
+fn metadata_matches_event_identity(
+    metadata: &TbankInstrumentMetadata,
+    instrument_uid: &str,
+    figi: &str,
+    ticker: &str,
+    class_code: &str,
+) -> bool {
+    let uid_matches = instrument_uid.is_empty() || metadata.instrument_uid == instrument_uid;
+    let figi_matches = figi.is_empty() || metadata.figi == figi;
+    let ticker_matches = ticker.is_empty() || metadata.ticker.eq_ignore_ascii_case(ticker);
+    let class_code_matches =
+        class_code.is_empty() || metadata.class_code.eq_ignore_ascii_case(class_code);
+    uid_matches && figi_matches && ticker_matches && class_code_matches
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +245,7 @@ struct TbankCommandTask {
 pub struct TbankExecutionClient {
     core: ExecutionClientCore,
     runtime: TbankExecutionRuntime,
+    instrument_subscriptions: Vec<(Venue, TypedHandler<InstrumentAny>)>,
 }
 
 impl TbankExecutionClient {
@@ -131,7 +260,60 @@ impl TbankExecutionClient {
             core.base_currency,
         );
         let runtime = TbankExecutionRuntime::new(config, core.client_id, core.account_id, emitter);
-        Self { core, runtime }
+        Self {
+            core,
+            runtime,
+            instrument_subscriptions: Vec::new(),
+        }
+    }
+
+    /// Subscribes the execution client to every public venue handled by the broker.
+    ///
+    /// Nautilus' live-node builder subscribes the execution engine only to the client's
+    /// primary `venue()`. T-Bank is a multi-venue broker, so the adapter owns these additional
+    /// subscriptions and feeds the same runtime metadata cache used by order translation.
+    pub(crate) fn subscribe_instrument_updates(&mut self) {
+        if !self.instrument_subscriptions.is_empty() {
+            return;
+        }
+
+        for configured_venue in TbankVenue::all() {
+            let venue = configured_venue.venue();
+            let instruments = Arc::downgrade(&self.runtime.instruments);
+            let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
+                let Some(instruments) = instruments.upgrade() else {
+                    return;
+                };
+                let Some(metadata) = TbankInstrumentMetadata::from_instrument(instrument) else {
+                    tracing::warn!(
+                        instrument_id = %instrument.id(),
+                        "ignoring T-Bank instrument definition without adapter metadata"
+                    );
+                    return;
+                };
+                if metadata.venue != configured_venue || !metadata.is_supported() {
+                    return;
+                }
+                instruments
+                    .lock()
+                    .expect("instruments lock")
+                    .insert(metadata.instrument_id.clone(), metadata);
+            });
+            msgbus::subscribe_instruments(
+                switchboard::get_instruments_pattern(venue),
+                handler.clone(),
+                None,
+            );
+            self.instrument_subscriptions.push((venue, handler));
+            tracing::debug!(%venue, "subscribed T-Bank execution client to instrument definitions");
+        }
+    }
+
+    /// Removes the adapter-owned instrument subscriptions before replacing runtime state.
+    pub(crate) fn unsubscribe_instrument_updates(&mut self) {
+        for (venue, handler) in self.instrument_subscriptions.drain(..) {
+            msgbus::unsubscribe_instruments(switchboard::get_instruments_pattern(venue), &handler);
+        }
     }
 
     /// Connects the client to the configured T-Bank endpoint.
@@ -194,6 +376,7 @@ struct TbankOrderStreamContext {
     broker_order_index: Arc<Mutex<TbankBrokerOrderIndex>>,
     fill_projection: Arc<Mutex<TbankFillProjection>>,
     order_status_projection: Arc<Mutex<HashMap<String, TbankProjectedOrderStatus>>>,
+    instruments: Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
     reconnect_policy: crate::config::TbankReconnectPolicy,
     activated_stop_reconciliations: Arc<Mutex<HashSet<String>>>,
     regular_order_reconciliations: Arc<Mutex<HashSet<String>>>,
@@ -253,10 +436,12 @@ use super::broker_order_index::{
 
 #[cfg(test)]
 use super::projections::project_trade_fill_report;
+#[cfg(test)]
+use super::projections::record_position_projection_from_source;
 use super::projections::{
-    TbankFillProjection, TbankProjectedOrderStatus, TbankProjectedPosition,
-    apply_position_snapshot, merge_fill_projection_alias, project_cumulative_order_fill,
-    project_order_status_report, project_trade_fill_report_locked, reconcile_portfolio_snapshot,
+    TbankFillProjection, TbankPositionProjectionSource, TbankProjectedOrderStatus,
+    TbankProjectedPosition, apply_position_snapshot, merge_fill_projection_alias,
+    project_cumulative_order_fill, project_order_status_report, project_trade_fill_report_locked,
     record_position_projection,
 };
 
@@ -276,11 +461,12 @@ enum TbankCancelRecoveryOutcome {
     Active,
 }
 
-const STOP_ORDER_RECONCILIATION_CREATE_DATE_TOLERANCE_NANOS: u64 = 2_000_000_000;
 const SUBMIT_OUTCOME_RECOVERY_ATTEMPTS: u32 = 8;
+const STOP_ORDER_SUBMIT_RECONCILIATION_WINDOW: Duration = Duration::from_secs(5 * 60);
 const RECONNECT_RECONCILIATION_MAX_ATTEMPTS: u32 = 5;
 const CANCEL_OUTCOME_RECOVERY_ATTEMPTS: u32 = 5;
 const RECONNECT_RECONCILIATION_OVERLAP_NANOS: u64 = 5 * 60 * 1_000_000_000;
+const FUTURES_MARGIN_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_UNRESOLVED_TRADE_FILLS: usize = 1_024;
 const MAX_UNRESOLVED_TRADE_FILLS_PER_ORDER: usize = 64;
 
@@ -347,11 +533,40 @@ fn reconnect_reconciliation_from(last_observed_unix_nanos: &AtomicU64) -> i128 {
     )
 }
 
+const STOP_ORDER_SUBMIT_TIMESTAMP_TOLERANCE: Duration = Duration::from_secs(2);
+
+fn stop_order_submit_earliest_timestamp(submitted_ts: UnixNanos) -> u64 {
+    let tolerance_nanos =
+        u64::try_from(STOP_ORDER_SUBMIT_TIMESTAMP_TOLERANCE.as_nanos()).unwrap_or(u64::MAX);
+    submitted_ts.as_u64().saturating_sub(tolerance_nanos)
+}
+
+fn stop_order_submit_reconciliation_from(submitted_ts: UnixNanos) -> i128 {
+    let now = current_unix_nanos().as_u64();
+    let window_nanos =
+        u64::try_from(STOP_ORDER_SUBMIT_RECONCILIATION_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+    i128::from(
+        stop_order_submit_earliest_timestamp(submitted_ts).max(now.saturating_sub(window_nanos)),
+    )
+}
+
+fn stop_order_is_after_submit(stop: &StopOrder, submitted_ts: UnixNanos, query_from: i128) -> bool {
+    match stop.create_date.as_ref() {
+        Some(create_date) => timestamp_to_unix_nanos(create_date).is_ok_and(|created_ts| {
+            created_ts.as_u64() >= stop_order_submit_earliest_timestamp(submitted_ts)
+        }),
+        // The broker contract includes create_date. Test/reduced deployments may omit it; in
+        // that case trust only an untrimmed request whose lower bound includes the full skew
+        // tolerance. A reconciliation clamped by the bounded history window remains unresolved.
+        None => query_from == i128::from(stop_order_submit_earliest_timestamp(submitted_ts)),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TbankPendingSubmit {
     instrument_id: String,
     submitted_ts: UnixNanos,
-    quantity_shares: Decimal,
+    quantity_units: Decimal,
     side: crate::common::TbankOrderSide,
     order_type: crate::common::TbankOrderType,
     time_in_force: TimeInForce,
@@ -359,6 +574,49 @@ struct TbankPendingSubmit {
     venue_order_id: Option<String>,
     last_reconciliation_ts: Option<UnixNanos>,
     stage: TbankPendingSubmitStage,
+}
+
+#[derive(Clone)]
+enum TbankFuturesMarginFlightState {
+    Pending,
+    Completed(Box<TbankFuturesMarginResult>),
+    Cancelled,
+}
+
+type TbankFuturesMarginResult = std::result::Result<TbankInstrumentMetadata, TbankAdapterError>;
+
+struct TbankFuturesMarginFlight {
+    state: watch::Sender<TbankFuturesMarginFlightState>,
+    _receiver: watch::Receiver<TbankFuturesMarginFlightState>,
+}
+
+type TbankFuturesMarginFlights = Arc<Mutex<HashMap<String, Arc<TbankFuturesMarginFlight>>>>;
+
+struct TbankFuturesMarginFlightGuard {
+    flights: TbankFuturesMarginFlights,
+    cache_key: String,
+    flight: Arc<TbankFuturesMarginFlight>,
+}
+
+impl Drop for TbankFuturesMarginFlightGuard {
+    fn drop(&mut self) {
+        let mut flights = self.flights.lock().expect("futures_margin_inflight lock");
+        if flights
+            .get(&self.cache_key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            flights.remove(&self.cache_key);
+        }
+        if matches!(
+            &*self.flight.state.borrow(),
+            TbankFuturesMarginFlightState::Pending
+        ) {
+            let _ = self
+                .flight
+                .state
+                .send(TbankFuturesMarginFlightState::Cancelled);
+        }
+    }
 }
 
 impl TbankExecutionRuntime {
@@ -374,6 +632,10 @@ impl TbankExecutionRuntime {
             config,
             clients: None,
             instruments: Arc::new(Mutex::new(HashMap::new())),
+            futures_margin_refreshed_at: Arc::new(Mutex::new(HashMap::new())),
+            futures_margin_inflight: Arc::new(Mutex::new(HashMap::new())),
+            futures_margin_generation: Arc::new(Mutex::new(0)),
+            futures_margin_generation_id: 0,
             broker_order_index: Arc::new(Mutex::new(TbankBrokerOrderIndex::default())),
             fill_projection: Arc::new(Mutex::new(TbankFillProjection::default())),
             order_status_projection: Arc::new(Mutex::new(HashMap::new())),
@@ -511,7 +773,18 @@ impl TbankExecutionRuntime {
     fn reset_state(&mut self) {
         // Install fresh state containers so an already-polled task racing with abort cannot
         // repopulate the state used by the next lifecycle run.
+        let generation = {
+            let mut generation = self
+                .futures_margin_generation
+                .lock()
+                .expect("futures_margin_generation lock");
+            *generation = generation.saturating_add(1);
+            *generation
+        };
         self.instruments = Arc::new(Mutex::new(HashMap::new()));
+        self.futures_margin_refreshed_at = Arc::new(Mutex::new(HashMap::new()));
+        self.futures_margin_inflight = Arc::new(Mutex::new(HashMap::new()));
+        self.futures_margin_generation_id = generation;
         self.broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
         self.fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
         self.order_status_projection = Arc::new(Mutex::new(HashMap::new()));
@@ -523,6 +796,25 @@ impl TbankExecutionRuntime {
         self.reconciliation_tasks = Arc::new(Mutex::new(Vec::new()));
         self.command_tasks = Arc::new(Mutex::new(Vec::new()));
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(false));
+    }
+
+    fn begin_connection_generation(&mut self) {
+        // Freshness belongs to a broker connection generation. A reconnect must not let a
+        // previous session's futures contract suppress GetFuturesMargin for the new session.
+        // Replacing the Arc also prevents an in-flight task from the old generation from
+        // repopulating the cache used by the new one.
+        let generation = *self
+            .futures_margin_generation
+            .lock()
+            .expect("futures_margin_generation lock")
+            + 1;
+        *self
+            .futures_margin_generation
+            .lock()
+            .expect("futures_margin_generation lock") = generation;
+        self.futures_margin_generation_id = generation;
+        self.futures_margin_refreshed_at = Arc::new(Mutex::new(HashMap::new()));
+        self.futures_margin_inflight = Arc::new(Mutex::new(HashMap::new()));
     }
 
     fn account_id(&self) -> AccountId {
@@ -544,6 +836,7 @@ impl TbankExecutionRuntime {
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(&token)?;
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.begin_connection_generation();
         // A new token is a lifecycle generation. Clones from a previous connection retain the
         // invalidated token and cannot become active again after reconnect.
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
@@ -579,6 +872,7 @@ impl TbankExecutionRuntime {
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(&token)?;
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
         tracing::info!(
             environment = ?self.config.environment,
@@ -673,7 +967,7 @@ impl TbankExecutionRuntime {
             let task = get_runtime().spawn(async move {
                 let identity = TbankBrokerOrderIdentity {
                     route: TbankBrokerOrderRoute::RegularOrder,
-                    broker_order_id: Some(child_order_id.clone()),
+                    broker_order_id: child_order_id.clone(),
                 };
                 if let Err(error) = cancel_client.cancel_resolved_broker_order(identity).await {
                     tracing::error!(
@@ -727,7 +1021,7 @@ impl TbankExecutionRuntime {
         if should_cancel {
             let identity = TbankBrokerOrderIdentity {
                 route: TbankBrokerOrderRoute::RegularOrder,
-                broker_order_id: Some(child_order_id.to_string()),
+                broker_order_id: child_order_id.to_string(),
             };
             if let Err(error) = self.cancel_resolved_broker_order(identity).await {
                 tracing::error!(
@@ -752,7 +1046,7 @@ impl TbankExecutionRuntime {
         if should_cancel {
             let identity = TbankBrokerOrderIdentity {
                 route,
-                broker_order_id: Some(venue_order_id.to_string()),
+                broker_order_id: venue_order_id.to_string(),
             };
             if let Err(error) = self.cancel_resolved_broker_order(identity).await {
                 tracing::error!(
@@ -789,7 +1083,7 @@ impl TbankExecutionRuntime {
         if should_cancel {
             let identity = TbankBrokerOrderIdentity {
                 route: TbankBrokerOrderRoute::RegularOrder,
-                broker_order_id: Some(current_order_id.to_string()),
+                broker_order_id: current_order_id.to_string(),
             };
             if let Err(error) = self.cancel_resolved_broker_order(identity).await {
                 tracing::error!(
@@ -823,6 +1117,13 @@ impl TbankExecutionRuntime {
             .record_client_order_route(route, client_order_id);
     }
 
+    fn remove_unresolved_broker_order_route(&self, client_order_id: &str) {
+        self.broker_order_index
+            .lock()
+            .expect("broker_order_index lock")
+            .remove_unresolved_client_order_route(client_order_id);
+    }
+
     fn record_broker_order_id(&self, route: TbankBrokerOrderRoute, venue_order_id: &str) {
         self.broker_order_index
             .lock()
@@ -851,8 +1152,9 @@ impl TbankExecutionRuntime {
             TbankManagedOrderContext {
                 side: Some(order.side),
                 order_type: Some(order.order_type),
+                report_order_type: None,
                 time_in_force: Some(order.time_in_force),
-                quantity_shares: Some(order.quantity_shares),
+                quantity_units: Some(order.quantity_units),
                 trailing: order.trailing,
             },
         );
@@ -886,23 +1188,66 @@ impl TbankExecutionRuntime {
         Ok(())
     }
 
-    fn record_stop_order_context(&self, client_order_id: &str, stop: &StopOrder, lot_size: u32) {
+    fn record_stop_order_context(
+        &self,
+        client_order_id: &str,
+        stop: &StopOrder,
+        metadata: &TbankInstrumentMetadata,
+    ) {
+        let existing = self
+            .broker_order_index
+            .lock()
+            .expect("broker_order_index lock")
+            .managed_context_for_client_order_id(client_order_id);
+        let trailing = match trailing_params_from_stop(stop) {
+            Ok(Some(params)) => Some(params),
+            Ok(None) => existing.as_ref().and_then(|context| context.trailing),
+            Err(error) => {
+                tracing::warn!(%error, "could not preserve external T-Bank trailing-stop context");
+                existing.as_ref().and_then(|context| context.trailing)
+            }
+        };
         self.record_managed_order_context(
             client_order_id,
             TbankManagedOrderContext {
-                side: tbank_side_from_stop_direction(stop.direction),
-                order_type: tbank_order_type_from_stop_order(stop),
-                time_in_force: Some(TimeInForce::Gtc),
-                quantity_shares: Some(Decimal::from(stop.lots_requested) * Decimal::from(lot_size)),
-                trailing: match trailing_params_from_stop(stop) {
-                    Ok(params) => params,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not preserve external T-Bank trailing-stop context");
-                        None
-                    }
-                },
+                side: existing
+                    .as_ref()
+                    .and_then(|context| context.side)
+                    .or_else(|| tbank_side_from_stop_direction(stop.direction)),
+                order_type: existing
+                    .as_ref()
+                    .and_then(|context| context.order_type)
+                    .or_else(|| tbank_order_type_from_stop_order(stop)),
+                report_order_type: existing
+                    .as_ref()
+                    .and_then(|context| context.report_order_type)
+                    .or_else(|| Some(nautilus_stop_order_type(stop))),
+                time_in_force: existing
+                    .as_ref()
+                    .and_then(|context| context.time_in_force)
+                    .or(Some(TimeInForce::Gtc)),
+                quantity_units: existing
+                    .as_ref()
+                    .and_then(|context| context.quantity_units)
+                    .or_else(|| {
+                        Some(Decimal::from(stop.lots_requested) * Decimal::from(metadata.lot))
+                    }),
+                trailing,
             },
         );
+    }
+
+    fn managed_order_type_for_client_order_id(
+        &self,
+        client_order_id: Option<&str>,
+    ) -> Option<crate::common::TbankOrderType> {
+        client_order_id.and_then(|client_order_id| {
+            self.broker_order_index
+                .lock()
+                .expect("broker_order_index lock")
+                .managed_context_for_client_order_id(client_order_id)
+                .and_then(|context| context.order_type)
+        })
     }
 
     fn known_broker_order_identity(
@@ -945,6 +1290,7 @@ impl TbankExecutionRuntime {
         client_order_id: &str,
         venue_order_id: Option<&str>,
     ) -> Result<TbankCancelTarget> {
+        let venue_order_id = venue_order_id.filter(|venue_order_id| !venue_order_id.is_empty());
         let known_identity = {
             self.broker_order_index
                 .lock()
@@ -952,31 +1298,45 @@ impl TbankExecutionRuntime {
                 .identity_for(Some(client_order_id), venue_order_id)
         };
         if let Some(identity) = known_identity {
-            return match identity.broker_order_id.as_ref() {
-                Some(_) => Ok(TbankCancelTarget::Ready(identity)),
-                None => {
-                    self.broker_order_index
-                        .lock()
-                        .expect("broker_order_index lock")
-                        .record_pending_cancel(client_order_id);
-                    Ok(TbankCancelTarget::Pending {
-                        route: identity.route,
-                        client_order_id: client_order_id.to_string(),
-                    })
-                }
-            };
+            return Ok(TbankCancelTarget::Ready(identity));
+        }
+        let pending_route = {
+            let index = self
+                .broker_order_index
+                .lock()
+                .expect("broker_order_index lock");
+            index.route_for_client_order_id(client_order_id)
+        };
+        if let Some(route) = pending_route {
+            if let Some(venue_order_id) = venue_order_id {
+                return Ok(TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
+                    route,
+                    broker_order_id: venue_order_id.to_string(),
+                }));
+            }
+            self.broker_order_index
+                .lock()
+                .expect("broker_order_index lock")
+                .record_pending_cancel(client_order_id);
+            return Ok(TbankCancelTarget::Pending {
+                route,
+                client_order_id: client_order_id.to_string(),
+            });
         }
         if venue_order_id.is_some()
-            && let Some(identity) = self
-                .stop_order_identity_from_broker(client_order_id, venue_order_id)
-                .await?
+            && let Some(identity) = self.stop_order_identity_from_broker(venue_order_id).await?
         {
             return Ok(TbankCancelTarget::Ready(identity));
         }
-        Ok(TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
-            route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some(venue_order_id.unwrap_or(client_order_id).to_string()),
-        }))
+        if let Some(venue_order_id) = venue_order_id {
+            return Ok(TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
+                route: TbankBrokerOrderRoute::RegularOrder,
+                broker_order_id: venue_order_id.to_string(),
+            }));
+        }
+        Err(TbankAdapterError::BrokerOrderIdentityUnresolved(format!(
+            "client order {client_order_id} has no resolved broker order ID"
+        )))
     }
 
     async fn recover_ambiguous_cancel(
@@ -1062,11 +1422,7 @@ impl TbankExecutionRuntime {
         &mut self,
         identity: &TbankBrokerOrderIdentity,
     ) -> Result<bool> {
-        let broker_order_id = identity.broker_order_id.as_deref().ok_or_else(|| {
-            TbankAdapterError::ConfigError(
-                "T-Bank cancel reconciliation target is missing broker order id".to_string(),
-            )
-        })?;
+        let broker_order_id = identity.broker_order_id.as_str();
         let cancelled = match identity.route {
             TbankBrokerOrderRoute::RegularOrder => {
                 let state = self.query_order(broker_order_id).await?;
@@ -1130,14 +1486,9 @@ impl TbankExecutionRuntime {
 
     async fn stop_order_identity_from_broker(
         &mut self,
-        client_order_id: &str,
         venue_order_id: Option<&str>,
     ) -> Result<Option<TbankBrokerOrderIdentity>> {
-        let stops = self.query_stop_orders().await?.stop_orders;
-        let stop = stops.into_iter().find(|stop| {
-            stop.stop_order_id == client_order_id
-                || venue_order_id.is_some_and(|venue_order_id| stop.stop_order_id == venue_order_id)
-        });
+        let stop = self.stop_order_from_broker(venue_order_id).await?;
         let Some(stop) = stop else {
             return Ok(None);
         };
@@ -1147,7 +1498,29 @@ impl TbankExecutionRuntime {
         );
         Ok(Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::StopOrder,
-            broker_order_id: Some(stop.stop_order_id),
+            broker_order_id: stop.stop_order_id,
+        }))
+    }
+
+    async fn stop_order_from_broker(
+        &mut self,
+        venue_order_id: Option<&str>,
+    ) -> Result<Option<StopOrder>> {
+        let stops = match self.query_stop_orders_for_reconciliation(None).await {
+            Ok(response) => response.stop_orders,
+            // A venue may expose only the regular-order API in a test or reduced
+            // deployment. Preserve the regular-order fallback in that case.
+            Err(TbankAdapterError::GrpcStatus {
+                code: tonic::Code::Unimplemented,
+                ..
+            }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(stops.into_iter().find(|stop| {
+            venue_order_id.is_some_and(|venue_order_id| {
+                stop.stop_order_id == venue_order_id
+                    || stop.exchange_order_id.as_deref() == Some(venue_order_id)
+            })
         }))
     }
 
@@ -1160,7 +1533,7 @@ impl TbankExecutionRuntime {
                 TbankPendingSubmit {
                     instrument_id: order.instrument_id.clone(),
                     submitted_ts,
-                    quantity_shares: order.quantity_shares,
+                    quantity_units: order.quantity_units,
                     side: order.side,
                     order_type: order.order_type,
                     time_in_force: order.time_in_force,
@@ -1175,7 +1548,10 @@ impl TbankExecutionRuntime {
     fn prepare_submit_route(&self, client_order_id: &ClientOrderId, order_type: OrderType) {
         let route = if matches!(
             order_type,
-            OrderType::StopMarket | OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
+            OrderType::StopMarket
+                | OrderType::MarketIfTouched
+                | OrderType::TrailingStopMarket
+                | OrderType::TrailingStopLimit
         ) {
             TbankBrokerOrderRoute::StopOrder
         } else {
@@ -1206,7 +1582,7 @@ impl TbankExecutionRuntime {
             tracing::debug!(
                 instrument_id = %pending.instrument_id,
                 submitted_ts = %pending.submitted_ts,
-                quantity_shares = %pending.quantity_shares,
+                quantity_units = %pending.quantity_units,
                 side = ?pending.side,
                 order_type = ?pending.order_type,
                 stage = ?pending.stage,
@@ -1219,11 +1595,7 @@ impl TbankExecutionRuntime {
         mark_pending_submit_order_report(&self.pending_submits, report);
     }
 
-    fn mark_pending_submit_fill_report(&self, report: &FillReport) {
-        mark_pending_submit_fill_report(&self.pending_submits, report);
-    }
-
-    fn pending_submit_submitted_ts(&self, client_order_id: &str) -> Option<UnixNanos> {
+    fn pending_submit_timestamp(&self, client_order_id: &str) -> Option<UnixNanos> {
         self.pending_submits
             .lock()
             .expect("pending_submits lock")
@@ -1231,12 +1603,14 @@ impl TbankExecutionRuntime {
             .map(|pending| pending.submitted_ts)
     }
 
+    fn mark_pending_submit_fill_report(&self, report: &FillReport) {
+        mark_pending_submit_fill_report(&self.pending_submits, report);
+    }
+
     fn spawn_submit_outcome_recovery(
         &self,
         order: TbankSubmitOrder,
-        init: nautilus_model::events::OrderInitialized,
         metadata: TbankInstrumentMetadata,
-        submitted_ts: UnixNanos,
         ts_init: UnixNanos,
         emitter: ExecutionEventEmitter,
     ) {
@@ -1248,13 +1622,7 @@ impl TbankExecutionRuntime {
                 tokio::time::sleep(delay).await;
                 let reconciliation_ts = current_unix_nanos();
                 match client
-                    .reconcile_submit_outcome(
-                        &order,
-                        init.clone(),
-                        &metadata,
-                        submitted_ts,
-                        ts_init,
-                    )
+                    .reconcile_submit_outcome(&order, &metadata, ts_init)
                     .await
                 {
                     Ok(Some(reconciled)) => {
@@ -1304,9 +1672,23 @@ impl TbankExecutionRuntime {
         instrument: &TbankInstrumentMetadata,
     ) -> Result<TbankSubmitResponse> {
         let request_timeout = self.config.request_timeout;
-        self.ensure_broker_request_mapping(order)?;
+        if let Err(error) = self.ensure_broker_request_mapping(order) {
+            self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+            return Err(error);
+        }
         self.record_pending_submit(order, current_unix_nanos());
+        self.submit_order_request(order, instrument, request_timeout)
+            .await
+    }
+
+    async fn submit_order_request(
+        &mut self,
+        order: &TbankSubmitOrder,
+        instrument: &TbankInstrumentMetadata,
+        request_timeout: Duration,
+    ) -> Result<TbankSubmitResponse> {
         if let Err(error) = self.config.ensure_submit_allowed() {
+            self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
             self.mark_pending_submit_stage(
                 order.client_order_id.as_str(),
                 TbankPendingSubmitStage::Rejected,
@@ -1317,6 +1699,7 @@ impl TbankExecutionRuntime {
         let account_id = match self.config.resolve_account_id() {
             Ok(account_id) => account_id,
             Err(error) => {
+                self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
                 self.mark_pending_submit_stage(
                     order.client_order_id.as_str(),
                     TbankPendingSubmitStage::Rejected,
@@ -1333,7 +1716,15 @@ impl TbankExecutionRuntime {
 
         // Re-check at the mutation boundary in case disconnect invalidated this runtime clone
         // while the submit pipeline was resolving instrument metadata.
-        self.ensure_lifecycle_active()?;
+        if let Err(error) = self.ensure_lifecycle_active() {
+            self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+            self.mark_pending_submit_stage(
+                order.client_order_id.as_str(),
+                TbankPendingSubmitStage::Rejected,
+                None,
+            );
+            return Err(error);
+        }
 
         let result = match service {
             TbankExecutionService::LiveOrders => {
@@ -1380,9 +1771,16 @@ impl TbankExecutionRuntime {
                     }
                 }
                 crate::common::TbankOrderType::StopMarket
-                | crate::common::TbankOrderType::TakeProfitMarket
+                | crate::common::TbankOrderType::MarketIfTouched
                 | crate::common::TbankOrderType::TrailingStopMarket
                 | crate::common::TbankOrderType::TrailingStopLimit => {
+                    const RPC: &str = "SandboxService.PostSandboxStopOrder";
+                    tracing::debug!(
+                        rpc = RPC,
+                        instrument_id = %order.instrument_id,
+                        order_type = ?order.order_type,
+                        "calling T-Bank RPC"
+                    );
                     match build_post_stop_order_request(order, &account_id, instrument) {
                         Ok(request) => match self.clients_mut() {
                             Ok(clients) => clients
@@ -1401,31 +1799,62 @@ impl TbankExecutionRuntime {
             },
         };
 
+        if let Err(error) = &result {
+            let rpc = match service {
+                TbankExecutionService::Sandbox
+                    if matches!(
+                        order.order_type,
+                        crate::common::TbankOrderType::StopMarket
+                            | crate::common::TbankOrderType::MarketIfTouched
+                            | crate::common::TbankOrderType::TrailingStopMarket
+                            | crate::common::TbankOrderType::TrailingStopLimit
+                    ) =>
+                {
+                    "SandboxService.PostSandboxStopOrder"
+                }
+                TbankExecutionService::Sandbox => "SandboxService.PostSandboxOrder",
+                TbankExecutionService::LiveOrders => "OrdersService.PostOrder",
+                TbankExecutionService::LiveStopOrders => "StopOrdersService.PostStopOrder",
+            };
+            log_tbank_rpc_failure(rpc, error);
+        }
+
         match result {
             Ok(response) => {
+                let (route, broker_order_id, identity_name) = match &response {
+                    TbankSubmitResponse::Order(response) => (
+                        TbankBrokerOrderRoute::RegularOrder,
+                        response.order_id.as_str(),
+                        "order_id",
+                    ),
+                    TbankSubmitResponse::StopOrder(response) => (
+                        TbankBrokerOrderRoute::StopOrder,
+                        response.stop_order_id.as_str(),
+                        "stop_order_id",
+                    ),
+                };
+                if broker_order_id.is_empty() {
+                    let error = TbankAdapterError::SubmitOutcomeUnknown(format!(
+                        "submit response is missing {identity_name}"
+                    ));
+                    self.mark_pending_submit_stage(
+                        order.client_order_id.as_str(),
+                        TbankPendingSubmitStage::Unknown,
+                        Some(current_unix_nanos()),
+                    );
+                    return Err(error);
+                }
                 self.mark_pending_submit_stage(
                     order.client_order_id.as_str(),
                     pending_stage_after_submit_response(&response),
                     None,
                 );
-                match &response {
-                    TbankSubmitResponse::Order(response) => {
-                        self.record_broker_order_mapping_and_drain_cancel(
-                            TbankBrokerOrderRoute::RegularOrder,
-                            order.client_order_id.as_str(),
-                            response.order_id.as_str(),
-                        )
-                        .await
-                    }
-                    TbankSubmitResponse::StopOrder(response) => {
-                        self.record_broker_order_mapping_and_drain_cancel(
-                            TbankBrokerOrderRoute::StopOrder,
-                            order.client_order_id.as_str(),
-                            response.stop_order_id.as_str(),
-                        )
-                        .await
-                    }
-                }
+                self.record_broker_order_mapping_and_drain_cancel(
+                    route,
+                    order.client_order_id.as_str(),
+                    broker_order_id,
+                )
+                .await;
                 Ok(response)
             }
             Err(error) => {
@@ -1433,6 +1862,7 @@ impl TbankExecutionRuntime {
                     classify_submit_failure(&error),
                     SubmitFailureKind::LocalRejected | SubmitFailureKind::BrokerRejected
                 ) {
+                    self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
                     self.mark_pending_submit_stage(
                         order.client_order_id.as_str(),
                         TbankPendingSubmitStage::Rejected,
@@ -1552,12 +1982,7 @@ impl TbankExecutionRuntime {
         &mut self,
         identity: TbankBrokerOrderIdentity,
     ) -> Result<()> {
-        let Some(broker_order_id) = identity.broker_order_id else {
-            return Err(TbankAdapterError::ConfigError(format!(
-                "T-Bank {:?} cancel target is missing broker order id",
-                identity.route
-            )));
-        };
+        let broker_order_id = identity.broker_order_id;
         match identity.route {
             TbankBrokerOrderRoute::RegularOrder => {
                 TbankExecutionRuntime::cancel_order(self, broker_order_id.as_str()).await?;
@@ -1579,7 +2004,7 @@ impl TbankExecutionRuntime {
             .into_iter()
             .map(|order| TbankBrokerOrderIdentity {
                 route: TbankBrokerOrderRoute::RegularOrder,
-                broker_order_id: Some(order.order_id),
+                broker_order_id: order.order_id,
             })
             .chain(
                 stops
@@ -1587,7 +2012,7 @@ impl TbankExecutionRuntime {
                     .into_iter()
                     .map(|stop| TbankBrokerOrderIdentity {
                         route: TbankBrokerOrderRoute::StopOrder,
-                        broker_order_id: Some(stop.stop_order_id),
+                        broker_order_id: stop.stop_order_id,
                     }),
             );
         let mut cancelled = 0;
@@ -1636,23 +2061,32 @@ impl TbankExecutionRuntime {
             order_id_type: Some(order_id_type as i32),
         };
         let request = with_timeout(request, self.config.request_timeout);
+        let rpc = if self.config.environment.is_live() {
+            "OrdersService.GetOrderState"
+        } else {
+            "SandboxService.GetSandboxOrderState"
+        };
 
-        if self.config.environment.is_live() {
-            Ok(self
-                .clients_mut()?
+        let response = if self.config.environment.is_live() {
+            self.clients_mut()?
                 .orders
                 .get_order_state(request)
                 .await
-                .map_err(TbankAdapterError::from)?
-                .into_inner())
+                .map(|response| response.into_inner())
         } else {
-            Ok(self
-                .clients_mut()?
+            self.clients_mut()?
                 .sandbox
                 .get_sandbox_order_state(request)
                 .await
-                .map_err(TbankAdapterError::from)?
-                .into_inner())
+                .map(|response| response.into_inner())
+        };
+        match response {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let error = TbankAdapterError::from(error);
+                log_tbank_rpc_failure(rpc, &error);
+                Err(error)
+            }
         }
     }
 
@@ -1868,23 +2302,32 @@ impl TbankExecutionRuntime {
             to,
         };
         let request = with_timeout(request, self.config.request_timeout);
+        let rpc = if self.config.environment.is_live() {
+            "StopOrdersService.GetStopOrders"
+        } else {
+            "SandboxService.GetSandboxStopOrders"
+        };
 
-        if self.config.environment.is_live() {
-            Ok(self
-                .clients_mut()?
+        let response = if self.config.environment.is_live() {
+            self.clients_mut()?
                 .stop_orders
                 .get_stop_orders(request)
                 .await
-                .map_err(TbankAdapterError::from)?
-                .into_inner())
+                .map(|response| response.into_inner())
         } else {
-            Ok(self
-                .clients_mut()?
+            self.clients_mut()?
                 .sandbox
                 .get_sandbox_stop_orders(request)
                 .await
-                .map_err(TbankAdapterError::from)?
-                .into_inner())
+                .map(|response| response.into_inner())
+        };
+        match response {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let error = TbankAdapterError::from(error);
+                log_tbank_rpc_failure(rpc, &error);
+                Err(error)
+            }
         }
     }
 
@@ -1895,23 +2338,32 @@ impl TbankExecutionRuntime {
             currency: None,
         };
         let request = with_timeout(request, self.config.request_timeout);
+        let rpc = if self.config.environment.is_live() {
+            "OperationsService.GetPortfolio"
+        } else {
+            "SandboxService.GetSandboxPortfolio"
+        };
 
-        if self.config.environment.is_live() {
-            Ok(self
-                .clients_mut()?
+        let response = if self.config.environment.is_live() {
+            self.clients_mut()?
                 .operations
                 .get_portfolio(request)
                 .await
-                .map_err(TbankAdapterError::from)?
-                .into_inner())
+                .map(|response| response.into_inner())
         } else {
-            Ok(self
-                .clients_mut()?
+            self.clients_mut()?
                 .sandbox
                 .get_sandbox_portfolio(request)
                 .await
-                .map_err(TbankAdapterError::from)?
-                .into_inner())
+                .map(|response| response.into_inner())
+        };
+        match response {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let error = TbankAdapterError::from(error);
+                log_tbank_rpc_failure(rpc, &error);
+                Err(error)
+            }
         }
     }
 
@@ -2035,9 +2487,7 @@ impl TbankExecutionRuntime {
     pub async fn reconcile_submit_outcome(
         &mut self,
         order: &TbankSubmitOrder,
-        init: nautilus_model::events::OrderInitialized,
         metadata: &TbankInstrumentMetadata,
-        submitted_ts: UnixNanos,
         ts_init: UnixNanos,
     ) -> anyhow::Result<Option<TbankOrderReconciliationReports>> {
         match order.service(self.config.environment) {
@@ -2046,19 +2496,19 @@ impl TbankExecutionRuntime {
                     .await
             }
             TbankExecutionService::LiveStopOrders => {
-                self.reconcile_stop_order_submit(order, init, metadata, submitted_ts, ts_init)
+                self.reconcile_stop_order_submit_outcome(order, metadata, ts_init)
                     .await
             }
             TbankExecutionService::Sandbox
                 if matches!(
                     order.order_type,
                     crate::common::TbankOrderType::StopMarket
-                        | crate::common::TbankOrderType::TakeProfitMarket
+                        | crate::common::TbankOrderType::MarketIfTouched
                         | crate::common::TbankOrderType::TrailingStopMarket
                         | crate::common::TbankOrderType::TrailingStopLimit
                 ) =>
             {
-                self.reconcile_stop_order_submit(order, init, metadata, submitted_ts, ts_init)
+                self.reconcile_stop_order_submit_outcome(order, metadata, ts_init)
                     .await
             }
             TbankExecutionService::Sandbox => {
@@ -2068,122 +2518,63 @@ impl TbankExecutionRuntime {
         }
     }
 
-    async fn reconcile_stop_order_submit(
+    async fn reconcile_stop_order_submit_outcome(
         &mut self,
         order: &TbankSubmitOrder,
-        init: nautilus_model::events::OrderInitialized,
         metadata: &TbankInstrumentMetadata,
-        submitted_ts: UnixNanos,
         ts_init: UnixNanos,
     ) -> anyhow::Result<Option<TbankOrderReconciliationReports>> {
-        let stops = self
-            .query_stop_orders_for_reconciliation(Some(i128::from(submitted_ts.as_u64())))
+        let Some(submitted_ts) = self.pending_submit_timestamp(order.client_order_id.as_str())
+        else {
+            return Err(anyhow::anyhow!(
+                "T-Bank stop-order submit has no pending timestamp for bounded reconciliation"
+            ));
+        };
+        let query_from = stop_order_submit_reconciliation_from(submitted_ts);
+        // GetStopOrders omits order_request_id. Query only active orders and terminal orders from
+        // the bounded submit window, then accept exactly one full wire-shape match. Ambiguity must
+        // remain outcome-unknown.
+        let stop_orders = self
+            .query_stop_orders_for_reconciliation(Some(query_from))
             .await?
             .stop_orders;
-        let matches = stops
-            .into_iter()
-            .filter(|stop| self.stop_order_matches_submit(stop, order, metadata, submitted_ts))
-            .collect::<Vec<_>>();
-        let stop = match matches.as_slice() {
-            [stop] => stop.clone(),
-            [] => {
-                tracing::warn!(
-                    client_order_id = %order.client_order_id,
-                    instrument_id = %order.instrument_id,
-                    "T-Bank stop-order submit reconciliation found no matching stop order"
-                );
-                return Ok(None);
-            }
-            _ => {
-                tracing::warn!(
-                    client_order_id = %order.client_order_id,
-                    instrument_id = %order.instrument_id,
-                    matches = matches.len(),
-                    "T-Bank stop-order submit reconciliation found ambiguous stop orders"
-                );
-                return Ok(None);
-            }
+        let candidates = {
+            let broker_order_index = self
+                .broker_order_index
+                .lock()
+                .expect("broker_order_index lock");
+            stop_orders
+                .into_iter()
+                .filter(|stop| {
+                    broker_order_index
+                        .identity_for(None, Some(stop.stop_order_id.as_str()))
+                        .is_none()
+                })
+                .filter(|stop| stop_order_is_after_submit(stop, submitted_ts, query_from))
+                .filter(|stop| stop_order_matches_submit(order, metadata, stop))
+                .collect::<Vec<_>>()
         };
-        self.record_broker_order_mapping_and_drain_cancel(
-            TbankBrokerOrderRoute::StopOrder,
-            order.client_order_id.as_str(),
-            stop.stop_order_id.as_str(),
-        )
-        .await;
-        let report = stop_order_status_report_from_reconciled_submit(
-            self.account_id(),
-            init,
-            stop,
-            ts_init,
-            metadata.lot,
-        )?;
-        self.mark_pending_submit_report(&report);
-        Ok(Some(TbankOrderReconciliationReports {
-            order_report: report,
+        let [stop] = candidates.as_slice() else {
+            if candidates.len() > 1 {
+                tracing::warn!(
+                    client_order_id = %order.client_order_id,
+                    candidates = candidates.len(),
+                    "T-Bank stop-order submit reconciliation found ambiguous broker candidates"
+                );
+            }
+            return Ok(None);
+        };
+        let report = self
+            .stop_order_status_report_for_stop(
+                Some(ClientOrderId::from(order.client_order_id.as_str())),
+                stop.clone(),
+                ts_init,
+            )
+            .await?;
+        Ok(report.map(|order_report| TbankOrderReconciliationReports {
+            order_report,
             fill_reports: Vec::new(),
         }))
-    }
-
-    fn stop_order_matches_submit(
-        &self,
-        stop: &StopOrder,
-        order: &TbankSubmitOrder,
-        metadata: &TbankInstrumentMetadata,
-        submitted_ts: UnixNanos,
-    ) -> bool {
-        if self
-            .broker_order_index
-            .lock()
-            .expect("broker_order_index lock")
-            .identity_for(None, Some(stop.stop_order_id.as_str()))
-            .is_some()
-        {
-            return false;
-        }
-        if stop.instrument_uid != metadata.instrument_uid {
-            return false;
-        }
-        if StopOrderDirection::try_from(stop.direction).ok()
-            != Some(order.side.to_stop_order_direction())
-        {
-            return false;
-        }
-        if StopOrderType::try_from(stop.order_type).ok() != order.order_type.to_stop_order_type() {
-            return false;
-        }
-        let expected_lots = match crate::common::decimal::quantity_shares_to_lots(
-            order.quantity_shares,
-            metadata.lot,
-        ) {
-            Ok(lots) => lots,
-            Err(_) => return false,
-        };
-        if stop.lots_requested != expected_lots {
-            return false;
-        }
-        let Some(expected_trigger_price) = order.trigger_price else {
-            return false;
-        };
-        if stop
-            .stop_price
-            .as_ref()
-            .map(crate::common::decimal::money_value_to_decimal)
-            != Some(expected_trigger_price)
-        {
-            return false;
-        }
-        if let Some(create_date) = stop.create_date.as_ref() {
-            match timestamp_to_unix_nanos(create_date) {
-                Ok(create_ts)
-                    if !stop_order_create_date_matches_submit_window(create_ts, submitted_ts) =>
-                {
-                    return false;
-                }
-                Err(_) => return false,
-                _ => {}
-            }
-        }
-        true
     }
 
     fn reconciled_fill_reports_from_state(
@@ -2293,6 +2684,10 @@ impl TbankExecutionRuntime {
             config: self.config.clone(),
             clients: self.clients.clone(),
             instruments: self.instruments.clone(),
+            futures_margin_refreshed_at: self.futures_margin_refreshed_at.clone(),
+            futures_margin_inflight: self.futures_margin_inflight.clone(),
+            futures_margin_generation: self.futures_margin_generation.clone(),
+            futures_margin_generation_id: self.futures_margin_generation_id,
             broker_order_index: self.broker_order_index.clone(),
             fill_projection: self.fill_projection.clone(),
             order_status_projection: self.order_status_projection.clone(),
@@ -2333,6 +2728,7 @@ impl TbankExecutionRuntime {
             broker_order_index: self.broker_order_index.clone(),
             fill_projection: self.fill_projection.clone(),
             order_status_projection: self.order_status_projection.clone(),
+            instruments: self.instruments.clone(),
             reconnect_policy: self.config.reconnect_policy.clone(),
             activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
             regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
@@ -2549,7 +2945,9 @@ impl TbankExecutionRuntime {
         let portfolio_account = account_id.clone();
         let portfolio_emitter = self.emitter.clone();
         let portfolio_position_projection = self.position_projection.clone();
+        let portfolio_instruments = self.instruments.clone();
         let portfolio_lifecycle_active = self.lifecycle_active.clone();
+        let portfolio_query_client = self.detached_query_clone();
         let portfolio_reconnect_policy = self.config.reconnect_policy.clone();
         let portfolio_task = get_runtime().spawn(async move {
             let request = PortfolioStreamRequest {
@@ -2566,7 +2964,9 @@ impl TbankExecutionRuntime {
                             stream,
                             portfolio_emitter.clone(),
                             portfolio_position_projection.clone(),
+                            portfolio_instruments.clone(),
                             portfolio_lifecycle_active.clone(),
+                            portfolio_query_client.clone(),
                         )
                         .await;
                         match stream_result {
@@ -2599,7 +2999,9 @@ impl TbankExecutionRuntime {
         let positions_account = account_id;
         let positions_emitter = self.emitter.clone();
         let positions_projection = self.position_projection.clone();
+        let positions_instruments = self.instruments.clone();
         let positions_lifecycle_active = self.lifecycle_active.clone();
+        let positions_query_client = self.detached_query_clone();
         let positions_reconnect_policy = self.config.reconnect_policy.clone();
         let positions_task = get_runtime().spawn(async move {
             let request = PositionsStreamRequest {
@@ -2617,7 +3019,9 @@ impl TbankExecutionRuntime {
                             stream,
                             positions_emitter.clone(),
                             positions_projection.clone(),
+                            positions_instruments.clone(),
                             positions_lifecycle_active.clone(),
+                            positions_query_client.clone(),
                         )
                         .await;
                         match stream_result {
@@ -2666,68 +3070,444 @@ impl TbankExecutionRuntime {
         &mut self,
         instrument_id: &str,
     ) -> Result<TbankInstrumentMetadata> {
-        if let Some(metadata) = self
+        let cached_metadata = self
             .instruments
             .lock()
             .expect("instruments lock")
             .get(instrument_id)
-            .cloned()
-        {
-            return Ok(metadata);
+            .cloned();
+        if let Some(metadata) = cached_metadata {
+            self.ensure_metadata_supported(&metadata)?;
+            if metadata.instrument_type != TbankInstrumentType::Futures
+                || metadata.conservative_initial_margin_rate().is_some()
+            {
+                return self.refresh_futures_margin(metadata).await;
+            }
+
+            // A persisted FuturesContract is only a cache seed. The current v0.2 futures
+            // contract requires both T-Bank risk rates from FutureBy; an older or otherwise
+            // incomplete definition must not be passed to GetFuturesMargin and rebuilt as if it
+            // were current. Drop it and resolve the authoritative definition below.
+            self.instruments
+                .lock()
+                .expect("instruments lock")
+                .remove(instrument_id);
+            self.futures_margin_refreshed_at
+                .lock()
+                .expect("futures_margin_refreshed_at lock")
+                .remove(instrument_id);
         }
 
         let parts = crate::common::ids::TbankInstrumentIdParts::from_str(instrument_id)?;
-        if !parts.is_moex_tqbr_equity() {
+        let is_share = parts.is_spbe_share() || parts.is_moex_tqbr_equity();
+        let is_moex_futures = parts.is_moex_futures();
+        let request = InstrumentRequest {
+            id_type: InstrumentIdType::Ticker as i32,
+            class_code: Some(parts.class_code),
+            id: parts.ticker,
+        };
+        let metadata = if is_share {
+            self.fetch_share_metadata(request, instrument_id).await?
+        } else if is_moex_futures {
+            self.fetch_future_metadata(request, instrument_id).await?
+        } else {
             return Err(TbankAdapterError::UnsupportedInstrument(
                 instrument_id.to_string(),
             ));
+        };
+        if metadata.instrument_id != instrument_id {
+            return Err(TbankAdapterError::InstrumentNotFound(
+                instrument_id.to_string(),
+            ));
         }
-        let request = with_timeout(
-            InstrumentRequest {
-                id_type: InstrumentIdType::Ticker as i32,
-                class_code: Some(parts.class_code),
-                id: parts.ticker,
-            },
-            self.config.request_timeout,
-        );
-        let response = self
-            .clients_mut()?
-            .instruments
-            .share_by(request)
-            .await
-            .map_err(TbankAdapterError::from)?
-            .into_inner();
-        let share = response
-            .instrument
-            .ok_or_else(|| TbankAdapterError::InstrumentNotFound(instrument_id.to_string()))?;
-        let metadata = TbankInstrumentMetadata::from_share(&share)?;
-        self.instruments
+        self.ensure_metadata_supported(&metadata)?;
+        self.cache_instrument_metadata(metadata.clone());
+        self.refresh_futures_margin(metadata).await
+    }
+
+    async fn refresh_futures_margin(
+        &mut self,
+        metadata: TbankInstrumentMetadata,
+    ) -> Result<TbankInstrumentMetadata> {
+        if !metadata.price_in_points {
+            return Ok(metadata);
+        }
+        let cache_key = metadata.instrument_id.clone();
+        let expected_generation = self.futures_margin_generation_id;
+        loop {
+            // Hold the generation lock across the cache/flight transition. If reconnect has
+            // already advanced the generation, reject this detached runtime before it can
+            // observe any state belonging to the previous connection.
+            let (flight, is_leader) = {
+                let generation_guard = self
+                    .futures_margin_generation
+                    .lock()
+                    .expect("futures_margin_generation lock");
+                if *generation_guard != expected_generation {
+                    return Err(TbankAdapterError::FuturesMarginUnresolved(format!(
+                        "discarding stale futures margin request for {}",
+                        metadata.instrument_id
+                    )));
+                }
+
+                let margin_is_fresh = self
+                    .futures_margin_refreshed_at
+                    .lock()
+                    .expect("futures_margin_refreshed_at lock")
+                    .get(&cache_key)
+                    .is_some_and(|refreshed_at| refreshed_at.elapsed() < FUTURES_MARGIN_CACHE_TTL);
+                if margin_is_fresh {
+                    return Ok(self
+                        .instruments
+                        .lock()
+                        .expect("instruments lock")
+                        .get(&cache_key)
+                        .cloned()
+                        .unwrap_or_else(|| metadata.clone()));
+                }
+
+                let mut flights = self
+                    .futures_margin_inflight
+                    .lock()
+                    .expect("futures_margin_inflight lock");
+                if let Some(flight) = flights.get(&cache_key) {
+                    (Arc::clone(flight), false)
+                } else {
+                    let (state, receiver) = watch::channel(TbankFuturesMarginFlightState::Pending);
+                    let flight = Arc::new(TbankFuturesMarginFlight {
+                        state,
+                        _receiver: receiver,
+                    });
+                    flights.insert(cache_key.clone(), Arc::clone(&flight));
+                    (flight, true)
+                }
+            };
+
+            if !is_leader {
+                let mut state = flight.state.subscribe();
+                loop {
+                    let current_state = state.borrow().clone();
+                    match current_state {
+                        TbankFuturesMarginFlightState::Completed(result) => {
+                            let generation_guard = self
+                                .futures_margin_generation
+                                .lock()
+                                .expect("futures_margin_generation lock");
+                            if *generation_guard != expected_generation {
+                                return Err(TbankAdapterError::FuturesMarginUnresolved(format!(
+                                    "discarding stale futures margin response for {}",
+                                    metadata.instrument_id
+                                )));
+                            }
+                            return *result;
+                        }
+                        TbankFuturesMarginFlightState::Cancelled => break,
+                        TbankFuturesMarginFlightState::Pending => {
+                            if state.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let _flight_guard = TbankFuturesMarginFlightGuard {
+                flights: Arc::clone(&self.futures_margin_inflight),
+                cache_key: cache_key.clone(),
+                flight: Arc::clone(&flight),
+            };
+            let result = self
+                .refresh_futures_margin_uncached(
+                    metadata.clone(),
+                    cache_key.clone(),
+                    expected_generation,
+                )
+                .await;
+
+            let generation_guard = self
+                .futures_margin_generation
+                .lock()
+                .expect("futures_margin_generation lock");
+            if *generation_guard != expected_generation {
+                let result = Err(TbankAdapterError::FuturesMarginUnresolved(format!(
+                    "discarding stale futures margin response for {}",
+                    metadata.instrument_id
+                )));
+                let _ = flight
+                    .state
+                    .send(TbankFuturesMarginFlightState::Completed(Box::new(
+                        result.clone(),
+                    )));
+                return result;
+            }
+            let _ = flight
+                .state
+                .send(TbankFuturesMarginFlightState::Completed(Box::new(
+                    result.clone(),
+                )));
+            return result;
+        }
+    }
+
+    async fn refresh_futures_margin_uncached(
+        &mut self,
+        mut metadata: TbankInstrumentMetadata,
+        cache_key: String,
+        generation: u64,
+    ) -> Result<TbankInstrumentMetadata> {
+        let instrument_id = metadata.futures_margin_instrument_id()?;
+        let request = GetFuturesMarginRequest {
+            #[allow(deprecated)]
+            figi: String::new(),
+            instrument_id,
+        };
+        let request_timeout = self.config.request_timeout;
+        let response =
+            self.clients_mut()?
+                .instruments
+                .get_futures_margin(with_timeout(request, request_timeout))
+                .await
+                .map_err(|status| {
+                    let error = TbankAdapterError::from(status);
+                    log_tbank_rpc_failure("InstrumentsService.GetFuturesMargin", &error);
+                    match error {
+                        TbankAdapterError::PermissionDenied(_)
+                        | TbankAdapterError::RateLimited(_) => error,
+                        error => TbankAdapterError::FuturesMarginUnresolved(format!(
+                            "{}: {error}",
+                            metadata.instrument_id
+                        )),
+                    }
+                })?
+                .into_inner();
+        metadata.update_futures_margin_contract(&response)?;
+
+        let generation_guard = self
+            .futures_margin_generation
             .lock()
-            .expect("instruments lock")
-            .insert(metadata.instrument_id.clone(), metadata.clone());
+            .expect("futures_margin_generation lock");
+        if *generation_guard != generation {
+            return Err(TbankAdapterError::FuturesMarginUnresolved(format!(
+                "discarding stale futures margin response for {}",
+                metadata.instrument_id
+            )));
+        }
+
+        // The Nautilus cache is the shared instrument owner. Publish the rebuilt definition
+        // before committing the execution metadata, so market-data and risk consumers cannot
+        // observe a partially applied tick/multiplier/GO update.
+        let instrument =
+            crate::instruments::build_futures_instrument(&metadata).map_err(|error| {
+                TbankAdapterError::FuturesMarginUnresolved(format!(
+                    "cannot publish current futures risk definition for {}: {error}",
+                    metadata.instrument_id
+                ))
+            })?;
+        if let Some(sender) = try_get_data_event_sender() {
+            sender
+                .send(DataEvent::Instrument(instrument))
+                .map_err(|error| {
+                    TbankAdapterError::ConversionError(format!(
+                        "failed to publish current futures instrument definition: {error}"
+                    ))
+                })?;
+        }
+        self.cache_instrument_metadata(metadata.clone());
+        self.futures_margin_refreshed_at
+            .lock()
+            .expect("futures_margin_refreshed_at lock")
+            .insert(cache_key, Instant::now());
+        drop(generation_guard);
         Ok(metadata)
     }
 
-    async fn lot_size_for_stop_order(&mut self, stop: &StopOrder) -> Result<u32> {
-        if !stop.ticker.is_empty() && !stop.class_code.is_empty() {
-            let instrument_id =
-                crate::common::ids::instrument_id_from_ticker_class(&stop.ticker, &stop.class_code);
-            match self.load_instrument_metadata(&instrument_id).await {
-                Ok(metadata) => return Ok(metadata.lot),
-                Err(error) if tbank_adapter_error_is_transient(&error) => return Err(error),
-                Err(_) => {}
-            }
+    fn ensure_metadata_supported(&self, metadata: &TbankInstrumentMetadata) -> Result<()> {
+        if !metadata.is_supported() {
+            return Err(TbankAdapterError::InstrumentOutOfScope(
+                metadata.instrument_id.clone(),
+            ));
         }
-        Ok(self
-            .instruments
+        Ok(())
+    }
+
+    fn cache_instrument_metadata(&self, metadata: TbankInstrumentMetadata) {
+        self.instruments
             .lock()
             .expect("instruments lock")
-            .values()
-            .find(|metadata| {
-                metadata.instrument_uid == stop.instrument_uid || metadata.figi == stop.figi
-            })
-            .map(|metadata| metadata.lot)
-            .unwrap_or(1))
+            .insert(metadata.instrument_id.clone(), metadata);
+    }
+
+    async fn fetch_share_metadata(
+        &mut self,
+        request: InstrumentRequest,
+        requested_id: &str,
+    ) -> Result<TbankInstrumentMetadata> {
+        let request_timeout = self.config.request_timeout;
+        let response = self
+            .clients_mut()?
+            .instruments
+            .share_by(with_timeout(request, request_timeout))
+            .await
+            .map_err(|status| {
+                let error = TbankAdapterError::from(status);
+                log_tbank_rpc_failure("InstrumentsService.ShareBy", &error);
+                error
+            })?
+            .into_inner();
+        let share = response
+            .instrument
+            .ok_or_else(|| TbankAdapterError::InstrumentNotFound(requested_id.to_string()))?;
+        let metadata = TbankInstrumentMetadata::from_share(&share)?;
+        Ok(metadata)
+    }
+
+    async fn fetch_future_metadata(
+        &mut self,
+        request: InstrumentRequest,
+        requested_id: &str,
+    ) -> Result<TbankInstrumentMetadata> {
+        let request_timeout = self.config.request_timeout;
+        let response = self
+            .clients_mut()?
+            .instruments
+            .future_by(with_timeout(request, request_timeout))
+            .await
+            .map_err(|status| {
+                let error = TbankAdapterError::from(status);
+                log_tbank_rpc_failure("InstrumentsService.FutureBy", &error);
+                error
+            })?
+            .into_inner();
+        let future = response
+            .instrument
+            .ok_or_else(|| TbankAdapterError::InstrumentNotFound(requested_id.to_string()))?;
+        let metadata = TbankInstrumentMetadata::from_future(&future)?;
+        Ok(metadata)
+    }
+
+    fn metadata_lookup_error_is_miss(error: &TbankAdapterError) -> bool {
+        match error {
+            TbankAdapterError::InstrumentNotFound(_) => true,
+            TbankAdapterError::GrpcStatus { code, .. } => matches!(
+                *code,
+                tonic::Code::InvalidArgument | tonic::Code::NotFound | tonic::Code::Unimplemented
+            ),
+            _ => false,
+        }
+    }
+
+    fn metadata_identity_error_allows_alternate(error: &TbankAdapterError) -> bool {
+        Self::metadata_lookup_error_is_miss(error)
+            || matches!(
+                error,
+                TbankAdapterError::UnsupportedInstrument(_)
+                    | TbankAdapterError::InstrumentOutOfScope(_)
+            )
+    }
+
+    fn metadata_error_is_event_rejection(error: &TbankAdapterError) -> bool {
+        Self::metadata_lookup_error_is_miss(error)
+            || matches!(error, TbankAdapterError::InvalidInstrumentIdentity(_))
+    }
+
+    fn metadata_lookup_allows_fallback(error: &TbankAdapterError) -> bool {
+        Self::metadata_lookup_error_is_miss(error) || tbank_adapter_error_is_transient(error)
+    }
+
+    fn select_metadata_lookup_error(
+        first: TbankAdapterError,
+        second: TbankAdapterError,
+    ) -> TbankAdapterError {
+        if tbank_adapter_error_is_transient(&second) {
+            second
+        } else if tbank_adapter_error_is_transient(&first)
+            && Self::metadata_lookup_error_is_miss(&second)
+        {
+            first
+        } else if !Self::metadata_lookup_error_is_miss(&second) {
+            second
+        } else {
+            first
+        }
+    }
+
+    async fn fetch_metadata_by_identifier(
+        &mut self,
+        request: InstrumentRequest,
+        identifier: &str,
+    ) -> Result<TbankInstrumentMetadata> {
+        let identifier_for_error = identifier;
+        let request_for_details = request.clone();
+        let request_timeout = self.config.request_timeout;
+        let kind = match self
+            .clients_mut()?
+            .instruments
+            .get_instrument_by(with_timeout(request_for_details, request_timeout))
+            .await
+        {
+            Ok(response) => response
+                .into_inner()
+                .instrument
+                .and_then(|instrument| InstrumentType::try_from(instrument.instrument_kind).ok()),
+            Err(status) => {
+                let error = TbankAdapterError::from(status);
+                if Self::metadata_lookup_error_is_miss(&error) {
+                    None
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+
+        match kind {
+            Some(InstrumentType::Share) => {
+                self.fetch_share_metadata(request, identifier_for_error)
+                    .await
+            }
+            Some(InstrumentType::Futures) => {
+                self.fetch_future_metadata(request, identifier_for_error)
+                    .await
+            }
+            Some(other) => Err(TbankAdapterError::InstrumentOutOfScope(format!(
+                "unsupported instrument type {other:?} for {identifier_for_error}"
+            ))),
+            None => {
+                let request_for_future = request.clone();
+                match self
+                    .fetch_share_metadata(request, identifier_for_error)
+                    .await
+                {
+                    Ok(metadata) => Ok(metadata),
+                    Err(share_error) if Self::metadata_lookup_allows_fallback(&share_error) => {
+                        match self
+                            .fetch_future_metadata(request_for_future, identifier_for_error)
+                            .await
+                        {
+                            Ok(metadata) => Ok(metadata),
+                            Err(future_error) => Err(Self::select_metadata_lookup_error(
+                                share_error,
+                                future_error,
+                            )),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    async fn metadata_for_stop_order(
+        &mut self,
+        stop: &StopOrder,
+    ) -> Result<TbankInstrumentMetadata> {
+        self.load_supported_metadata_for_identity(
+            &stop.instrument_uid,
+            &stop.figi,
+            &stop.ticker,
+            &stop.class_code,
+        )
+        .await
     }
 
     async fn load_instrument_metadata_by_uid(
@@ -2739,37 +3519,28 @@ impl TbankExecutionRuntime {
             .lock()
             .expect("instruments lock")
             .values()
-            .find(|metadata| {
-                metadata.instrument_uid == instrument_uid || metadata.figi == instrument_uid
-            })
+            .find(|metadata| metadata.instrument_uid == instrument_uid)
             .cloned()
         {
+            self.ensure_metadata_supported(&metadata)?;
             return Ok(metadata);
         }
 
-        let request = with_timeout(
-            InstrumentRequest {
-                id_type: InstrumentIdType::Uid as i32,
-                class_code: None,
-                id: instrument_uid.to_string(),
-            },
-            self.config.request_timeout,
-        );
-        let response = self
-            .clients_mut()?
-            .instruments
-            .share_by(request)
-            .await
-            .map_err(TbankAdapterError::from)?
-            .into_inner();
-        let share = response
-            .instrument
-            .ok_or_else(|| TbankAdapterError::InstrumentNotFound(instrument_uid.to_string()))?;
-        let metadata = TbankInstrumentMetadata::from_share(&share)?;
-        self.instruments
-            .lock()
-            .expect("instruments lock")
-            .insert(metadata.instrument_id.clone(), metadata.clone());
+        let request = InstrumentRequest {
+            id_type: InstrumentIdType::Uid as i32,
+            class_code: None,
+            id: instrument_uid.to_string(),
+        };
+        let metadata = self
+            .fetch_metadata_by_identifier(request, instrument_uid)
+            .await?;
+        if metadata.instrument_uid != instrument_uid {
+            return Err(TbankAdapterError::InstrumentNotFound(
+                instrument_uid.to_string(),
+            ));
+        }
+        self.ensure_metadata_supported(&metadata)?;
+        self.cache_instrument_metadata(metadata.clone());
         Ok(metadata)
     }
 
@@ -2785,68 +3556,188 @@ impl TbankExecutionRuntime {
             .find(|metadata| metadata.figi == figi)
             .cloned()
         {
+            self.ensure_metadata_supported(&metadata)?;
             return Ok(metadata);
         }
 
-        let request = with_timeout(
-            InstrumentRequest {
-                id_type: InstrumentIdType::Figi as i32,
-                class_code: None,
-                id: figi.to_string(),
-            },
-            self.config.request_timeout,
-        );
-        let response = self
-            .clients_mut()?
-            .instruments
-            .share_by(request)
-            .await
-            .map_err(TbankAdapterError::from)?
-            .into_inner();
-        let share = response
-            .instrument
-            .ok_or_else(|| TbankAdapterError::InstrumentNotFound(figi.to_string()))?;
-        let metadata = TbankInstrumentMetadata::from_share(&share)?;
-        self.instruments
-            .lock()
-            .expect("instruments lock")
-            .insert(metadata.instrument_id.clone(), metadata.clone());
+        let request = InstrumentRequest {
+            id_type: InstrumentIdType::Figi as i32,
+            class_code: None,
+            id: figi.to_string(),
+        };
+        let metadata = self.fetch_metadata_by_identifier(request, figi).await?;
+        if metadata.figi != figi {
+            return Err(TbankAdapterError::InstrumentNotFound(figi.to_string()));
+        }
+        self.ensure_metadata_supported(&metadata)?;
+        self.cache_instrument_metadata(metadata.clone());
         Ok(metadata)
+    }
+
+    async fn load_instrument_metadata_by_ticker_class(
+        &mut self,
+        ticker: &str,
+        class_code: &str,
+    ) -> Result<TbankInstrumentMetadata> {
+        let metadata = {
+            let instruments = self.instruments.lock().expect("instruments lock");
+            let mut matches = instruments.values().filter(|metadata| {
+                metadata.ticker.eq_ignore_ascii_case(ticker)
+                    && metadata.class_code.eq_ignore_ascii_case(class_code)
+            });
+            let first = matches.next().cloned();
+            first.filter(|_| matches.next().is_none())
+        };
+        if let Some(metadata) = metadata {
+            self.ensure_metadata_supported(&metadata)?;
+            return Ok(metadata);
+        }
+
+        let request = InstrumentRequest {
+            id_type: InstrumentIdType::Ticker as i32,
+            class_code: Some(class_code.to_string()),
+            id: ticker.to_string(),
+        };
+        let requested_identity = format!("{ticker}_{class_code}");
+        let metadata = self
+            .fetch_metadata_by_identifier(request, &requested_identity)
+            .await?;
+        if !metadata.ticker.eq_ignore_ascii_case(ticker)
+            || !metadata.class_code.eq_ignore_ascii_case(class_code)
+        {
+            return Err(TbankAdapterError::InstrumentNotFound(requested_identity));
+        }
+        self.ensure_metadata_supported(&metadata)?;
+        self.cache_instrument_metadata(metadata.clone());
+        Ok(metadata)
+    }
+
+    async fn metadata_for_identity(
+        &mut self,
+        instrument_uid: &str,
+        figi: &str,
+        ticker: &str,
+        class_code: &str,
+    ) -> Result<TbankInstrumentMetadata> {
+        let mut metadata = None;
+        let mut identity_error = None;
+
+        if !instrument_uid.is_empty() {
+            match self.load_instrument_metadata_by_uid(instrument_uid).await {
+                Ok(value) => metadata = Some(value),
+                Err(error) if tbank_adapter_error_is_transient(&error) => return Err(error),
+                Err(error) if Self::metadata_identity_error_allows_alternate(&error) => {
+                    identity_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if metadata.is_none() && !figi.is_empty() && figi != instrument_uid {
+            match self.load_instrument_metadata_by_figi(figi).await {
+                Ok(value) => metadata = Some(value),
+                Err(error) if tbank_adapter_error_is_transient(&error) => return Err(error),
+                Err(error) if Self::metadata_identity_error_allows_alternate(&error) => {
+                    identity_error = Some(match identity_error {
+                        Some(first) => Self::select_metadata_lookup_error(first, error),
+                        None => error,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let metadata = if let Some(metadata) = metadata {
+            metadata
+        } else if instrument_uid.is_empty() && figi.is_empty() {
+            if ticker.is_empty() || class_code.is_empty() {
+                return Err(invalid_instrument_identity_error(
+                    "",
+                    "",
+                    ticker,
+                    class_code,
+                    "event has no broker identity or complete ticker/class_code pair",
+                ));
+            }
+            self.load_instrument_metadata_by_ticker_class(ticker, class_code)
+                .await?
+        } else {
+            return Err(identity_error.unwrap_or_else(|| {
+                TbankAdapterError::InstrumentNotFound(instrument_metadata_identity(
+                    instrument_uid,
+                    figi,
+                    ticker,
+                    class_code,
+                ))
+            }));
+        };
+
+        if !metadata_matches_event_identity(&metadata, instrument_uid, figi, ticker, class_code) {
+            return Err(invalid_instrument_identity_error(
+                instrument_uid,
+                figi,
+                ticker,
+                class_code,
+                "resolved identity contradicts the event identity",
+            ));
+        }
+        self.refresh_futures_margin(metadata).await
+    }
+
+    async fn metadata_resolution_for_identity(
+        &mut self,
+        instrument_uid: &str,
+        figi: &str,
+        ticker: &str,
+        class_code: &str,
+    ) -> Result<TbankInstrumentMetadataResolution> {
+        match self
+            .metadata_for_identity(instrument_uid, figi, ticker, class_code)
+            .await
+        {
+            Ok(_) => Ok(TbankInstrumentMetadataResolution::Enabled),
+            Err(error) if tbank_adapter_error_is_transient(&error) => Err(error),
+            Err(TbankAdapterError::InstrumentOutOfScope(_))
+            | Err(TbankAdapterError::UnsupportedInstrument(_)) => {
+                Ok(TbankInstrumentMetadataResolution::OutOfScope)
+            }
+            Err(error) if Self::metadata_error_is_event_rejection(&error) => {
+                Ok(TbankInstrumentMetadataResolution::Rejected)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn load_supported_metadata_for_identity(
+        &mut self,
+        instrument_uid: &str,
+        figi: &str,
+        ticker: &str,
+        class_code: &str,
+    ) -> Result<TbankInstrumentMetadata> {
+        match self
+            .metadata_for_identity(instrument_uid, figi, ticker, class_code)
+            .await
+        {
+            Err(TbankAdapterError::UnsupportedInstrument(_)) => {
+                Err(TbankAdapterError::InstrumentOutOfScope(
+                    instrument_metadata_identity(instrument_uid, figi, ticker, class_code),
+                ))
+            }
+            result => result,
+        }
     }
 
     async fn metadata_for_order_state(
         &mut self,
         state: &OrderState,
-    ) -> Result<Option<TbankInstrumentMetadata>> {
-        if !state.ticker.is_empty() && !state.class_code.is_empty() {
-            let instrument_id = crate::common::ids::instrument_id_from_ticker_class(
-                &state.ticker,
-                &state.class_code,
-            );
-            match self.load_instrument_metadata(&instrument_id).await {
-                Ok(metadata) => return Ok(Some(metadata)),
-                Err(error) if tbank_adapter_error_is_transient(&error) => return Err(error),
-                Err(_) => {}
-            }
-        }
-        if !state.instrument_uid.is_empty() {
-            match self
-                .load_instrument_metadata_by_uid(&state.instrument_uid)
-                .await
-            {
-                Ok(metadata) => return Ok(Some(metadata)),
-                Err(error) if tbank_adapter_error_is_transient(&error) => return Err(error),
-                Err(_) => {}
-            }
-        }
-        if !state.figi.is_empty() {
-            match self.load_instrument_metadata_by_figi(&state.figi).await {
-                Ok(metadata) => return Ok(Some(metadata)),
-                Err(error) if tbank_adapter_error_is_transient(&error) => return Err(error),
-                Err(_) => {}
-            }
-        }
-        Ok(None)
+    ) -> Result<TbankInstrumentMetadata> {
+        self.load_supported_metadata_for_identity(
+            &state.instrument_uid,
+            &state.figi,
+            &state.ticker,
+            &state.class_code,
+        )
+        .await
     }
 
     async fn order_status_report_from_state_with_lots(
@@ -2878,7 +3769,7 @@ impl TbankExecutionRuntime {
             let known_current_order_id = client_order_id
                 .as_deref()
                 .and_then(|client_order_id| index.identity_for(Some(client_order_id), None))
-                .and_then(|identity| identity.broker_order_id);
+                .map(|identity| identity.broker_order_id);
             let canonical_order_id = known_current_order_id
                 .as_deref()
                 .map(|order_id| index.canonical_venue_order_id_or_self(order_id))
@@ -2929,31 +3820,34 @@ impl TbankExecutionRuntime {
                         "activated T-Bank stop parent {stop_order_id} was absent during child reconciliation"
                     )
                 })?;
-            let lot_size = self.lot_size_for_stop_order(&stop).await?;
-            return activated_stop_child_status_report(
+            let metadata = self.metadata_for_stop_order(&stop).await?;
+            let managed_order_type =
+                self.managed_order_type_for_client_order_id(client_order_id.as_deref());
+            return activated_stop_child_status_report_with_context(
                 account_id,
                 &stop,
                 &state,
                 ts_init,
-                lot_size,
+                metadata.lot,
                 client_order_id.as_deref(),
+                Some(&self.instruments),
+                managed_order_type,
             );
         }
         let metadata = self.metadata_for_order_state(&state).await?;
-        let instrument_id = match metadata.as_ref() {
-            Some(metadata) => metadata
-                .instrument_id
-                .parse()
-                .map_err(|error| anyhow::anyhow!("invalid cached instrument id: {error}"))?,
-            None => instrument_id_from_ticker_class_or_uid(
-                &state.ticker,
-                &state.class_code,
-                &state.instrument_uid,
-            )?,
-        };
-        let lot_size = metadata.map(|metadata| metadata.lot).unwrap_or(1);
-        let mut report =
-            order_status_report_from_state(account_id, state, ts_init, instrument_id, lot_size)?;
+        let instrument_id = metadata
+            .instrument_id
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid cached instrument id: {error}"))?;
+        let lot_size = metadata.lot;
+        let mut report = order_status_report_from_state_with_metadata(
+            account_id,
+            state,
+            ts_init,
+            instrument_id,
+            lot_size,
+            Some(&metadata),
+        )?;
         report.client_order_id = client_order_id
             .as_deref()
             .and_then(nonempty_client_order_id);
@@ -2970,17 +3864,28 @@ impl TbankExecutionRuntime {
 
     async fn resolve_activated_stop_mapping(
         &mut self,
-        order_request_id: Option<&str>,
         exchange_order_id: &str,
+        order_request_id: Option<&str>,
     ) -> anyhow::Result<Option<(StopOrder, Option<String>)>> {
-        let stop = self
+        let stops = self
             .query_stop_orders_for_reconciliation(None)
             .await?
-            .stop_orders
-            .into_iter()
-            .find(|stop| {
-                order_request_id.is_some_and(|request_id| stop.stop_order_id == request_id)
-                    || stop.exchange_order_id.as_deref() == Some(exchange_order_id)
+            .stop_orders;
+        // During activation, OrderState can expose the child before the stop-order
+        // projection has populated optional exchange_order_id. The parent request ID
+        // is the authoritative correlation key for that transition.
+        let stop = stops
+            .iter()
+            .find(|stop| stop.exchange_order_id.as_deref() == Some(exchange_order_id))
+            .cloned()
+            .or_else(|| {
+                order_request_id
+                    .filter(|order_request_id| !order_request_id.is_empty())
+                    .and_then(|order_request_id| {
+                        stops
+                            .into_iter()
+                            .find(|stop| stop.stop_order_id == order_request_id)
+                    })
             });
         let Some(stop) = stop else {
             return Ok(None);
@@ -3028,6 +3933,16 @@ impl TbankExecutionRuntime {
             return Ok(None);
         };
 
+        self.stop_order_status_report_for_stop(client_order_id, stop, ts_init)
+            .await
+    }
+
+    async fn stop_order_status_report_for_stop(
+        &mut self,
+        client_order_id: Option<ClientOrderId>,
+        stop: StopOrder,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
         if let Some(client_order_id) = client_order_id.as_ref() {
             self.record_broker_order_mapping_and_drain_cancel(
                 TbankBrokerOrderRoute::StopOrder,
@@ -3041,9 +3956,9 @@ impl TbankExecutionRuntime {
                 stop.stop_order_id.as_str(),
             );
         }
-        let lot_size = self.lot_size_for_stop_order(&stop).await?;
+        let metadata = self.metadata_for_stop_order(&stop).await?;
         if let Some(client_order_id) = client_order_id.as_ref() {
-            self.record_stop_order_context(client_order_id.as_str(), &stop, lot_size);
+            self.record_stop_order_context(client_order_id.as_str(), &stop, &metadata);
         }
         if StopOrderStatusOption::try_from(stop.status).ok()
             == Some(StopOrderStatusOption::StopOrderStatusExecuted)
@@ -3059,13 +3974,18 @@ impl TbankExecutionRuntime {
                         stop.stop_order_id.as_str(),
                         state.order_id.as_str(),
                     );
-                    let report = activated_stop_child_status_report(
+                    let managed_order_type = self.managed_order_type_for_client_order_id(
+                        client_order_id.as_ref().map(|id| id.as_str()),
+                    );
+                    let report = activated_stop_child_status_report_with_context(
                         self.account_id(),
                         &stop,
                         &state,
                         ts_init,
-                        lot_size,
+                        metadata.lot,
                         client_order_id.as_ref().map(|id| id.as_str()),
+                        Some(&self.instruments),
+                        managed_order_type,
                     )?;
                     self.mark_pending_submit_report(&report);
                     return Ok(Some(report));
@@ -3080,7 +4000,16 @@ impl TbankExecutionRuntime {
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut report = stop_order_status_report(self.account_id(), stop, ts_init, lot_size)?;
+        let managed_order_type = self
+            .managed_order_type_for_client_order_id(client_order_id.as_ref().map(|id| id.as_str()));
+        let mut report = stop_order_status_report_with_context(
+            self.account_id(),
+            stop,
+            ts_init,
+            metadata.lot,
+            Some(&self.instruments),
+            managed_order_type,
+        )?;
         report.client_order_id = client_order_id;
         self.mark_pending_submit_report(&report);
         Ok(Some(report))
@@ -3097,15 +4026,25 @@ impl TbankExecutionRuntime {
             self.known_broker_order_identity(client_order_id.as_ref(), venue_order_id.as_ref())
             && identity.route == TbankBrokerOrderRoute::StopOrder
         {
-            let Some(stop_order_id) = identity.broker_order_id else {
-                tracing::warn!(
-                    client_order_id = client_order_id.as_ref().map(|id| id.as_str()).unwrap_or(""),
-                    "known T-Bank stop-order route is missing broker order id"
-                );
-                return Ok(None);
-            };
             return self
-                .stop_order_status_report_for_known_id(client_order_id, stop_order_id, ts_init)
+                .stop_order_status_report_for_known_id(
+                    client_order_id,
+                    identity.broker_order_id,
+                    ts_init,
+                )
+                .await;
+        }
+
+        // The in-memory broker-order index is empty after a fresh client is created on
+        // reconnect. Resolve a supplied venue ID against T-Bank's stop-order history before
+        // falling back to OrdersService.GetOrderState: a stop-order ID is not a regular order ID.
+        if venue_order_id.is_some()
+            && let Some(stop) = self
+                .stop_order_from_broker(venue_order_id.as_ref().map(|id| id.as_str()))
+                .await?
+        {
+            return self
+                .stop_order_status_report_for_stop(client_order_id, stop, ts_init)
                 .await;
         }
 

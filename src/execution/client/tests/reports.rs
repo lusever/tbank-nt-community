@@ -1,3 +1,104 @@
+fn si_futures_metadata() -> crate::instruments::TbankInstrumentMetadata {
+    let mut metadata = sber_metadata();
+    metadata.instrument_id = "Si-9.26_SPBFUT.MOEX".to_string();
+    metadata.ticker = "Si-9.26".to_string();
+    metadata.class_code = "SPBFUT".to_string();
+    metadata.instrument_uid = "si-future-uid".to_string();
+    metadata.price_in_points = true;
+    metadata.min_price_increment = Decimal::ONE;
+    metadata.min_price_increment_amount = Some(Decimal::new(125, 1));
+    metadata.lot = 1;
+    metadata
+}
+
+#[test]
+fn futures_post_order_price_is_converted_to_points() {
+    let metadata = si_futures_metadata();
+    let cmd = submit_order_cmd_for("Si-9.26_SPBFUT.MOEX", OrderType::Market, None);
+    let response = PostOrderResponse {
+        order_id: "future-order-1".to_string(),
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+        lots_requested: 2,
+        lots_executed: 2,
+        executed_order_price: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: 875_006,
+            nano: 250_000_000,
+        }),
+        ..PostOrderResponse::default()
+    };
+
+    let report = super::order_status_report_from_post_order_response(
+        "TBANK-001".into(),
+        &cmd,
+        &response,
+        &metadata,
+        super::current_unix_nanos(),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px, Some(Decimal::new(700005, 1)));
+}
+
+#[test]
+fn futures_order_state_price_is_normalized_from_cumulative_value() {
+    let metadata = si_futures_metadata();
+    let report = super::order_status_report_from_state_with_metadata(
+        "TBANK-001".into(),
+        OrderState {
+            order_id: "future-order-1".to_string(),
+            lots_requested: 2,
+            lots_executed: 2,
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            executed_order_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 1_750_000,
+                nano: 0,
+            }),
+            ..OrderState::default()
+        },
+        super::current_unix_nanos(),
+        "Si-9.26_SPBFUT.MOEX".parse().unwrap(),
+        metadata.lot,
+        Some(&metadata),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px, Some(Decimal::from(70_000)));
+}
+
+#[test]
+fn futures_portfolio_fallback_price_is_converted_to_points() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let position = PortfolioPosition {
+        instrument_uid: metadata.instrument_uid.clone(),
+        figi: metadata.figi.clone(),
+        ticker: metadata.ticker.clone(),
+        class_code: metadata.class_code.clone(),
+        quantity: Some(Quotation { units: 2, nano: 0 }),
+        average_position_price: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: 875_000,
+            nano: 0,
+        }),
+        ..PortfolioPosition::default()
+    };
+
+    let report = super::position_status_report_from_portfolio_with_instruments(
+        "TBANK-001".into(),
+        &position,
+        super::current_unix_nanos(),
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px_open, Some(Decimal::from(70_000)));
+}
+
 #[test]
 fn numeric_tbank_account_id_is_prefixed_for_nautilus_reports() {
     assert_eq!(
@@ -39,24 +140,199 @@ fn portfolio_account_state_uses_currency_cash_as_free_balance() {
 }
 
 #[test]
-fn trades_stream_fill_uses_cached_uid_instead_of_parsing_uid_as_instrument_id() {
+fn portfolio_account_state_supports_kazakhstani_tenge() {
+    let portfolio = PortfolioResponse {
+        account_id: "2289788994".to_string(),
+        total_amount_portfolio: Some(MoneyValue {
+            currency: "kzt".to_string(),
+            units: 100_000,
+            nano: 0,
+        }),
+        total_amount_currencies: Some(MoneyValue {
+            currency: "kzt".to_string(),
+            units: 25_000,
+            nano: 0,
+        }),
+        ..PortfolioResponse::default()
+    };
+
+    let state = super::account_state_from_portfolio(&portfolio)
+        .unwrap()
+        .unwrap();
+    let balance = &state.balances[0];
+
+    assert_eq!(balance.currency.code.as_str(), "KZT");
+    assert_eq!(balance.total.as_f64(), 100_000.0);
+    assert_eq!(balance.free.as_f64(), 25_000.0);
+}
+
+#[test]
+fn trades_stream_fill_uses_figi_when_uid_is_empty() {
     let mut metadata = sber_metadata();
-    metadata.instrument_uid = "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string();
+    metadata.instrument_uid = "cached-sber-uid".to_string();
     metadata.figi = "BBG004730N88".to_string();
     let instruments = Arc::new(Mutex::new(HashMap::from([(
         metadata.instrument_id.clone(),
         metadata,
     )])));
 
-    let instrument_id = super::instrument_id_from_ticker_class_or_cached_uid(
+    let instrument_id = super::instrument_id_from_ticker_class_or_cached_identity(
         "",
         "",
-        "e6123145-9665-43e0-8413-cd61b8aa9b13",
-        &instruments,
+        "",
+        "BBG004730N88",
+        Some(&instruments),
     )
     .unwrap();
 
     assert_eq!(instrument_id.to_string(), "SBER_TQBR.MOEX");
+}
+
+#[test]
+fn cached_identity_does_not_fallback_after_authoritative_identity_miss() {
+    let metadata = sber_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+
+    let error = super::instrument_id_from_ticker_class_or_cached_identity(
+        "SBER",
+        "TQBR",
+        "stale-broker-uid",
+        "stale-figi",
+        Some(&instruments),
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("refusing to infer venue"));
+}
+
+#[test]
+fn cached_identity_uses_unique_ticker_class_only_without_authoritative_identity() {
+    let metadata = sber_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+
+    let instrument_id = super::instrument_id_from_ticker_class_or_cached_identity(
+        "SBER",
+        "TQBR",
+        "",
+        "",
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert_eq!(instrument_id.to_string(), "SBER_TQBR.MOEX");
+}
+
+#[test]
+fn order_state_stream_uses_instrument_uid_for_cached_venue_resolution() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_id = "AAPL_SPBXM.SPBE".to_string();
+    metadata.ticker = "AAPL".to_string();
+    metadata.class_code = "SPBXM".to_string();
+    metadata.instrument_uid = "aapl-spbe-uid".to_string();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+
+    let report = super::stream_order_status_report_from_state_with_instruments(
+        order_state_stream_response::OrderState {
+            order_id: "exchange-order-1".to_string(),
+            trade_order_id: "trade-order-1".to_string(),
+            instrument_uid: "aapl-spbe-uid".to_string(),
+            ticker: "AAPL".to_string(),
+            class_code: "SPBXM".to_string(),
+            lot_size: 1,
+            ..order_state_stream_response::OrderState::default()
+        },
+        "exchange-order-1",
+        super::current_unix_nanos(),
+        None,
+        None,
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert_eq!(report.instrument_id.to_string(), "AAPL_SPBXM.SPBE");
+}
+
+#[test]
+fn futures_order_state_stream_price_is_already_in_points() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let report = super::stream_order_status_report_from_state_with_instruments(
+        order_state_stream_response::OrderState {
+            order_id: "future-stream-order-1".to_string(),
+            trade_order_id: "future-stream-trade-1".to_string(),
+            instrument_uid: metadata.instrument_uid,
+            ticker: metadata.ticker,
+            class_code: metadata.class_code,
+            lot_size: 1,
+            order_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 70_000,
+                nano: 0,
+            }),
+            ..order_state_stream_response::OrderState::default()
+        },
+        "future-stream-order-1",
+        super::current_unix_nanos(),
+        None,
+        None,
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.price.map(|price| price.as_decimal()),
+        Some(Decimal::from(70_000))
+    );
+}
+
+#[test]
+fn order_state_stream_average_price_is_not_divided_by_lots() {
+    let metadata = sber_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let report = super::stream_order_status_report_from_state_with_instruments(
+        order_state_stream_response::OrderState {
+            order_id: "stream-order-with-fill".to_string(),
+            trade_order_id: "stream-trade-with-fill".to_string(),
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            instrument_uid: metadata.instrument_uid,
+            ticker: metadata.ticker,
+            class_code: metadata.class_code,
+            lot_size: 10,
+            lots_requested: 2,
+            lots_executed: 2,
+            executed_order_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 275,
+                nano: 0,
+            }),
+            ..order_state_stream_response::OrderState::default()
+        },
+        "stream-order-with-fill",
+        super::current_unix_nanos(),
+        None,
+        None,
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px, Some(Decimal::from(275)));
 }
 
 #[test]
@@ -96,6 +372,206 @@ fn stop_order_maps_to_order_status_report() {
         report.trigger_price.unwrap().as_decimal(),
         Decimal::from(275)
     );
+}
+
+#[test]
+fn managed_market_if_touched_type_survives_stop_query_translation() {
+    let report = super::stop_order_status_report_with_context(
+        "account-1".into(),
+        StopOrder {
+            stop_order_id: "mit-stop-1".to_string(),
+            direction: StopOrderDirection::Buy as i32,
+            order_type: StopOrderType::TakeProfit as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            stop_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 275,
+                nano: 0,
+            }),
+            status: StopOrderStatusOption::StopOrderStatusActive as i32,
+            ..StopOrder::default()
+        },
+        super::current_unix_nanos(),
+        10,
+        None,
+        Some(TbankOrderType::MarketIfTouched),
+    )
+    .unwrap();
+
+    assert_eq!(report.order_type, OrderType::MarketIfTouched);
+    assert_eq!(report.trigger_price.unwrap().as_decimal(), Decimal::from(275));
+}
+
+#[test]
+fn limit_take_profit_stop_query_preserves_limit_if_touched_type() {
+    let report = super::stop_order_status_report(
+        "account-1".into(),
+        StopOrder {
+            stop_order_id: "limit-tp-stop-1".to_string(),
+            direction: StopOrderDirection::Buy as i32,
+            order_type: StopOrderType::TakeProfit as i32,
+            exchange_order_type: ExchangeOrderType::Limit as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            stop_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 275,
+                nano: 0,
+            }),
+            status: StopOrderStatusOption::StopOrderStatusActive as i32,
+            ..StopOrder::default()
+        },
+        super::current_unix_nanos(),
+        10,
+    )
+    .unwrap();
+
+    assert_eq!(report.order_type, OrderType::LimitIfTouched);
+}
+
+#[test]
+fn futures_stop_query_report_preserves_point_prices() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let report = super::stop_order_status_report_with_context(
+        "account-1".into(),
+        StopOrder {
+            stop_order_id: "future-stop-1".to_string(),
+            direction: StopOrderDirection::Sell as i32,
+            order_type: StopOrderType::StopLoss as i32,
+            instrument_uid: metadata.instrument_uid.clone(),
+            ticker: metadata.ticker.clone(),
+            class_code: metadata.class_code.clone(),
+            price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 70_000,
+                nano: 0,
+            }),
+            stop_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 70_000,
+                nano: 0,
+            }),
+            status: StopOrderStatusOption::StopOrderStatusActive as i32,
+            ..StopOrder::default()
+        },
+        super::current_unix_nanos(),
+        1,
+        Some(&instruments),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.price.map(|price| price.as_decimal()),
+        Some(Decimal::from(70_000))
+    );
+    assert_eq!(
+        report.trigger_price.map(|price| price.as_decimal()),
+        Some(Decimal::from(70_000))
+    );
+}
+
+#[test]
+fn futures_stop_stream_report_preserves_point_prices() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let client_order_id = "524b1a03-efdd-4cd0-bd56-7cc6570c7156";
+    let pending_submits = Arc::new(Mutex::new(HashMap::from([(
+        client_order_id.to_string(),
+        TbankPendingSubmit {
+            instrument_id: metadata.instrument_id.clone(),
+            submitted_ts: super::current_unix_nanos(),
+            quantity_units: Decimal::ONE,
+            side: TbankOrderSide::Sell,
+            order_type: TbankOrderType::StopMarket,
+            time_in_force: TimeInForce::Gtc,
+            trailing: None,
+            venue_order_id: Some("future-stop-stream-1".to_string()),
+            last_reconciliation_ts: None,
+            stage: TbankPendingSubmitStage::Submitted,
+        },
+    )])));
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    broker_order_index.lock().unwrap().record_mapping(
+        TbankBrokerOrderRoute::StopOrder,
+        client_order_id,
+        "future-stop-stream-1",
+    );
+
+    let report = super::stream_stop_order_status_report_from_state_with_instruments(
+        order_state_stream_response::StopOrderState {
+            stop_order_id: "future-stop-stream-1".to_string(),
+            account_id: "account-1".to_string(),
+            direction: OrderDirection::Sell as i32,
+            price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 70_000,
+                nano: 0,
+            }),
+            stop_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 70_000,
+                nano: 0,
+            }),
+            instrument_uid: metadata.instrument_uid,
+            ticker: metadata.ticker,
+            class_code: metadata.class_code,
+            status: StopOrderStatusOption::StopOrderStatusActive as i32,
+            ..order_state_stream_response::StopOrderState::default()
+        },
+        super::current_unix_nanos(),
+        &pending_submits,
+        &broker_order_index,
+        Some(&instruments),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        report.price.map(|price| price.as_decimal()),
+        Some(Decimal::from(70_000))
+    );
+    assert_eq!(
+        report.trigger_price.map(|price| price.as_decimal()),
+        Some(Decimal::from(70_000))
+    );
+}
+
+#[test]
+fn take_profit_stop_query_falls_back_to_market_if_touched() {
+    let report = super::stop_order_status_report(
+        "account-1".into(),
+        StopOrder {
+            stop_order_id: "mit-stop-after-restart".to_string(),
+            direction: StopOrderDirection::Buy as i32,
+            order_type: StopOrderType::TakeProfit as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            stop_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 275,
+                nano: 0,
+            }),
+            status: StopOrderStatusOption::StopOrderStatusActive as i32,
+            ..StopOrder::default()
+        },
+        super::current_unix_nanos(),
+        10,
+    )
+    .unwrap();
+
+    assert_eq!(report.order_type, OrderType::MarketIfTouched);
 }
 
 #[test]
@@ -149,6 +625,130 @@ fn trailing_stop_query_preserves_native_offsets() {
     assert_eq!(report.limit_offset, Some(Decimal::from(50)));
     assert_eq!(report.trailing_offset_type, TrailingOffsetType::BasisPoints);
     assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+}
+
+#[test]
+fn futures_trailing_stop_report_preserves_point_activation_and_offsets() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let report = super::stop_order_status_report_with_context(
+        "account-1".into(),
+        StopOrder {
+            stop_order_id: "future-trailing-1".to_string(),
+            lots_requested: 1,
+            direction: StopOrderDirection::Sell as i32,
+            order_type: StopOrderType::TakeProfit as i32,
+            take_profit_type: TakeProfitType::Trailing as i32,
+            exchange_order_type: ExchangeOrderType::Limit as i32,
+            instrument_uid: metadata.instrument_uid.clone(),
+            ticker: metadata.ticker.clone(),
+            class_code: metadata.class_code.clone(),
+            stop_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 70_000,
+                nano: 0,
+            }),
+            trailing_data: Some(stop_order::TrailingData {
+                indent: Some(Quotation {
+                    units: 10,
+                    nano: 0,
+                }),
+                indent_type: TrailingValueType::TrailingValueAbsolute as i32,
+                spread: Some(Quotation { units: 2, nano: 0 }),
+                spread_type: TrailingValueType::TrailingValueAbsolute as i32,
+                ..stop_order::TrailingData::default()
+            }),
+            status: StopOrderStatusOption::StopOrderStatusActive as i32,
+            ..StopOrder::default()
+        },
+        super::current_unix_nanos(),
+        1,
+        Some(&instruments),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.activation_price.map(|price| price.as_decimal()),
+        Some(Decimal::from(70_000))
+    );
+    assert_eq!(report.trailing_offset, Some(Decimal::from(10)));
+    assert_eq!(report.limit_offset, Some(Decimal::from(2)));
+}
+
+#[test]
+fn futures_cursor_operation_trade_price_is_already_in_points() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let reports = super::fill_reports_from_cursor_operation_with_instruments(
+        "TBANK-001".into(),
+        &OperationItem {
+            id: "future-operation-1".to_string(),
+            r#type: TbankOperationType::Buy as i32,
+            instrument_uid: metadata.instrument_uid.clone(),
+            ticker: metadata.ticker.clone(),
+            class_code: metadata.class_code.clone(),
+            trades_info: Some(OperationItemTrades {
+                trades: vec![OperationItemTrade {
+                    num: "future-trade-1".to_string(),
+                    quantity: 1,
+                    price: Some(MoneyValue {
+                        currency: "rub".to_string(),
+                        units: 70_000,
+                        nano: 0,
+                    }),
+                    ..OperationItemTrade::default()
+                }],
+            }),
+            ..OperationItem::default()
+        },
+        super::current_unix_nanos(),
+        Some(&instruments),
+    );
+
+    let report = reports.into_iter().next().unwrap().unwrap();
+    assert_eq!(report.last_px.as_decimal(), Decimal::from(70_000));
+}
+
+#[test]
+fn futures_order_trade_price_is_already_in_points() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let trade = OrderTrade {
+        price: Some(Quotation {
+            units: 70_000,
+            nano: 0,
+        }),
+        quantity: 1,
+        trade_id: "future-trade-1".to_string(),
+        ..OrderTrade::default()
+    };
+
+    let report = super::fill_report_from_order_trade(
+        &OrderTrades {
+            order_id: "future-order-1".to_string(),
+            direction: OrderDirection::Buy as i32,
+            account_id: "account-1".to_string(),
+            instrument_uid: metadata.instrument_uid,
+            trades: vec![trade.clone()],
+            ..OrderTrades::default()
+        },
+        &trade,
+        super::current_unix_nanos(),
+        &instruments,
+    )
+    .unwrap();
+
+    assert_eq!(report.last_px.as_decimal(), Decimal::from(70_000));
 }
 
 #[test]
@@ -260,6 +860,7 @@ fn order_status_fill_projection_dedupes_late_stream_fill() {
             direction: OrderDirection::Buy as i32,
             account_id: "account-1".to_string(),
             instrument_uid: "sber-uid".to_string(),
+            figi: "BBG004730N88".to_string(),
             trades: Vec::new(),
             ..OrderTrades::default()
         },
@@ -302,8 +903,9 @@ async fn open_order_status_report_uses_cached_uid_metadata() {
         TbankManagedOrderContext {
             side: Some(TbankOrderSide::Buy),
             order_type: Some(TbankOrderType::Limit),
+            report_order_type: None,
             time_in_force: Some(TimeInForce::Fok),
-            quantity_shares: Some(Decimal::from(10)),
+            quantity_units: Some(Decimal::from(10)),
             trailing: None,
         },
     );
@@ -471,7 +1073,7 @@ async fn unary_order_report_keeps_canonical_stop_identity_for_child_alias() {
             .known_broker_order_identity(Some(&ClientOrderId::from("client-stop-1")), None),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some("exchange-child-1".to_string()),
+            broker_order_id: "exchange-child-1".to_string(),
         })
     );
 }
@@ -598,6 +1200,9 @@ impl StopOrdersService for MockStopOrdersService {
         if let Some((code, message)) = self.post_error.lock().unwrap().take() {
             return Err(Status::new(code, message));
         }
+        if let Some(response) = self.post_response.lock().unwrap().clone() {
+            return Ok(Response::new(response));
+        }
         Ok(Response::new(PostStopOrderResponse {
             stop_order_id: "stop-order-1".to_string(),
             order_request_id: request.order_id,
@@ -610,8 +1215,8 @@ impl StopOrdersService for MockStopOrdersService {
         request: Request<GetStopOrdersRequest>,
     ) -> std::result::Result<Response<GetStopOrdersResponse>, Status> {
         self.get_calls.lock().unwrap().push(request.into_inner());
-        if let Some((code, message)) = self.get_error.lock().unwrap().clone() {
-            return Err(Status::new(code, message));
+        if let Some(response) = self.get_responses.lock().unwrap().pop_front() {
+            return Ok(Response::new(response));
         }
         Ok(Response::new(
             self.get_response
@@ -735,7 +1340,7 @@ async fn submit_market_live_calls_orders_service() {
                 side: TbankOrderSide::Buy,
                 order_type: TbankOrderType::Market,
                 time_in_force: TimeInForce::Ioc,
-                quantity_shares: Decimal::from(20),
+                quantity_units: Decimal::from(20),
                 limit_price: None,
                 trigger_price: None,
                 trailing: None,
@@ -859,6 +1464,7 @@ async fn generate_order_status_report_routes_known_stop_venue_order_id_to_stop_o
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
+    seed_sber_metadata(&mut client);
     client
         .runtime
         .record_broker_order_id(TbankBrokerOrderRoute::StopOrder, "stop-order-1");
@@ -884,7 +1490,56 @@ async fn generate_order_status_report_routes_known_stop_venue_order_id_to_stop_o
 }
 
 #[tokio::test]
-async fn generate_order_status_report_resolves_executed_stop_child() {
+async fn generate_order_status_report_recovers_stop_route_when_local_index_is_empty() {
+    let orders_service = MockOrdersService::default();
+    let state_calls = Arc::clone(&orders_service.state_calls);
+    let stop_orders_service = MockStopOrdersService::default();
+    let get_calls = Arc::clone(&stop_orders_service.get_calls);
+    *stop_orders_service.get_response.lock().unwrap() = Some(GetStopOrdersResponse {
+        stop_orders: vec![active_sber_stop_order("stop-order-1")],
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(orders_service))
+            .add_service(StopOrdersServiceServer::new(stop_orders_service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    seed_sber_metadata(&mut client);
+    client.runtime.connect().await.unwrap();
+
+    let report =
+        <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_order_status_report(
+            &client,
+            &order_status_report_cmd(
+                Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
+                Some("stop-order-1"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(report.venue_order_id.to_string(), "stop-order-1");
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(state_calls.lock().unwrap().len(), 0);
+    assert_reconciliation_stop_queries(&get_calls.lock().unwrap());
+}
+
+#[tokio::test]
+async fn generate_order_status_report_resolves_executed_stop_child_after_restart_by_exchange_id() {
     let orders_service = MockOrdersService::default();
     let state_calls = Arc::clone(&orders_service.state_calls);
     *orders_service.state_response.lock().unwrap() = Some(OrderState {
@@ -927,17 +1582,13 @@ async fn generate_order_status_report_resolves_executed_stop_child() {
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.record_broker_order_mapping(
-        TbankBrokerOrderRoute::StopOrder,
-        client_order_id,
-        "stop-order-1",
-    );
+    seed_sber_metadata(&mut client);
     client.runtime.connect().await.unwrap();
 
     let report =
         <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_order_status_report(
             &client,
-            &order_status_report_cmd(Some(client_order_id), None),
+            &order_status_report_cmd(Some(client_order_id), Some("exchange-child-1")),
         )
         .await
         .unwrap()
@@ -986,6 +1637,7 @@ async fn generate_order_status_report_routes_known_stop_request_id_to_stop_order
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
+    seed_sber_metadata(&mut client);
     client.runtime.record_broker_order_mapping(
         TbankBrokerOrderRoute::StopOrder,
         "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
@@ -1040,6 +1692,7 @@ async fn query_order_routes_known_stop_order_to_stop_orders_service() {
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
+    seed_sber_metadata(&mut client);
     client
         .runtime
         .record_broker_order_id(TbankBrokerOrderRoute::StopOrder, "stop-order-1");
@@ -1259,7 +1912,7 @@ async fn reconcile_order_by_request_id_maps_remote_fill_to_fill_report_once() {
     );
     assert_eq!(
         reports.fill_reports[0].last_px.as_decimal(),
-        Decimal::from(275)
+        Decimal::new(1375, 1)
     );
     assert!(client.runtime.stream_tasks.lock().unwrap().is_empty());
 
@@ -1478,7 +2131,7 @@ async fn stop_order_cancel_uses_submitted_stop_mapping() {
             .unwrap(),
         TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::StopOrder,
-            broker_order_id: Some("stop-order-1".to_string()),
+            broker_order_id: "stop-order-1".to_string(),
         })
     );
     assert_eq!(
@@ -1489,7 +2142,7 @@ async fn stop_order_cancel_uses_submitted_stop_mapping() {
             .unwrap(),
         TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::StopOrder,
-            broker_order_id: Some("stop-order-1".to_string()),
+            broker_order_id: "stop-order-1".to_string(),
         })
     );
 }
@@ -1523,30 +2176,80 @@ async fn pending_stop_order_cancel_waits_for_broker_stop_order_id() {
             .known_broker_order_identity(Some(&ClientOrderId::from("stop-request-1")), None),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::StopOrder,
-            broker_order_id: Some("stop-order-1".to_string()),
+            broker_order_id: "stop-order-1".to_string(),
         })
     );
 }
 
 #[tokio::test]
-async fn submit_route_is_visible_before_async_broker_submit() {
+async fn pending_cancel_uses_explicit_venue_order_id_with_pending_route() {
     let mut client = test_client(TbankExecutionClientConfig::default());
-    let client_order_id = ClientOrderId::from("stop-request-before-spawn");
     client
         .runtime
-        .prepare_submit_route(&client_order_id, OrderType::StopMarket);
+        .record_broker_order_route(TbankBrokerOrderRoute::StopOrder, "stop-request-1");
 
     assert_eq!(
         client
             .runtime
-            .resolve_cancel_target(client_order_id.as_str(), None)
+            .resolve_cancel_target("stop-request-1", Some("stop-order-1"))
             .await
             .unwrap(),
-        TbankCancelTarget::Pending {
+        TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::StopOrder,
-            client_order_id: client_order_id.to_string(),
-        }
+            broker_order_id: "stop-order-1".to_string(),
+        })
     );
+}
+
+#[tokio::test]
+async fn cancel_without_broker_order_identity_fails_closed() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+
+    let error = client
+        .runtime
+        .resolve_cancel_target("client-only-order", None)
+        .await
+        .expect_err("client order ID must not be used as a broker order ID");
+
+    assert!(matches!(
+        error,
+        TbankAdapterError::BrokerOrderIdentityUnresolved(_)
+    ));
+}
+
+#[tokio::test]
+async fn submit_route_is_visible_before_async_broker_submit() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    activate_test_lifecycle(&client);
+    let client_order_id = ClientOrderId::from("stop-request-before-spawn");
+    let runtime = client.runtime.clone();
+    let mut future_runtime = runtime.clone();
+    let route_runtime = runtime.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    runtime
+        .spawn_mutating_command_task_with(
+            async move {
+                assert_eq!(
+                    future_runtime
+                        .resolve_cancel_target(client_order_id.as_str(), None)
+                        .await
+                        .unwrap(),
+                    TbankCancelTarget::Pending {
+                        route: TbankBrokerOrderRoute::StopOrder,
+                        client_order_id: client_order_id.to_string(),
+                    }
+                );
+                ready_tx.send(()).unwrap();
+            },
+            move || {
+                route_runtime.prepare_submit_route(&client_order_id, OrderType::StopMarket);
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
@@ -1607,7 +2310,7 @@ fn custom_broker_request_id_is_rejected() {
         side: TbankOrderSide::Buy,
         order_type: TbankOrderType::Market,
         time_in_force: TimeInForce::Ioc,
-        quantity_shares: Decimal::from(20),
+        quantity_units: Decimal::from(20),
         limit_price: None,
         trigger_price: None,
         trailing: None,
@@ -1673,10 +2376,58 @@ async fn stop_order_cancel_route_recovers_from_broker_after_restart() {
         target,
         TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::StopOrder,
-            broker_order_id: Some("stop-order-1".to_string()),
+            broker_order_id: "stop-order-1".to_string(),
         })
     );
     assert_eq!(get_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn activated_stop_recovery_uses_order_request_id_without_exchange_order_id() {
+    let service = MockStopOrdersService::default();
+    *service.get_response.lock().unwrap() = Some(GetStopOrdersResponse {
+        stop_orders: vec![active_sber_stop_order("request-shaped-stop-id")],
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(StopOrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    client.runtime.connect_for_queries().await.unwrap();
+
+    let (stop, client_order_id) = client
+        .runtime
+        .resolve_activated_stop_mapping(
+            "exchange-child-1",
+            Some("request-shaped-stop-id"),
+        )
+        .await
+        .unwrap()
+        .expect("order_request_id should recover the stop parent");
+    assert_eq!(stop.stop_order_id, "request-shaped-stop-id");
+    assert!(client_order_id.is_none());
+    assert_eq!(
+        client
+            .runtime
+            .broker_order_index
+            .lock()
+            .unwrap()
+            .known_stop_broker_order_ids(),
+        vec!["request-shaped-stop-id".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -1755,32 +2506,45 @@ async fn generate_fill_reports_returns_operation_history_trades() {
         let mut pages = service.pages.lock().unwrap();
         let response = GetOperationsByCursorResponse {
             has_next: false,
-            items: vec![OperationItem {
-                id: "operation-1".to_string(),
-                r#type: TbankOperationType::Buy as i32,
-                state: OperationState::Executed as i32,
-                instrument_uid: "sber-uid".to_string(),
-                ticker: "SBER".to_string(),
-                class_code: "TQBR".to_string(),
-                commission: Some(MoneyValue {
-                    currency: "rub".to_string(),
-                    units: 1,
-                    nano: 0,
-                }),
-                trades_info: Some(OperationItemTrades {
-                    trades: vec![OperationItemTrade {
-                        num: "trade-1".to_string(),
-                        quantity: 10,
-                        price: Some(MoneyValue {
-                            currency: "rub".to_string(),
-                            units: 275,
-                            nano: 0,
-                        }),
-                        ..OperationItemTrade::default()
-                    }],
-                }),
-                ..OperationItem::default()
-            }],
+            items: vec![
+                OperationItem {
+                    id: "unsupported-operation".to_string(),
+                    r#type: TbankOperationType::Buy as i32,
+                    state: OperationState::Executed as i32,
+                    instrument_uid: "unsupported-uid".to_string(),
+                    figi: "unsupported-figi".to_string(),
+                    ticker: "BOND".to_string(),
+                    class_code: "TQTF".to_string(),
+                    ..OperationItem::default()
+                },
+                OperationItem {
+                    id: "operation-1".to_string(),
+                    r#type: TbankOperationType::Buy as i32,
+                    state: OperationState::Executed as i32,
+                    instrument_uid: "sber-uid".to_string(),
+                    figi: "BBG004730N88".to_string(),
+                    ticker: "SBER".to_string(),
+                    class_code: "TQBR".to_string(),
+                    commission: Some(MoneyValue {
+                        currency: "rub".to_string(),
+                        units: 1,
+                        nano: 0,
+                    }),
+                    trades_info: Some(OperationItemTrades {
+                        trades: vec![OperationItemTrade {
+                            num: "trade-1".to_string(),
+                            quantity: 10,
+                            price: Some(MoneyValue {
+                                currency: "rub".to_string(),
+                                units: 275,
+                                nano: 0,
+                            }),
+                            ..OperationItemTrade::default()
+                        }],
+                    }),
+                    ..OperationItem::default()
+                },
+            ],
             ..GetOperationsByCursorResponse::default()
         };
         pages.push_back(response.clone());
@@ -1804,6 +2568,22 @@ async fn generate_fill_reports_returns_operation_history_trades() {
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
+    seed_sber_metadata(&mut client);
+    let mut out_of_scope_metadata = sber_metadata();
+    out_of_scope_metadata.instrument_id = "BOND_TQTF.MOEX".to_string();
+    out_of_scope_metadata.instrument_uid = "unsupported-uid".to_string();
+    out_of_scope_metadata.figi = "unsupported-figi".to_string();
+    out_of_scope_metadata.ticker = "BOND".to_string();
+    out_of_scope_metadata.class_code = "TQTF".to_string();
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert(
+            out_of_scope_metadata.instrument_id.clone(),
+            out_of_scope_metadata,
+        );
     client.connect_for_queries().await.unwrap();
 
     let generate = || {

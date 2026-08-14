@@ -265,15 +265,57 @@ fn initial_order_state_ack_cannot_promote_internal_order_id() {
     let index = broker_order_index.lock().unwrap();
     assert_eq!(
         index.identity_for(Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"), None),
-        Some(TbankBrokerOrderIdentity {
-            route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: None,
-        })
+        None
+    );
+    assert_eq!(
+        index.route_for_client_order_id("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
+        Some(TbankBrokerOrderRoute::RegularOrder)
     );
     assert!(
         index
             .identity_for(None, Some("internal-uuid-like-id"))
             .is_none()
+    );
+}
+
+#[test]
+fn unresolved_stop_stream_event_preserves_stop_route_when_identity_arrives_later() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let client_order_id = "stop-request-with-delayed-identity";
+    let broker_request_id = {
+        let mut index = broker_order_index.lock().unwrap();
+        index.record_client_order_route(TbankBrokerOrderRoute::StopOrder, client_order_id);
+        index
+            .get_or_allocate_request_mapping(client_order_id, None)
+            .unwrap()
+    };
+
+    let resolved = resolve_stream_order_venue_id(
+        &broker_order_index,
+        &Arc::new(Mutex::new(TbankFillProjection::default())),
+        Some(broker_request_id.as_str()),
+        "stop-order-1",
+        "trade-order-1",
+        OrderExecutionReportStatus::ExecutionReportStatusPartiallyfill as i32,
+    )
+    .expect("stop event should resolve once it carries a broker order id");
+
+    assert_eq!(resolved.venue_order_id, "stop-order-1");
+    assert_eq!(
+        broker_order_index
+            .lock()
+            .unwrap()
+            .identity_for(Some(client_order_id), None),
+        Some(TbankBrokerOrderIdentity {
+            route: TbankBrokerOrderRoute::StopOrder,
+            broker_order_id: "stop-order-1".to_string(),
+        })
+    );
+    assert!(
+        broker_order_index
+            .lock()
+            .unwrap()
+            .is_known_stop_broker_order_id("stop-order-1")
     );
 }
 
@@ -358,7 +400,7 @@ fn order_state_stream_mapping_uses_exchange_order_id_not_trade_order_id() {
         index.identity_for(Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"), None),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some("exchange-order-1".to_string()),
+            broker_order_id: "exchange-order-1".to_string(),
         })
     );
     assert!(index.identity_for(None, Some("trade-order-1")).is_none());
@@ -389,7 +431,7 @@ fn reissued_regular_order_keeps_canonical_identity_and_current_cancel_route() {
         index.identity_for(Some("client-order-1"), None),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some("reissued-order-2".to_string()),
+            broker_order_id: "reissued-order-2".to_string(),
         })
     );
     assert_eq!(
@@ -427,7 +469,7 @@ fn activated_stop_child_keeps_stop_identity_and_uses_regular_cancel_route() {
             .identity_for(Some("client-stop-1"), None),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some("exchange-child-1".to_string()),
+            broker_order_id: "exchange-child-1".to_string(),
         })
     );
     assert_eq!(
@@ -613,7 +655,7 @@ fn external_activated_stop_child_keeps_parent_identity_without_client_owner() {
         index.identity_for(None, Some("exchange-child-1")),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some("exchange-child-1".to_string()),
+            broker_order_id: "exchange-child-1".to_string(),
         })
     );
     assert_eq!(
@@ -645,7 +687,7 @@ fn activated_stop_initial_child_ack_does_not_promote_internal_id() {
         index.identity_for(Some("client-stop-1"), None),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::StopOrder,
-            broker_order_id: Some("stop-order-1".to_string()),
+            broker_order_id: "stop-order-1".to_string(),
         })
     );
     assert!(index.identity_for(None, Some("internal-child-1")).is_none());
@@ -697,6 +739,7 @@ async fn external_activated_stop_initial_ack_recovers_confirmed_child_in_backgro
         },
         ..TbankExecutionClientConfig::default()
     });
+    seed_sber_metadata(&mut client);
     client
         .runtime
         .record_broker_order_id(TbankBrokerOrderRoute::StopOrder, "stop-order-1");
@@ -712,6 +755,7 @@ async fn external_activated_stop_initial_ack_recovers_confirmed_child_in_backgro
         broker_order_index: client.runtime.broker_order_index.clone(),
         fill_projection: client.runtime.fill_projection.clone(),
         order_status_projection: client.runtime.order_status_projection.clone(),
+        instruments: client.runtime.instruments.clone(),
         reconnect_policy: client.runtime.config.reconnect_policy.clone(),
         activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
         regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
@@ -739,7 +783,7 @@ async fn external_activated_stop_initial_ack_recovers_confirmed_child_in_backgro
             .identity_for(None, Some("exchange-child-1")),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some("exchange-child-1".to_string()),
+            broker_order_id: "exchange-child-1".to_string(),
         })
     );
     assert_eq!(
@@ -810,6 +854,7 @@ async fn external_regular_initial_ack_schedules_request_id_reconciliation() {
         broker_order_index: client.runtime.broker_order_index.clone(),
         fill_projection: client.runtime.fill_projection.clone(),
         order_status_projection: client.runtime.order_status_projection.clone(),
+        instruments: client.runtime.instruments.clone(),
         reconnect_policy: client.runtime.config.reconnect_policy.clone(),
         activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
         regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
@@ -841,7 +886,7 @@ async fn external_regular_initial_ack_schedules_request_id_reconciliation() {
             .identity_for(None, Some("exchange-order-1")),
         Some(TbankBrokerOrderIdentity {
             route: TbankBrokerOrderRoute::RegularOrder,
-            broker_order_id: Some("exchange-order-1".to_string()),
+            broker_order_id: "exchange-order-1".to_string(),
         })
     );
 }
@@ -901,7 +946,7 @@ fn stop_order_state_stream_updates_known_stop_lifecycle() {
         TbankPendingSubmit {
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             submitted_ts: current_unix_nanos(),
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::StopMarket,
             time_in_force: TimeInForce::Gtc,
@@ -973,8 +1018,9 @@ fn stop_order_state_stream_updates_restored_stop_without_pending_submit() {
             TbankManagedOrderContext {
                 side: Some(TbankOrderSide::Sell),
                 order_type: Some(TbankOrderType::StopMarket),
+                report_order_type: Some(OrderType::StopMarket),
                 time_in_force: Some(TimeInForce::Gtc),
-                quantity_shares: Some(Decimal::from(20)),
+                quantity_units: Some(Decimal::from(20)),
                 trailing: None,
             },
         );
@@ -1008,6 +1054,189 @@ fn stop_order_state_stream_updates_restored_stop_without_pending_submit() {
     assert_eq!(report.order_type, OrderType::StopMarket);
     assert_eq!(report.trigger_type, Some(TriggerType::Default));
     assert_eq!(report.quantity.as_decimal(), Decimal::from(20));
+}
+
+#[test]
+fn stop_order_state_stream_preserves_restored_limit_take_profit_type() {
+    let pending_submits = Arc::new(Mutex::new(HashMap::new()));
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    {
+        let mut index = broker_order_index.lock().unwrap();
+        index.record_mapping(
+            TbankBrokerOrderRoute::StopOrder,
+            "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
+            "limit-tp-stop-1",
+        );
+        index.record_managed_context(
+            "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
+            TbankManagedOrderContext {
+                side: Some(TbankOrderSide::Buy),
+                order_type: None,
+                report_order_type: Some(OrderType::LimitIfTouched),
+                time_in_force: Some(TimeInForce::Gtc),
+                quantity_units: Some(Decimal::from(20)),
+                trailing: None,
+            },
+        );
+    }
+
+    let report = stream_stop_order_status_report_from_state(
+        order_state_stream_response::StopOrderState {
+            stop_order_id: "limit-tp-stop-1".to_string(),
+            account_id: "account-1".to_string(),
+            direction: OrderDirection::Buy as i32,
+            order_type: crate::grpc::generated::OrderType::Limit as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            status: StopOrderStatusOption::StopOrderStatusActive as i32,
+            ..order_state_stream_response::StopOrderState::default()
+        },
+        current_unix_nanos(),
+        &pending_submits,
+        &broker_order_index,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(report.order_type, OrderType::LimitIfTouched);
+}
+
+#[test]
+fn stop_order_context_records_limit_take_profit_reporting_type() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    client
+        .runtime
+        .record_stop_order_context(
+            "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
+            &StopOrder {
+                stop_order_id: "limit-tp-stop-1".to_string(),
+                direction: StopOrderDirection::Buy as i32,
+                order_type: StopOrderType::TakeProfit as i32,
+                exchange_order_type: ExchangeOrderType::Limit as i32,
+                instrument_uid: "sber-uid".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                ..StopOrder::default()
+            },
+            &metadata,
+        );
+
+    let context = client
+        .runtime
+        .broker_order_index
+        .lock()
+        .unwrap()
+        .managed_context_for_client_order_id("524b1a03-efdd-4cd0-bd56-7cc6570c7156")
+        .unwrap();
+    assert_eq!(context.report_order_type, Some(OrderType::LimitIfTouched));
+}
+
+#[test]
+fn stop_order_submit_reconciliation_accepts_small_broker_clock_skew() {
+    let submitted_ts = UnixNanos::from(1_700_000_000_000_000_000_u64);
+    let earliest_ts = 1_699_999_998_000_000_000_u64;
+    assert_eq!(
+        super::stop_order_submit_earliest_timestamp(submitted_ts),
+        earliest_ts
+    );
+    let query_from = i128::from(earliest_ts);
+    let mut stop = active_sber_stop_order("skewed-stop-1");
+    stop.create_date = Some(prost_types::Timestamp {
+        seconds: 1_699_999_998,
+        nanos: 500_000_000,
+    });
+    assert!(super::stop_order_is_after_submit(
+        &stop,
+        submitted_ts,
+        query_from,
+    ));
+
+    stop.create_date = Some(prost_types::Timestamp {
+        seconds: 1_699_999_997,
+        nanos: 999_999_999,
+    });
+    assert!(!super::stop_order_is_after_submit(
+        &stop,
+        submitted_ts,
+        query_from,
+    ));
+}
+
+#[tokio::test]
+async fn stop_submit_reconciliation_does_not_rebind_known_broker_order() {
+    let service = MockStopOrdersService::default();
+    *service.post_error.lock().unwrap() =
+        Some((Code::Unavailable, "submit response lost".to_string()));
+    let mut known_candidate = active_sber_stop_order("known-stop-order");
+    known_candidate.exchange_order_type = ExchangeOrderType::Market as i32;
+    *service.get_responses.lock().unwrap() = VecDeque::from([
+        GetStopOrdersResponse::default(),
+        GetStopOrdersResponse {
+            stop_orders: vec![known_candidate],
+        },
+    ]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(StopOrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        enable_trading: true,
+        allow_live_trading: true,
+        ..TbankExecutionClientConfig::default()
+    });
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    metadata.lot = 10;
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert(metadata.instrument_id.clone(), metadata);
+    client
+        .runtime
+        .broker_order_index
+        .lock()
+        .unwrap()
+        .record_mapping(
+            TbankBrokerOrderRoute::StopOrder,
+            "other-client-order",
+            "known-stop-order",
+        );
+    client.connect_for_queries().await.unwrap();
+
+    let cmd = submit_stop_order_cmd();
+    let reports = submit_nautilus_order_reports(&mut client.runtime, &cmd, current_unix_nanos())
+        .await
+        .expect("known broker order must not be rebound during reconciliation");
+
+    assert!(reports.is_empty());
+    let index = client.runtime.broker_order_index.lock().unwrap();
+    assert_eq!(
+        index.client_order_id_for_venue_order_id("known-stop-order"),
+        Some("other-client-order".to_string())
+    );
+    assert_eq!(
+        index.identity_for(
+            Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
+            None
+        ),
+        None
+    );
 }
 
 #[test]
@@ -1166,29 +1395,22 @@ async fn submit_reconciliation_partial_fill_bundles_status_and_fill_reports() {
 }
 
 #[tokio::test]
-async fn submit_stop_order_timeout_reconciles_against_stop_orders() {
+async fn submit_stop_order_timeout_stays_unknown_when_snapshot_attribution_is_ambiguous() {
     let service = MockStopOrdersService::default();
     *service.post_error.lock().unwrap() =
         Some((Code::Unavailable, "submit response lost".to_string()));
-    *service.get_response.lock().unwrap() = Some(GetStopOrdersResponse {
-        stop_orders: vec![StopOrder {
-            stop_order_id: "stop-order-1".to_string(),
-            lots_requested: 2,
-            direction: StopOrderDirection::Sell as i32,
-            order_type: StopOrderType::StopLoss as i32,
-            instrument_uid: "sber-uid".to_string(),
-            ticker: "SBER".to_string(),
-            class_code: "TQBR".to_string(),
-            stop_price: Some(MoneyValue {
-                currency: "rub".to_string(),
-                units: 270,
-                nano: 0,
-            }),
-            status: StopOrderStatusOption::StopOrderStatusActive as i32,
-            ..StopOrder::default()
-        }],
-    });
+    let mut first_candidate = active_sber_stop_order("stop-order-1");
+    first_candidate.exchange_order_type = ExchangeOrderType::Market as i32;
+    let mut second_candidate = active_sber_stop_order("stop-order-2");
+    second_candidate.exchange_order_type = ExchangeOrderType::Market as i32;
+    *service.get_responses.lock().unwrap() = VecDeque::from([
+        GetStopOrdersResponse::default(),
+        GetStopOrdersResponse {
+            stop_orders: vec![first_candidate, second_candidate],
+        },
+    ]);
     let post_calls = service.post_calls.clone();
+    let get_calls = service.get_calls.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1223,38 +1445,60 @@ async fn submit_stop_order_timeout_reconciles_against_stop_orders() {
     let cmd = submit_stop_order_cmd();
     let reports = submit_nautilus_order_reports(&mut client.runtime, &cmd, current_unix_nanos())
         .await
-        .unwrap();
+        .expect("ambiguous stop snapshot must remain an unresolved outcome");
+    assert!(reports.is_empty());
 
-    assert_eq!(post_calls.lock().unwrap().len(), 1);
-    let report = single_order_report(&reports);
+    let post_calls = post_calls.lock().unwrap();
+    assert_eq!(post_calls.len(), 1);
+    let get_calls = get_calls.lock().unwrap();
+    assert_eq!(get_calls.len(), 2);
     assert_eq!(
-        report.client_order_id.map(|id| id.to_string()),
-        Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string())
+        get_calls[0].status,
+        StopOrderStatusOption::StopOrderStatusActive as i32
     );
-    assert_eq!(report.venue_order_id.to_string(), "stop-order-1");
-    assert_eq!(report.order_status, OrderStatus::Accepted);
-    assert_eq!(report.order_type, OrderType::StopMarket);
+    assert!(get_calls[0].from.is_none());
+    assert_eq!(
+        get_calls[1].status,
+        StopOrderStatusOption::StopOrderStatusAll as i32
+    );
+    assert!(get_calls[1].from.is_some());
+    assert!(get_calls[1].to.is_some());
+    assert_eq!(
+        client
+            .runtime
+            .pending_submits
+            .lock()
+            .unwrap()
+            .get("524b1a03-efdd-4cd0-bd56-7cc6570c7156")
+            .unwrap()
+            .stage,
+        TbankPendingSubmitStage::Unknown
+    );
     assert_eq!(
         client.runtime.known_broker_order_identity(
             Some(&ClientOrderId::from("524b1a03-efdd-4cd0-bd56-7cc6570c7156")),
             None
         ),
-        Some(TbankBrokerOrderIdentity {
-            route: TbankBrokerOrderRoute::StopOrder,
-            broker_order_id: Some("stop-order-1".to_string()),
-        })
+        None
+    );
+    assert_eq!(
+        client
+            .runtime
+            .broker_order_index
+            .lock()
+            .unwrap()
+            .route_for_client_order_id("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
+        Some(TbankBrokerOrderRoute::StopOrder)
     );
 }
 
 #[tokio::test]
-async fn submit_stop_order_reconciliation_error_starts_background_recovery() {
+async fn stop_order_submit_missing_broker_identity_remains_unknown() {
     let service = MockStopOrdersService::default();
-    *service.post_error.lock().unwrap() =
-        Some((Code::Unavailable, "submit response lost".to_string()));
-    let get_error = Arc::clone(&service.get_error);
-    let get_response = Arc::clone(&service.get_response);
-    let get_calls = Arc::clone(&service.get_calls);
-    *get_error.lock().unwrap() = Some((Code::Unavailable, "query unavailable".to_string()));
+    *service.post_response.lock().unwrap() = Some(PostStopOrderResponse {
+        order_request_id: "missing-stop-order-id".to_string(),
+        ..PostStopOrderResponse::default()
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -1273,11 +1517,71 @@ async fn submit_stop_order_reconciliation_error_starts_background_recovery() {
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
         allow_live_trading: true,
-        reconnect_policy: crate::config::TbankReconnectPolicy {
-            initial_backoff_ms: 1,
-            max_backoff_ms: 5,
-            jitter: false,
+        ..TbankExecutionClientConfig::default()
+    });
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    metadata.lot = 10;
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert(metadata.instrument_id.clone(), metadata);
+    client.connect_for_queries().await.unwrap();
+
+    let cmd = submit_stop_order_cmd();
+    let reports = submit_nautilus_order_reports(&mut client.runtime, &cmd, current_unix_nanos())
+        .await
+        .expect("missing stop_order_id must remain recoverable");
+    assert!(reports.is_empty());
+    assert_eq!(
+        client
+            .runtime
+            .pending_submits
+            .lock()
+            .unwrap()
+            .get("524b1a03-efdd-4cd0-bd56-7cc6570c7156")
+            .unwrap()
+            .stage,
+        TbankPendingSubmitStage::Unknown
+    );
+}
+
+#[tokio::test]
+async fn submit_stop_order_unknown_outcome_recovers_in_background() {
+    let service = MockStopOrdersService::default();
+    *service.post_error.lock().unwrap() =
+        Some((Code::Unavailable, "submit response lost".to_string()));
+    let mut recovered_stop = active_sber_stop_order("stop-order-1");
+    recovered_stop.exchange_order_type = ExchangeOrderType::Market as i32;
+    *service.get_responses.lock().unwrap() = VecDeque::from([
+        GetStopOrdersResponse::default(),
+        GetStopOrdersResponse::default(),
+        GetStopOrdersResponse {
+            stop_orders: vec![recovered_stop],
         },
+    ]);
+    let post_calls = Arc::clone(&service.post_calls);
+    let get_calls = Arc::clone(&service.get_calls);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(StopOrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        enable_trading: true,
+        allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
     let mut metadata = sber_metadata();
@@ -1293,50 +1597,34 @@ async fn submit_stop_order_reconciliation_error_starts_background_recovery() {
 
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let cmd = submit_stop_order_cmd();
-    let outcome = submit_nautilus_order_reports_with_recovery(
+    let reports = submit_nautilus_order_reports_with_recovery(
         &mut client.runtime,
         &cmd,
         current_unix_nanos(),
         Some(test_emitter(sender)),
     )
     .await
-    .unwrap();
+    .expect("unknown stop submit should enter bounded recovery");
     assert!(matches!(
-        outcome,
+        reports,
         super::submit::SubmitPipelineOutcome::Reports(reports) if reports.is_empty()
     ));
-    assert_eq!(
-        client
-            .runtime
-            .pending_submits
-            .lock()
-            .unwrap()
-            .get("524b1a03-efdd-4cd0-bd56-7cc6570c7156")
-            .unwrap()
-            .stage,
-        TbankPendingSubmitStage::Unknown
-    );
-
-    *get_error.lock().unwrap() = None;
-    *get_response.lock().unwrap() = Some(GetStopOrdersResponse {
-        stop_orders: vec![StopOrder {
-            stop_order_id: "stop-order-1".to_string(),
-            lots_requested: 2,
-            direction: StopOrderDirection::Sell as i32,
-            order_type: StopOrderType::StopLoss as i32,
-            instrument_uid: "sber-uid".to_string(),
-            ticker: "SBER".to_string(),
-            class_code: "TQBR".to_string(),
-            stop_price: Some(MoneyValue {
-                currency: "rub".to_string(),
-                units: 270,
-                nano: 0,
-            }),
-            status: StopOrderStatusOption::StopOrderStatusActive as i32,
-            ..StopOrder::default()
-        }],
-    });
-
+    assert_eq!(post_calls.lock().unwrap().len(), 1);
+    {
+        let get_calls = get_calls.lock().unwrap();
+        assert!(get_calls.len() >= 2);
+        assert_eq!(
+            get_calls[0].status,
+            StopOrderStatusOption::StopOrderStatusActive as i32
+        );
+        assert!(get_calls[0].from.is_none());
+        assert_eq!(
+            get_calls[1].status,
+            StopOrderStatusOption::StopOrderStatusAll as i32
+        );
+        assert!(get_calls[1].from.is_some());
+        assert!(get_calls[1].to.is_some());
+    }
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
         .await
         .unwrap()
@@ -1346,12 +1634,23 @@ async fn submit_stop_order_reconciliation_error_starts_background_recovery() {
     };
     assert_eq!(report.order_status, OrderStatus::Accepted);
     assert_eq!(report.venue_order_id.to_string(), "stop-order-1");
-    assert!(get_calls.lock().unwrap().len() >= 2);
+    assert_eq!(
+        client
+            .runtime
+            .pending_submits
+            .lock()
+            .unwrap()
+            .get("524b1a03-efdd-4cd0-bd56-7cc6570c7156")
+            .unwrap()
+            .stage,
+        TbankPendingSubmitStage::Accepted
+    );
 }
 
 #[tokio::test]
-async fn submit_stop_order_response_returns_accepted_fallback_without_reconciliation() {
+async fn submit_stop_order_response_returns_accepted_without_preflight_query() {
     let service = MockStopOrdersService::default();
+    let post_calls = Arc::clone(&service.post_calls);
     let get_calls = Arc::clone(&service.get_calls);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1402,97 +1701,8 @@ async fn submit_stop_order_response_returns_accepted_fallback_without_reconcilia
         report.trigger_price.map(|price| price.as_decimal()),
         Some(Decimal::from(270))
     );
-    assert!(get_calls.lock().unwrap().is_empty());
-}
-
-#[test]
-fn stop_order_submit_match_allows_broker_timestamp_precision_tolerance() {
-    let client = test_client(TbankExecutionClientConfig::default());
-    let mut metadata = sber_metadata();
-    metadata.instrument_uid = "sber-uid".to_string();
-    metadata.lot = 10;
-    let order = TbankSubmitOrder {
-        instrument_id: "SBER_TQBR.MOEX".to_string(),
-        client_order_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
-        broker_request_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
-        side: TbankOrderSide::Sell,
-        order_type: TbankOrderType::StopMarket,
-        time_in_force: TimeInForce::Gtc,
-        quantity_shares: Decimal::from(20),
-        limit_price: None,
-        trigger_price: Some(Decimal::from(270)),
-        trailing: None,
-        confirm_margin_trade: false,
-    };
-    let submitted_ts = UnixNanos::from(1_700_000_000_999_000_000);
-    let stop = StopOrder {
-        stop_order_id: "stop-order-1".to_string(),
-        lots_requested: 2,
-        direction: StopOrderDirection::Sell as i32,
-        order_type: StopOrderType::StopLoss as i32,
-        instrument_uid: "sber-uid".to_string(),
-        stop_price: Some(MoneyValue {
-            currency: "rub".to_string(),
-            units: 270,
-            nano: 0,
-        }),
-        create_date: Some(prost_types::Timestamp {
-            seconds: 1_700_000_000,
-            nanos: 0,
-        }),
-        ..StopOrder::default()
-    };
-
-    assert!(
-        client
-            .runtime
-            .stop_order_matches_submit(&stop, &order, &metadata, submitted_ts)
-    );
-}
-
-#[test]
-fn stop_order_submit_match_rejects_stale_broker_timestamp() {
-    let client = test_client(TbankExecutionClientConfig::default());
-    let mut metadata = sber_metadata();
-    metadata.instrument_uid = "sber-uid".to_string();
-    metadata.lot = 10;
-    let order = TbankSubmitOrder {
-        instrument_id: "SBER_TQBR.MOEX".to_string(),
-        client_order_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
-        broker_request_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
-        side: TbankOrderSide::Sell,
-        order_type: TbankOrderType::StopMarket,
-        time_in_force: TimeInForce::Gtc,
-        quantity_shares: Decimal::from(20),
-        limit_price: None,
-        trigger_price: Some(Decimal::from(270)),
-        trailing: None,
-        confirm_margin_trade: false,
-    };
-    let submitted_ts = UnixNanos::from(1_700_000_003_000_000_000);
-    let stop = StopOrder {
-        stop_order_id: "stop-order-1".to_string(),
-        lots_requested: 2,
-        direction: StopOrderDirection::Sell as i32,
-        order_type: StopOrderType::StopLoss as i32,
-        instrument_uid: "sber-uid".to_string(),
-        stop_price: Some(MoneyValue {
-            currency: "rub".to_string(),
-            units: 270,
-            nano: 0,
-        }),
-        create_date: Some(prost_types::Timestamp {
-            seconds: 1_700_000_000,
-            nanos: 0,
-        }),
-        ..StopOrder::default()
-    };
-
-    assert!(
-        !client
-            .runtime
-            .stop_order_matches_submit(&stop, &order, &metadata, submitted_ts)
-    );
+    assert_eq!(post_calls.lock().unwrap().len(), 1);
+    assert_eq!(get_calls.lock().unwrap().len(), 0);
 }
 
 async fn submit_with_post_error(
@@ -1522,12 +1732,7 @@ async fn submit_with_post_error(
         allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
-    client
-        .runtime
-        .instruments
-        .lock()
-        .unwrap()
-        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    seed_sber_metadata(&mut client);
     client.connect_for_queries().await.unwrap();
 
     let cmd = submit_order_cmd(None);
@@ -1577,12 +1782,7 @@ async fn submit_unresolved_reconciliation_keeps_unknown_pending() {
         allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
-    client
-        .runtime
-        .instruments
-        .lock()
-        .unwrap()
-        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    seed_sber_metadata(&mut client);
     client.connect_for_queries().await.unwrap();
 
     let cmd = submit_order_cmd(None);
@@ -1637,7 +1837,7 @@ async fn submit_unresolved_reconciliation_keeps_unknown_pending() {
             order_id: "exchange-order-1".to_string(),
             direction: OrderDirection::Buy as i32,
             account_id: "account-1".to_string(),
-            instrument_uid: sber_metadata().instrument_uid,
+            instrument_uid: "sber-uid".to_string(),
             trades: Vec::new(),
             ..OrderTrades::default()
         },
@@ -1704,12 +1904,7 @@ async fn submit_unknown_outcome_recovers_in_background_after_initial_miss() {
         },
         ..TbankExecutionClientConfig::default()
     });
-    client
-        .runtime
-        .instruments
-        .lock()
-        .unwrap()
-        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    seed_sber_metadata(&mut client);
     client.connect_for_queries().await.unwrap();
 
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();

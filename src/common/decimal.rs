@@ -83,30 +83,79 @@ pub fn price_to_quotation(
     decimal_to_quotation(price)
 }
 
-/// Converts a Nautilus share quantity to whole T-Bank lots.
-pub fn quantity_shares_to_lots(quantity_shares: Decimal, lot_size: u32) -> Result<i64> {
+/// Converts a Nautilus quantity in shares or contracts to whole T-Bank lots.
+pub fn quantity_units_to_lots(quantity_units: Decimal, lot_size: u32) -> Result<i64> {
     if lot_size == 0 {
         return Err(TbankAdapterError::InvalidQuantity(
             "lot size must be positive".to_string(),
         ));
     }
-    if quantity_shares <= Decimal::ZERO || !quantity_shares.fract().is_zero() {
+    if quantity_units <= Decimal::ZERO || !quantity_units.fract().is_zero() {
         return Err(TbankAdapterError::InvalidQuantity(format!(
-            "share quantity must be a positive whole number, got {quantity_shares}"
+            "quantity units must be a positive whole number, got {quantity_units}"
         )));
     }
 
     let lot = Decimal::from(lot_size);
-    let lots = quantity_shares / lot;
+    let lots = quantity_units / lot;
     if !lots.fract().is_zero() {
         return Err(TbankAdapterError::QuantityNotMultipleOfLot {
-            quantity: quantity_shares.to_string(),
+            quantity: quantity_units.to_string(),
             lot: lot_size,
         });
     }
 
     lots.to_i64()
         .ok_or_else(|| TbankAdapterError::InvalidQuantity(format!("lots out of i64 range: {lots}")))
+}
+
+/// Converts a futures price expressed in points to a settlement-currency
+/// quotation for an endpoint which explicitly requires currency values.
+pub fn futures_points_to_currency(
+    price_points: Decimal,
+    min_price_increment: Decimal,
+    min_price_increment_amount: Decimal,
+) -> Result<Decimal> {
+    if min_price_increment <= Decimal::ZERO || min_price_increment_amount <= Decimal::ZERO {
+        return Err(TbankAdapterError::InvalidPrice(
+            "futures tick and tick amount must be positive".to_string(),
+        ));
+    }
+    ensure_price_on_tick(price_points, min_price_increment)?;
+    Ok(price_points / min_price_increment * min_price_increment_amount)
+}
+
+/// Converts an explicitly currency-valued futures quotation to points.
+pub fn futures_currency_to_points(
+    currency_price: Decimal,
+    min_price_increment: Decimal,
+    min_price_increment_amount: Decimal,
+) -> Result<Decimal> {
+    let points = futures_currency_to_points_without_tick_validation(
+        currency_price,
+        min_price_increment,
+        min_price_increment_amount,
+    )?;
+    ensure_price_on_tick(points, min_price_increment)?;
+    Ok(points)
+}
+
+/// Converts a futures currency amount to points without requiring the result to be on a tick.
+///
+/// Execution and position average prices can be between ticks even when every constituent fill
+/// was executed on a valid tick. Callers converting order or trigger prices must use
+/// [`futures_currency_to_points`] so those venue constraints remain enforced.
+pub fn futures_currency_to_points_without_tick_validation(
+    currency_price: Decimal,
+    min_price_increment: Decimal,
+    min_price_increment_amount: Decimal,
+) -> Result<Decimal> {
+    if min_price_increment <= Decimal::ZERO || min_price_increment_amount <= Decimal::ZERO {
+        return Err(TbankAdapterError::InvalidPrice(
+            "futures tick and tick amount must be positive".to_string(),
+        ));
+    }
+    Ok(currency_price / min_price_increment_amount * min_price_increment)
 }
 
 #[cfg(test)]
@@ -156,10 +205,10 @@ mod tests {
     }
 
     #[test]
-    fn quantity_shares_to_lots_validates_lot_multiple() {
-        assert_eq!(quantity_shares_to_lots(Decimal::from(20), 10).unwrap(), 2);
+    fn quantity_units_to_lots_validates_lot_multiple() {
+        assert_eq!(quantity_units_to_lots(Decimal::from(20), 10).unwrap(), 2);
         assert!(matches!(
-            quantity_shares_to_lots(Decimal::from(15), 10),
+            quantity_units_to_lots(Decimal::from(15), 10),
             Err(TbankAdapterError::QuantityNotMultipleOfLot { .. })
         ));
     }
@@ -176,5 +225,41 @@ mod tests {
     #[test]
     fn price_precision_ignores_trailing_zeros() {
         assert!(price_to_quotation(Decimal::new(25_000_000_000, 8), Decimal::new(1, 2), 2).is_ok());
+    }
+
+    #[test]
+    fn futures_points_currency_conversion_round_trips() {
+        let currency = futures_points_to_currency(
+            Decimal::from(70_000),
+            Decimal::from(1),
+            Decimal::new(125, 1),
+        )
+        .unwrap();
+        assert_eq!(currency, Decimal::from(875_000));
+        assert_eq!(
+            futures_currency_to_points(currency, Decimal::from(1), Decimal::new(125, 1)).unwrap(),
+            Decimal::from(70_000)
+        );
+    }
+
+    #[test]
+    fn futures_average_currency_conversion_allows_between_tick_price() {
+        assert_eq!(
+            futures_currency_to_points_without_tick_validation(
+                Decimal::new(87_500_625, 2),
+                Decimal::ONE,
+                Decimal::new(125, 1),
+            )
+            .unwrap(),
+            Decimal::new(700005, 1)
+        );
+        assert!(
+            futures_currency_to_points(
+                Decimal::new(87_500_625, 2),
+                Decimal::ONE,
+                Decimal::new(125, 1),
+            )
+            .is_err()
+        );
     }
 }

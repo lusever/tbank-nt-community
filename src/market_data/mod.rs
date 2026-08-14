@@ -38,4 +38,7 @@ pub use trades::{TbankQuoteTick, TbankTradeTick};
 pub(crate) struct MarketDataInstrumentMetadata {
     pub lot_size: u32,
     pub price_precision: u8,
+    /// Whether T-Bank's ticker/class fields are descriptive for a configured indicative and
+    /// the registered Nautilus ID must remain the event identity.
+    pub preserve_instrument_id: bool,
 }

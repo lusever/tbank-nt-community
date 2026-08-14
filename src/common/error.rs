@@ -3,6 +3,9 @@ use thiserror::Error;
 /// Result type returned by adapter operations.
 pub type Result<T> = std::result::Result<T, TbankAdapterError>;
 
+/// Safe label used when a broker identity cannot be included in human-readable output.
+pub(crate) const REDACTED_BROKER_IDENTITY: &str = "broker instrument identity";
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 /// Errors produced by configuration, conversion, transport, and execution operations.
 pub enum TbankAdapterError {
@@ -38,6 +41,21 @@ pub enum TbankAdapterError {
     /// The requested instrument is unsupported.
     #[error("unsupported instrument: {0}")]
     UnsupportedInstrument(String),
+    /// The instrument was resolved but is outside the adapter's supported scope.
+    #[error("instrument outside adapter scope: {0}")]
+    InstrumentOutOfScope(String),
+    /// Instrument identity was not resolvable yet and the operation should be retried.
+    #[error("instrument metadata unresolved: {0}")]
+    InstrumentMetadataUnresolved(String),
+    /// Current futures margin metadata is unavailable or incomplete.
+    #[error("futures margin metadata unresolved: {0}")]
+    FuturesMarginUnresolved(String),
+    /// A broker event carried an invalid or contradictory instrument identity.
+    #[error("invalid instrument identity: {0}")]
+    InvalidInstrumentIdentity(String),
+    /// A cancel or reconciliation operation has no resolved broker order ID.
+    #[error("broker order identity unresolved: {0}")]
+    BrokerOrderIdentityUnresolved(String),
     /// The requested order type is unsupported.
     #[error("unsupported order type: {0}")]
     UnsupportedOrderType(String),
@@ -50,10 +68,10 @@ pub enum TbankAdapterError {
     /// An order price is invalid.
     #[error("invalid price: {0}")]
     InvalidPrice(String),
-    /// A share quantity is not an exact lot multiple.
+    /// A quantity in Nautilus units is not an exact lot multiple.
     #[error("quantity {quantity} is not divisible by lot size {lot}")]
     QuantityNotMultipleOfLot {
-        /// Requested share quantity.
+        /// Requested quantity in Nautilus units.
         quantity: String,
         /// Instrument lot size.
         lot: u32,
@@ -69,6 +87,9 @@ pub enum TbankAdapterError {
     /// A value could not be converted between broker and Nautilus representations.
     #[error("conversion error: {0}")]
     ConversionError(String),
+    /// A mutating broker request may have been accepted, but its identity is unavailable.
+    #[error("submit outcome unknown: {0}")]
+    SubmitOutcomeUnknown(String),
     /// Reconnection attempts were exhausted.
     #[error("reconnect failed: {0}")]
     ReconnectFailed(String),

@@ -3,7 +3,7 @@ use std::{
     ops::Deref,
 };
 
-use nautilus_model::enums::TimeInForce;
+use nautilus_model::enums::{OrderType, TimeInForce};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -16,15 +16,21 @@ pub(super) enum TbankBrokerOrderRoute {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct TbankBrokerOrderIdentity {
     pub(super) route: TbankBrokerOrderRoute,
-    pub(super) broker_order_id: Option<String>,
+    pub(super) broker_order_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TbankManagedOrderContext {
     pub(super) side: Option<crate::common::TbankOrderSide>,
     pub(super) order_type: Option<crate::common::TbankOrderType>,
+    /// Canonical Nautilus type used for reports reconstructed from broker stop state.
+    ///
+    /// T-Bank can return external stop subtypes (for example a regular take-profit
+    /// with an exchange limit child) which are not representable by the submit-side
+    /// `TbankOrderType` enum. Keep that reporting identity separately.
+    pub(super) report_order_type: Option<OrderType>,
     pub(super) time_in_force: Option<TimeInForce>,
-    pub(super) quantity_shares: Option<Decimal>,
+    pub(super) quantity_units: Option<Decimal>,
     pub(super) trailing: Option<crate::execution::TbankTrailingStopParams>,
 }
 
@@ -54,6 +60,7 @@ impl Deref for TbankResolvedStreamOrderIdentity {
 #[derive(Debug, Default)]
 pub(super) struct TbankBrokerOrderIndex {
     by_client_order_id: HashMap<String, TbankBrokerOrderIdentity>,
+    pending_route_by_client_order_id: HashMap<String, TbankBrokerOrderRoute>,
     broker_request_id_by_client_order_id: HashMap<String, String>,
     client_order_id_by_request_id: HashMap<String, String>,
     by_venue_order_id: HashMap<String, TbankBrokerOrderRoute>,
@@ -81,15 +88,22 @@ impl TbankBrokerOrderIndex {
         if client_order_id.is_empty() {
             return;
         }
-        self.by_client_order_id
+        if self.by_client_order_id.contains_key(client_order_id) {
+            return;
+        }
+        self.pending_route_by_client_order_id
             .entry(client_order_id.to_string())
-            .and_modify(|identity| {
-                identity.route = route;
-            })
-            .or_insert_with(|| TbankBrokerOrderIdentity {
-                route,
-                broker_order_id: None,
-            });
+            .or_insert(route);
+    }
+
+    pub(super) fn remove_unresolved_client_order_route(&mut self, client_order_id: &str) {
+        if self
+            .pending_route_by_client_order_id
+            .remove(client_order_id)
+            .is_some()
+        {
+            self.pending_cancel_client_order_ids.remove(client_order_id);
+        }
     }
 
     pub(super) fn record_mapping(
@@ -98,19 +112,22 @@ impl TbankBrokerOrderIndex {
         client_order_id: &str,
         venue_order_id: &str,
     ) -> bool {
+        if venue_order_id.is_empty() {
+            return false;
+        }
         self.record_venue_order_id(route, venue_order_id);
         let mut should_cancel = false;
         if !client_order_id.is_empty() {
             should_cancel = self.pending_cancel_client_order_ids.remove(client_order_id);
-            if !venue_order_id.is_empty() {
-                self.client_order_id_by_venue_order_id
-                    .insert(venue_order_id.to_string(), client_order_id.to_string());
-            }
+            self.pending_route_by_client_order_id
+                .remove(client_order_id);
+            self.client_order_id_by_venue_order_id
+                .insert(venue_order_id.to_string(), client_order_id.to_string());
             self.by_client_order_id.insert(
                 client_order_id.to_string(),
                 TbankBrokerOrderIdentity {
                     route,
-                    broker_order_id: Some(venue_order_id.to_string()),
+                    broker_order_id: venue_order_id.to_string(),
                 },
             );
         }
@@ -220,8 +237,10 @@ impl TbankBrokerOrderIndex {
 
     pub(super) fn is_known_regular_order_request_id(&self, broker_request_id: &str) -> bool {
         let client_order_id = self.client_order_id_for_request_id(broker_request_id);
-        self.identity_for(client_order_id.as_deref(), Some(broker_request_id))
-            .is_some_and(|identity| identity.route == TbankBrokerOrderRoute::RegularOrder)
+        client_order_id
+            .as_deref()
+            .and_then(|client_order_id| self.route_for_client_order_id(client_order_id))
+            .is_some_and(|route| route == TbankBrokerOrderRoute::RegularOrder)
     }
 
     pub(super) fn record_venue_order_id(
@@ -249,17 +268,25 @@ impl TbankBrokerOrderIndex {
         {
             return Some(TbankBrokerOrderIdentity {
                 route,
-                broker_order_id: Some(venue_order_id.to_string()),
+                broker_order_id: venue_order_id.to_string(),
             });
         }
-        let mut identity = client_order_id
-            .and_then(|client_order_id| self.by_client_order_id.get(client_order_id).cloned())?;
-        if identity.broker_order_id.is_none()
-            && let Some(venue_order_id) = venue_order_id
-        {
-            identity.broker_order_id = Some(venue_order_id.to_string());
-        }
-        Some(identity)
+        client_order_id
+            .and_then(|client_order_id| self.by_client_order_id.get(client_order_id).cloned())
+    }
+
+    pub(super) fn route_for_client_order_id(
+        &self,
+        client_order_id: &str,
+    ) -> Option<TbankBrokerOrderRoute> {
+        self.by_client_order_id
+            .get(client_order_id)
+            .map(|identity| identity.route)
+            .or_else(|| {
+                self.pending_route_by_client_order_id
+                    .get(client_order_id)
+                    .copied()
+            })
     }
 
     pub(super) fn client_order_id_for_venue_order_id(
@@ -343,26 +370,30 @@ impl TbankBrokerOrderIndex {
     }
 
     pub(super) fn known_regular_broker_order_ids(&self) -> Vec<String> {
-        self.by_client_order_id
+        let mut order_ids = self
+            .by_client_order_id
             .values()
             .filter(|identity| identity.route == TbankBrokerOrderRoute::RegularOrder)
-            .filter_map(|identity| identity.broker_order_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect()
+            .map(|identity| identity.broker_order_id.clone())
+            .collect::<HashSet<_>>();
+        order_ids.extend(
+            self.by_venue_order_id
+                .iter()
+                .filter(|(_, route)| **route == TbankBrokerOrderRoute::RegularOrder)
+                .map(|(order_id, _)| order_id.clone()),
+        );
+        order_ids.into_iter().collect()
     }
 
     pub(super) fn unresolved_regular_request_mappings(&self) -> Vec<(String, String)> {
         self.broker_request_id_by_client_order_id
             .iter()
-            .filter_map(|(client_order_id, broker_request_id)| {
-                self.by_client_order_id
-                    .get(client_order_id)
-                    .filter(|identity| {
-                        identity.route == TbankBrokerOrderRoute::RegularOrder
-                            && identity.broker_order_id.is_none()
-                    })
-                    .map(|_| (client_order_id.clone(), broker_request_id.clone()))
+            .filter(|(client_order_id, _)| {
+                self.pending_route_by_client_order_id.get(*client_order_id)
+                    == Some(&TbankBrokerOrderRoute::RegularOrder)
+            })
+            .map(|(client_order_id, broker_request_id)| {
+                (client_order_id.clone(), broker_request_id.clone())
             })
             .collect()
     }

@@ -16,25 +16,26 @@ Compatibility:
 
 | tbank-nt-community | NautilusTrader | Rust | T-Bank contracts |
 | --- | --- | --- | --- |
-| `0.1.x` | `v1.231.0` | `1.97.1` | Release 1.49, `ef3337c71b7d6dffe61dfdef814fc4e603004f8b` |
+| `0.2.x` | `v1.231.0` | `1.97.1` | Release 1.49 |
 
 ## Scope
 
 Supported:
 
-- MOEX TQBR equities.
+- MOEX TQBR equities and MOEX futures.
+- SPB equities, including `SPBKZ` shares settled in `KZT`.
 - Sandbox and live environments.
 - Instruments and symbol mapping.
 - Market data bars, trades, quotes, and order book snapshots.
 - Historical bars and trades through the main Nautilus data client.
-- Market, limit, stop-market, take-profit-market, trailing-stop-market, and
+- Market, limit, stop-market, market-if-touched, trailing-stop-market, and
   trailing-stop-limit execution mapping.
 - Broker order routing, deterministic request idempotency, and Nautilus execution reconciliation.
 
 Not currently supported:
 
 - Python bindings.
-- ETFs, bonds, futures, and currencies as complete trading products.
+- OTC, dealer, ETFs, bonds, and currencies as complete trading products.
 - Native venue order book deltas.
 - `OrderFillVoided`: T-Bank does not publish an authoritative trade-void/correction reference,
   voided quantity, or reopened-order signal, so the adapter does not infer this event from order or
@@ -54,7 +55,7 @@ tbank-nt-community = { path = "../tbank-nt-community" }
 For a reproducible Git dependency, use an immutable tag:
 
 ```toml
-tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.1.0" }
+tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.2.0" }
 ```
 
 All direct Nautilus dependencies in the consumer must use the same `v1.231.0` source as this
@@ -72,10 +73,11 @@ Order submission follows Nautilus lifecycle semantics: local validation failures
 are supported for independent orders with all-leg preflight; contingent OCO/OTO/OUO lists are
 denied as a whole because T-Bank cannot preserve their semantics.
 
-The adapter follows Nautilus venue-adapter naming conventions: `TBANK` is the canonical client
-identifier and `MOEX` is the canonical venue identifier. Typed values are exported as
-`TBANK_CLIENT_ID` and `MOEX_VENUE`; instrument IDs use the
-`{ticker}_{class_code}.MOEX` form and broker accounts use `TBANK-{broker_account_id}`.
+The adapter follows Nautilus multi-venue conventions: `TBANK` is the broker execution client,
+while public exchange venues are `MOEX` and `SPBE`. Typed values are exported as
+`TBANK_CLIENT_ID`, `MOEX_VENUE`, `SPBE_VENUE`, and `TBANK_VENUE`. Instrument IDs use
+`{ticker}_{class_code}.MOEX` for MOEX shares/futures and `{ticker}_{class_code}.SPBE` for SPB shares;
+broker accounts use `TBANK-{broker_account_id}`.
 
 Nautilus supplies the concrete client config and client name to each `create` call. Both client
 factories are stateless and reject a wrong config type instead of silently substituting defaults.
@@ -85,14 +87,16 @@ Minimal `LiveNode` wiring:
 
 ```rust
 use nautilus_common::enums::Environment as NautilusEnvironment;
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::RoutingConfig, node::LiveNode};
 use nautilus_model::identifiers::TraderId;
 use tbank_nt_community::{
+    register_tbank_currencies,
     TbankDataClientConfig, TbankDataClientFactory, TbankEnvironment,
     TbankExecutionClientConfig, TbankExecutionClientFactory,
 };
 
 let trader_id = TraderId::from("TRADER-001");
+register_tbank_currencies()?;
 let data_config = TbankDataClientConfig {
     environment: TbankEnvironment::Sandbox,
     ..TbankDataClientConfig::default()
@@ -103,24 +107,30 @@ let execution_config = TbankExecutionClientConfig {
     ..TbankExecutionClientConfig::default()
 };
 
+let routing = RoutingConfig::builder()
+    .default(true)
+    .venues(vec!["MOEX".to_string(), "SPBE".to_string()])
+    .build();
 let node = LiveNode::builder(trader_id, NautilusEnvironment::Sandbox)?
-    .add_data_client(
+    .add_data_client_with_routing(
         Some("tbank".to_string()),
         Box::new(TbankDataClientFactory::new()),
         Box::new(data_config),
+        routing.clone(),
     )?
-    .add_exec_client(
+    .add_exec_client_with_routing(
         Some("tbank".to_string()),
         Box::new(TbankExecutionClientFactory::new()),
         Box::new(execution_config),
+        routing,
     )?
     .build()?;
 # Ok::<(), anyhow::Error>(())
 ```
 
-The data client loads the supported TQBR/RUB instrument universe during `connect`, publishes
-Nautilus `Instrument` events before market data starts, and uses the same metadata to map T-Bank
-lot quantities to Nautilus share quantities. Custom remote endpoints must use HTTPS; plaintext HTTP
+The data client loads the supported MOEX shares, SPB shares, and MOEX futures during `connect`,
+publishes Nautilus `Instrument` events before market data starts, and uses the same metadata to map
+T-Bank lot quantities to Nautilus share/contract quantities. Custom remote endpoints must use HTTPS; plaintext HTTP
 is accepted only for loopback test servers.
 
 Historical `RequestBars` and `RequestTrades` messages are handled by that same data client, as in
@@ -172,7 +182,8 @@ Required environment variables:
 
 - `TBANK_SANDBOX_INVEST_TOKEN`
 - `TBANK_SANDBOX_ACCOUNT_ID` for account and order tests
-- `TBANK_SANDBOX_TEST_INSTRUMENT` optionally overrides `SBER_TQBR.MOEX`
+- `TBANK_SANDBOX_TEST_INSTRUMENT` optionally overrides `SBER_TQBR.MOEX`; the acceptance harness currently validates the MOEX/TQBR RUB share path
+- `TBANK_SANDBOX_FUTURES_INSTRUMENT` is required for the separate MOEX/SPBFUT acceptance feature and must name an active RUB futures contract as `TICKER_SPBFUT.MOEX`
 - `TBANK_SANDBOX_PAY_IN_RUB` optionally funds the configured sandbox account
 
 Store these values in the repository-local `.env`, which is excluded from Git, and restrict the
@@ -227,6 +238,21 @@ cargo test --locked \
   -- --ignored --test-threads=1 --nocapture
 ```
 
+MOEX futures acceptance is intentionally separate because contracts expire and the active
+contract must be supplied explicitly:
+
+```bash
+cargo test --locked \
+  --features sandbox-futures-tests \
+  --test sandbox_futures_integration \
+  -- --ignored --test-threads=1 --nocapture
+```
+
+This separate test target resolves the contract through `FutureBy`, checks futures fills and order
+reports in Nautilus points, verifies the broker stop quotation, reconnect recovery, cancellation,
+and leaves no futures position or active stop order behind. Missing futures configuration fails
+this explicit suite; the default share acceptance does not depend on an expiring futures symbol.
+
 For adapter, protobuf, transport, factory, execution, market-data, config, or sandbox-test changes,
 agents run this full acceptance suite by default immediately after `cargo test --locked`. The
 repository instructions provide standing authorization for sandbox mutations only; live trading is
@@ -253,8 +279,10 @@ Execution `connect` publishes the initial account state and waits up to
 reporting the client as connected.
 
 Never place access tokens in tracked repository files, command output, fixtures, or CI artifacts.
-Broker tracking metadata, account identifiers, and venue order identifiers are not included in
-human-readable adapter errors or logs.
+Private broker tracking metadata—authorization metadata, account identifiers, venue order or
+position identifiers, and broker request/idempotency IDs—is not included in human-readable adapter
+errors or logs. Public instrument identifiers such as `ticker`, `class_code`, `FIGI`, and
+`instrument_uid` may be included when useful for diagnostics.
 
 The adapter does not persist parallel lifecycle, event-journal, or market-data-health files.
 Nautilus execution events and reconciliation reports are the execution contract. The adapter

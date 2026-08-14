@@ -1,5 +1,5 @@
 use nautilus_common::enums::Environment;
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::RoutingConfig, node::LiveNode};
 use nautilus_model::identifiers::TraderId;
 use tbank_nt_community::{
     TbankDataClientConfig, TbankDataClientFactory, TbankEnvironment, TbankExecutionClientConfig,
@@ -25,19 +25,25 @@ fn live_node_builds_with_tbank_factories_and_configs() {
         ..TbankExecutionClientConfig::default()
     };
 
+    let routing = RoutingConfig::builder()
+        .default(true)
+        .venues(vec!["MOEX".to_string(), "SPBE".to_string()])
+        .build();
     let node = LiveNode::builder(trader_id, Environment::Sandbox)
         .unwrap()
         .with_name("tbank-adapter-smoke")
-        .add_data_client(
+        .add_data_client_with_routing(
             Some("tbank".to_string()),
             Box::new(TbankDataClientFactory::new()),
             Box::new(data_config),
+            routing.clone(),
         )
         .unwrap()
-        .add_exec_client(
+        .add_exec_client_with_routing(
             Some("tbank".to_string()),
             Box::new(TbankExecutionClientFactory::new()),
             Box::new(execution_config),
+            routing,
         )
         .unwrap()
         .build();

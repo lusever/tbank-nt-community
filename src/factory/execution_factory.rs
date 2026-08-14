@@ -7,7 +7,8 @@ use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_model::enums::{AccountType, OmsType};
 
 use crate::{
-    common::consts::{MOEX_VENUE, TBANK},
+    common::consts::{TBANK, TBANK_VENUE},
+    common::venue::TbankVenue,
     config::TbankExecutionClientConfig,
     execution::{TbankExecutionClient, tbank_account_id},
 };
@@ -45,7 +46,7 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
         let core = ExecutionClientCore::new(
             config.trader_id,
             name.into(),
-            *MOEX_VENUE,
+            *TBANK_VENUE,
             OmsType::Netting,
             account_id,
             AccountType::Margin,
@@ -53,13 +54,10 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
             cache.clone(),
         );
         let mut client = TbankExecutionClient::new(core, config);
-        for instrument in cache
-            .borrow()
-            .instruments(&MOEX_VENUE, None)
-            .into_iter()
-            .cloned()
-        {
-            client.on_instrument(instrument);
+        for venue in TbankVenue::all() {
+            for instrument in cache.borrow().instruments(&venue.venue(), None) {
+                client.on_instrument(instrument.clone());
+            }
         }
         Ok(Box::new(client))
     }

@@ -7,7 +7,9 @@ impl DataClient for TbankDataClient {
     }
 
     fn venue(&self) -> Option<Venue> {
-        Some(*crate::common::consts::MOEX_VENUE)
+        // T-Bank is a multi-venue broker. The command's instrument venue is
+        // registered by LiveNode routing and must not be constrained to MOEX.
+        None
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -136,6 +138,7 @@ impl DataClient for TbankDataClient {
             .clone();
         let timestamp_mode = self.config.candle_timestamp_mode;
         let request_timeout = self.config.historical_candle_request_timeout;
+        let indicative_instruments = self.config.indicative_instruments.clone();
         let sender = get_data_event_sender();
         let instrument_id = request.instrument_id;
         let resolved_client_id = request.client_id.unwrap_or_else(|| self.client_id());
@@ -153,6 +156,7 @@ impl DataClient for TbankDataClient {
                     clients,
                     timestamp_mode,
                     request_timeout,
+                    indicative_instruments,
                 );
                 let resolved = historical.resolve_instrument(instrument_id).await?;
                 let from = start.ok_or_else(|| anyhow::anyhow!("request_trades requires start"))?;
@@ -202,6 +206,7 @@ impl DataClient for TbankDataClient {
         let timestamp_mode = self.config.candle_timestamp_mode;
         let request_timeout = self.config.historical_candle_request_timeout;
         let retries = self.config.historical_candle_max_retries as usize;
+        let indicative_instruments = self.config.indicative_instruments.clone();
         let sender = get_data_event_sender();
         let bar_type = request.bar_type;
         let instrument_id = bar_type.instrument_id();
@@ -221,14 +226,13 @@ impl DataClient for TbankDataClient {
                     clients,
                     timestamp_mode,
                     request_timeout,
+                    indicative_instruments,
                 );
                 let resolved = historical.resolve_instrument(instrument_id).await?;
                 let from = start.ok_or_else(|| anyhow::anyhow!("request_bars requires start"))?;
                 let to = end.ok_or_else(|| anyhow::anyhow!("request_bars requires end"))?;
                 historical
-                    .request_bars(
-                        &resolved, bar_type, interval, from, to, limit, None, retries,
-                    )
+                    .request_bars(&resolved, bar_type, interval, from, to, limit, retries)
                     .await
             }
             .await;

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::{
     common::{
         TbankOrderSide, TbankOrderType,
-        decimal::{price_to_quotation, quantity_shares_to_lots},
+        decimal::{price_to_quotation, quantity_units_to_lots},
         error::{Result, TbankAdapterError},
     },
     config::TbankEnvironment,
@@ -54,8 +54,8 @@ pub struct TbankSubmitOrder {
     pub order_type: TbankOrderType,
     /// Nautilus time-in-force.
     pub time_in_force: TimeInForce,
-    /// Requested quantity in shares.
-    pub quantity_shares: Decimal,
+    /// Requested quantity in Nautilus units (shares or futures contracts).
+    pub quantity_units: Decimal,
     /// Optional limit price.
     pub limit_price: Option<Decimal>,
     /// Optional stop trigger price.
@@ -75,7 +75,10 @@ pub(crate) fn validate_tbank_request_id(request_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn tbank_time_in_force(order: &TbankSubmitOrder) -> Result<TimeInForceType> {
+fn tbank_time_in_force(
+    order: &TbankSubmitOrder,
+    instrument: &TbankInstrumentMetadata,
+) -> Result<TimeInForceType> {
     if order.order_type == TbankOrderType::Market {
         if order.time_in_force != TimeInForce::Ioc {
             return Err(TbankAdapterError::UnsupportedTimeInForce(format!(
@@ -88,6 +91,13 @@ fn tbank_time_in_force(order: &TbankSubmitOrder) -> Result<TimeInForceType> {
     match order.time_in_force {
         TimeInForce::Day => Ok(TimeInForceType::TimeInForceDay),
         TimeInForce::Ioc => Ok(TimeInForceType::TimeInForceFillAndKill),
+        TimeInForce::Fok
+            if instrument.instrument_type == crate::common::TbankInstrumentType::Futures =>
+        {
+            Err(TbankAdapterError::UnsupportedTimeInForce(
+                "T-Bank futures orders do not support FOK".to_string(),
+            ))
+        }
         TimeInForce::Fok => Ok(TimeInForceType::TimeInForceFillOrKill),
         unsupported => Err(TbankAdapterError::UnsupportedTimeInForce(format!(
             "T-Bank regular limit orders support DAY, IOC, or FOK, got {unsupported:?}"
@@ -105,7 +115,7 @@ impl TbankSubmitOrder {
             (
                 TbankEnvironment::Live,
                 TbankOrderType::StopMarket
-                | TbankOrderType::TakeProfitMarket
+                | TbankOrderType::MarketIfTouched
                 | TbankOrderType::TrailingStopMarket
                 | TbankOrderType::TrailingStopLimit,
             ) => TbankExecutionService::LiveStopOrders,
@@ -143,15 +153,19 @@ pub fn build_post_order_request(
     Ok(PostOrderRequest {
         #[allow(deprecated)]
         figi: None,
-        quantity: quantity_shares_to_lots(order.quantity_shares, instrument.lot)?,
+        quantity: quantity_units_to_lots(order.quantity_units, instrument.lot)?,
         price,
         direction: order.side.to_order_direction() as i32,
         account_id: account_id.to_string(),
         order_type: order_type as i32,
         order_id: order.broker_request_id.clone(),
         instrument_id: instrument.instrument_uid.clone(),
-        time_in_force: tbank_time_in_force(order)? as i32,
-        price_type: PriceType::Currency as i32,
+        time_in_force: tbank_time_in_force(order, instrument)? as i32,
+        price_type: if instrument.price_in_points {
+            PriceType::Point as i32
+        } else {
+            PriceType::Currency as i32
+        },
         confirm_margin_trade: order.confirm_margin_trade,
     })
 }
@@ -178,6 +192,7 @@ mod tests {
             exchange: "MOEX".to_string(),
             price_precision: 2,
             quantity_precision: 0,
+            ..Default::default()
         }
     }
 
@@ -190,7 +205,7 @@ mod tests {
             side: TbankOrderSide::Buy,
             order_type: TbankOrderType::Market,
             time_in_force: TimeInForce::Ioc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: None,
             trailing: None,
@@ -216,7 +231,7 @@ mod tests {
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::Market,
             time_in_force: TimeInForce::Ioc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: None,
             trailing: None,
@@ -235,7 +250,7 @@ mod tests {
             side: TbankOrderSide::Buy,
             order_type: TbankOrderType::Market,
             time_in_force: TimeInForce::Day,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: None,
             trailing: None,
@@ -258,7 +273,7 @@ mod tests {
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),
             side: TbankOrderSide::Buy,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             trigger_price: None,
             trailing: None,
             confirm_margin_trade: false,
@@ -283,7 +298,7 @@ mod tests {
                 side: TbankOrderSide::Buy,
                 order_type: TbankOrderType::Limit,
                 time_in_force,
-                quantity_shares: Decimal::from(20),
+                quantity_units: Decimal::from(20),
                 limit_price: Some(Decimal::from(250)),
                 trigger_price: None,
                 trailing: None,
@@ -304,7 +319,7 @@ mod tests {
             side: TbankOrderSide::Buy,
             order_type: TbankOrderType::Limit,
             time_in_force: TimeInForce::Gtc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: Some(Decimal::from(250)),
             trigger_price: None,
             trailing: None,
@@ -326,7 +341,7 @@ mod tests {
             side: TbankOrderSide::Buy,
             order_type: TbankOrderType::Market,
             time_in_force: TimeInForce::Ioc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: None,
             trailing: None,
@@ -347,7 +362,7 @@ mod tests {
             side: TbankOrderSide::Buy,
             order_type: TbankOrderType::Market,
             time_in_force: TimeInForce::Ioc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: None,
             trailing: None,

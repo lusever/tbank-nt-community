@@ -36,8 +36,8 @@ pub enum TbankOrderType {
     Limit,
     /// Stop-market order.
     StopMarket,
-    /// Take-profit market order.
-    TakeProfitMarket,
+    /// Market-if-touched order, represented by T-Bank's stop-order service.
+    MarketIfTouched,
     /// Trailing stop-market order.
     TrailingStopMarket,
     /// Trailing stop-limit order.
@@ -51,7 +51,7 @@ impl TbankOrderType {
             Self::Market => Some(OrderType::Market),
             Self::Limit => Some(OrderType::Limit),
             Self::StopMarket
-            | Self::TakeProfitMarket
+            | Self::MarketIfTouched
             | Self::TrailingStopMarket
             | Self::TrailingStopLimit => None,
         }
@@ -61,7 +61,7 @@ impl TbankOrderType {
     pub const fn to_stop_order_type(self) -> Option<StopOrderType> {
         match self {
             Self::StopMarket => Some(StopOrderType::StopLoss),
-            Self::TakeProfitMarket | Self::TrailingStopMarket | Self::TrailingStopLimit => {
+            Self::MarketIfTouched | Self::TrailingStopMarket | Self::TrailingStopLimit => {
                 Some(StopOrderType::TakeProfit)
             }
             Self::Market | Self::Limit => None,

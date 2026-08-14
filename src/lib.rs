@@ -23,6 +23,8 @@ pub mod market_data;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use common::consts::{SPBE, SPBE_VENUE, TBANK_VENUE};
+pub use common::{TbankInstrumentType, TbankVenue, register_tbank_currencies};
 pub use config::{
     TbankDataClientConfig, TbankEnvironment, TbankExecutionClientConfig,
     TbankIndicativeInstrumentConfig,

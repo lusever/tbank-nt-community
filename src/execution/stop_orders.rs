@@ -1,7 +1,7 @@
 use crate::{
     common::{
         TbankOrderType,
-        decimal::{decimal_to_quotation, price_to_quotation, quantity_shares_to_lots},
+        decimal::{decimal_to_quotation, price_to_quotation, quantity_units_to_lots},
         error::{Result, TbankAdapterError},
     },
     execution::orders::{TbankSubmitOrder, validate_tbank_request_id},
@@ -18,6 +18,7 @@ fn trailing_value(
     value: Decimal,
     value_type: TrailingOffsetType,
     field: &str,
+    instrument: &TbankInstrumentMetadata,
 ) -> Result<(crate::grpc::generated::Quotation, TrailingValueType)> {
     if value <= Decimal::ZERO {
         return Err(TbankAdapterError::InvalidPrice(format!(
@@ -26,7 +27,11 @@ fn trailing_value(
     }
     match value_type {
         TrailingOffsetType::Price => Ok((
-            decimal_to_quotation(value)?,
+            price_to_quotation(
+                value,
+                instrument.min_price_increment,
+                instrument.price_precision,
+            )?,
             TrailingValueType::TrailingValueAbsolute,
         )),
         TrailingOffsetType::BasisPoints => Ok((
@@ -89,16 +94,19 @@ pub fn build_post_stop_order_request(
                 )
             })
             .transpose()?,
-        None => Some(price_to_quotation(
-            order.trigger_price.ok_or_else(|| {
+        None => {
+            let price = order.trigger_price.ok_or_else(|| {
                 TbankAdapterError::InvalidPrice("trigger price required".to_string())
-            })?,
-            instrument.min_price_increment,
-            instrument.price_precision,
-        )?),
+            })?;
+            Some(price_to_quotation(
+                price,
+                instrument.min_price_increment,
+                instrument.price_precision,
+            )?)
+        }
     };
     let price = match order.order_type {
-        TbankOrderType::StopMarket | TbankOrderType::TakeProfitMarket => None,
+        TbankOrderType::StopMarket | TbankOrderType::MarketIfTouched => None,
         TbankOrderType::TrailingStopMarket | TbankOrderType::TrailingStopLimit => None,
         TbankOrderType::Market | TbankOrderType::Limit => {
             return Err(TbankAdapterError::UnsupportedOrderType(format!(
@@ -111,7 +119,7 @@ pub fn build_post_stop_order_request(
     Ok(PostStopOrderRequest {
         #[allow(deprecated)]
         figi: None,
-        quantity: quantity_shares_to_lots(order.quantity_shares, instrument.lot)?,
+        quantity: quantity_units_to_lots(order.quantity_units, instrument.lot)?,
         price,
         stop_price,
         direction: order.side.to_stop_order_direction() as i32,
@@ -122,13 +130,13 @@ pub fn build_post_stop_order_request(
         instrument_id: instrument.instrument_uid.clone(),
         exchange_order_type: match order.order_type {
             TbankOrderType::StopMarket
-            | TbankOrderType::TakeProfitMarket
+            | TbankOrderType::MarketIfTouched
             | TbankOrderType::TrailingStopMarket => ExchangeOrderType::Market,
             TbankOrderType::TrailingStopLimit => ExchangeOrderType::Limit,
             TbankOrderType::Market | TbankOrderType::Limit => ExchangeOrderType::Unspecified,
         } as i32,
         take_profit_type: match order.order_type {
-            TbankOrderType::TakeProfitMarket => TakeProfitType::Regular,
+            TbankOrderType::MarketIfTouched => TakeProfitType::Regular,
             TbankOrderType::TrailingStopMarket | TbankOrderType::TrailingStopLimit => {
                 TakeProfitType::Trailing
             }
@@ -142,11 +150,16 @@ pub fn build_post_stop_order_request(
                     params.trailing_offset,
                     params.trailing_offset_type,
                     "offset",
+                    instrument,
                 )?;
                 let (spread, spread_type) = match params.limit_offset {
                     Some(value) => {
-                        let (value, value_type) =
-                            trailing_value(value, params.trailing_offset_type, "limit offset")?;
+                        let (value, value_type) = trailing_value(
+                            value,
+                            params.trailing_offset_type,
+                            "limit offset",
+                            instrument,
+                        )?;
                         (Some(value), value_type)
                     }
                     None if order.order_type == TbankOrderType::TrailingStopMarket => {
@@ -166,7 +179,11 @@ pub fn build_post_stop_order_request(
                 })
             })
             .transpose()?,
-        price_type: PriceType::Currency as i32,
+        price_type: if instrument.price_in_points {
+            PriceType::Point as i32
+        } else {
+            PriceType::Currency as i32
+        },
         order_id: order.broker_request_id.clone(),
         confirm_margin_trade: order.confirm_margin_trade,
         instant_execution: trailing.map(|params| params.activation_price.is_none()),
@@ -203,19 +220,101 @@ mod tests {
             exchange: "MOEX".to_string(),
             price_precision: 2,
             quantity_precision: 0,
+            ..Default::default()
+        }
+    }
+
+    fn futures_instrument() -> TbankInstrumentMetadata {
+        TbankInstrumentMetadata {
+            instrument_id: "Si-9.26_SPBFUT.MOEX".to_string(),
+            ticker: "Si-9.26".to_string(),
+            class_code: "SPBFUT".to_string(),
+            instrument_uid: "future-uid".to_string(),
+            instrument_type: crate::common::venue::TbankInstrumentType::Futures,
+            price_in_points: true,
+            min_price_increment: Decimal::ONE,
+            min_price_increment_amount: Some(Decimal::new(125, 1)),
+            lot: 1,
+            ..Default::default()
         }
     }
 
     #[test]
-    fn take_profit_market_maps_to_regular_take_profit() {
+    fn futures_stop_order_uses_point_trigger_and_price_type() {
+        let order = TbankSubmitOrder {
+            instrument_id: "Si-9.26_SPBFUT.MOEX".to_string(),
+            client_order_id: REQUEST_ID.to_string(),
+            broker_request_id: REQUEST_ID.to_string(),
+            side: TbankOrderSide::Sell,
+            order_type: TbankOrderType::StopMarket,
+            time_in_force: TimeInForce::Gtc,
+            quantity_units: Decimal::ONE,
+            limit_price: None,
+            trigger_price: Some(Decimal::from(70_000)),
+            trailing: None,
+            confirm_margin_trade: false,
+        };
+
+        let request = build_post_stop_order_request(&order, "account", &futures_instrument())
+            .expect("T-Bank stop-order endpoint accepts futures prices in points");
+        assert_eq!(request.quantity, 1);
+        assert_eq!(request.stop_order_type, StopOrderType::StopLoss as i32);
+        assert_eq!(request.price_type, PriceType::Point as i32);
+        let stop_price = request.stop_price.expect("futures stop price");
+        assert_eq!(stop_price.units, 70_000);
+        assert_eq!(stop_price.nano, 0);
+    }
+
+    #[test]
+    fn futures_trailing_stop_uses_point_activation_and_offsets() {
+        let order = TbankSubmitOrder {
+            instrument_id: "Si-9.26_SPBFUT.MOEX".to_string(),
+            client_order_id: REQUEST_ID.to_string(),
+            broker_request_id: REQUEST_ID.to_string(),
+            side: TbankOrderSide::Sell,
+            order_type: TbankOrderType::TrailingStopLimit,
+            time_in_force: TimeInForce::Gtc,
+            quantity_units: Decimal::ONE,
+            limit_price: None,
+            trigger_price: None,
+            trailing: Some(TbankTrailingStopParams {
+                activation_price: Some(Decimal::from(70_000)),
+                trailing_offset: Decimal::from(10),
+                trailing_offset_type: TrailingOffsetType::Price,
+                limit_offset: Some(Decimal::from(2)),
+                trigger_type: None,
+            }),
+            confirm_margin_trade: false,
+        };
+
+        let request = build_post_stop_order_request(&order, "account", &futures_instrument())
+            .expect("futures trailing stop should use point quotations");
+        assert_eq!(request.price_type, PriceType::Point as i32);
+        assert_eq!(
+            crate::common::decimal::quotation_to_decimal(request.stop_price.as_ref().unwrap()),
+            Decimal::from(70_000)
+        );
+        let trailing = request.trailing_data.unwrap();
+        assert_eq!(
+            crate::common::decimal::quotation_to_decimal(trailing.indent.as_ref().unwrap()),
+            Decimal::from(10)
+        );
+        assert_eq!(
+            crate::common::decimal::quotation_to_decimal(trailing.spread.as_ref().unwrap()),
+            Decimal::from(2)
+        );
+    }
+
+    #[test]
+    fn market_if_touched_maps_to_regular_take_profit() {
         let order = TbankSubmitOrder {
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),
             side: TbankOrderSide::Sell,
-            order_type: TbankOrderType::TakeProfitMarket,
+            order_type: TbankOrderType::MarketIfTouched,
             time_in_force: TimeInForce::Gtc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: Some(Decimal::new(26_000, 2)),
             trailing: None,
@@ -242,7 +341,7 @@ mod tests {
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::StopMarket,
             time_in_force: TimeInForce::Gtc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: Some(Decimal::new(25_000, 2)),
             trailing: None,
@@ -261,7 +360,7 @@ mod tests {
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::StopMarket,
             time_in_force: TimeInForce::Gtc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: Some(Decimal::new(25_000, 2)),
             trailing: None,
@@ -282,7 +381,7 @@ mod tests {
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::TrailingStopMarket,
             time_in_force: TimeInForce::Gtc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: None,
             trailing: Some(TbankTrailingStopParams {
@@ -325,7 +424,7 @@ mod tests {
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::TrailingStopLimit,
             time_in_force: TimeInForce::Gtc,
-            quantity_shares: Decimal::from(20),
+            quantity_units: Decimal::from(20),
             limit_price: None,
             trigger_price: None,
             trailing: Some(TbankTrailingStopParams {

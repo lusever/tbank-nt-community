@@ -1,12 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fmt,
-    str::FromStr,
     time::Duration,
 };
 
 use nautilus_common::factories::ClientConfig;
-use nautilus_model::types::Currency;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -76,7 +74,10 @@ pub struct TbankDataClientConfig {
     /// Base delay for historical candle retry backoff.
     pub historical_candle_retry_base_delay: Duration,
     #[builder(default)]
-    /// Nautilus instrument IDs mapped to broker stream IDs.
+    /// Explicit Nautilus instrument IDs mapped to broker stream IDs.
+    ///
+    /// Futures must be listed here to be loaded: their current tick-value contract requires a
+    /// separate broker request per instrument and is therefore not auto-discovered.
     pub instrument_stream_ids: HashMap<String, String>,
     #[builder(default)]
     /// Explicit definitions for non-tradable indicative instruments requested from T-Bank.
@@ -96,6 +97,9 @@ pub struct TbankDataClientConfig {
     #[builder(default = Duration::from_secs(180))]
     /// Maximum allowed period without market-data stream traffic.
     pub market_data_stream_idle_timeout: Duration,
+    #[builder(default = Duration::from_secs(60 * 60))]
+    /// Interval between broker instrument-catalog refreshes; zero disables refresh.
+    pub instrument_refresh_interval: Duration,
 }
 
 impl fmt::Debug for TbankDataClientConfig {
@@ -149,6 +153,10 @@ impl fmt::Debug for TbankDataClientConfig {
                 "market_data_stream_idle_timeout",
                 &self.market_data_stream_idle_timeout,
             )
+            .field(
+                "instrument_refresh_interval",
+                &self.instrument_refresh_interval,
+            )
             .finish()
     }
 }
@@ -193,7 +201,7 @@ impl TbankDataClientConfig {
         for (instrument_id, definition) in &self.indicative_instruments {
             if !instrument_id.ends_with(".MOEX")
                 || definition.price_increment <= Decimal::ZERO
-                || Currency::from_str(&definition.currency.to_uppercase()).is_err()
+                || crate::common::currency::currency_from_code(&definition.currency).is_err()
             {
                 return Err(TbankAdapterError::ConfigError(format!(
                     "invalid indicative definition for {instrument_id}: currency={} price_increment={}",
@@ -442,6 +450,14 @@ mod tests {
             Err(TbankAdapterError::ConfigError(message))
                 if message == "periodic_candle_poll_interval must be positive when polling instruments"
         ));
+    }
+
+    #[test]
+    fn instrument_catalogue_refresh_is_enabled_by_default() {
+        assert_eq!(
+            TbankDataClientConfig::default().instrument_refresh_interval,
+            Duration::from_secs(60 * 60)
+        );
     }
 
     #[test]

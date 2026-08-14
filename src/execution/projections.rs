@@ -177,6 +177,7 @@ mod tests {
             account_id,
             &mut partial_snapshot,
             current_unix_nanos(),
+            super::TbankPositionProjectionSource::SecuritiesSnapshot,
             false,
         );
 
@@ -823,6 +824,7 @@ pub(super) fn reconcile_position_source_snapshot(
     }
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_portfolio_snapshot(
     projection: &Arc<Mutex<HashMap<String, TbankProjectedPosition>>>,
     account_id: AccountId,
@@ -838,6 +840,7 @@ pub(super) fn reconcile_portfolio_snapshot(
     );
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_position_snapshot(
     projection: &Arc<Mutex<HashMap<String, TbankProjectedPosition>>>,
     account_id: AccountId,
@@ -858,14 +861,16 @@ pub(super) fn apply_position_snapshot(
     account_id: AccountId,
     reports: &mut Vec<PositionStatusReport>,
     ts_init: UnixNanos,
+    source: TbankPositionProjectionSource,
     is_complete: bool,
 ) {
     if is_complete {
-        reconcile_position_snapshot(projection, account_id, reports, ts_init);
+        reconcile_position_source_snapshot(projection, account_id, reports, ts_init, source);
     } else {
-        reports.retain(|report| record_position_projection(projection, report));
+        reports.retain(|report| record_position_projection_from_source(projection, report, source));
         tracing::warn!(
-            "T-Bank position snapshot is still loading; preserving positions absent from the partial snapshot"
+            ?source,
+            "T-Bank position snapshot is incomplete; preserving positions absent from the partial snapshot"
         );
     }
 }

@@ -15,6 +15,10 @@ pub(super) struct TbankReconnectReconciliationCounts {
     fills: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("invalid T-Bank reconciliation fill event: {0}")]
+struct TbankReconciliationEventError(#[source] anyhow::Error);
+
 impl TbankReconnectReconciler {
     pub(super) fn new(client: TbankExecutionRuntime, emitter: ExecutionEventEmitter) -> Self {
         Self {
@@ -68,12 +72,28 @@ pub(super) fn reconnect_reconciliation_error_is_transient(error: &anyhow::Error)
         .is_some_and(|status| crate::grpc::retry::is_transient_status(status.code()))
 }
 
+pub(super) fn reconciliation_adapter_error_is_safe_to_skip(error: &TbankAdapterError) -> bool {
+    matches!(error, TbankAdapterError::InstrumentOutOfScope(_))
+        || TbankExecutionRuntime::metadata_error_is_event_rejection(error)
+}
+
+pub(super) fn reconnect_reconciliation_error_is_safe_to_skip(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<TbankReconciliationEventError>()
+        .is_some()
+        || error
+            .downcast_ref::<TbankAdapterError>()
+            .is_some_and(reconciliation_adapter_error_is_safe_to_skip)
+}
+
 pub(super) fn tbank_adapter_error_is_transient(error: &TbankAdapterError) -> bool {
     match error {
         TbankAdapterError::RateLimited(_) => true,
         TbankAdapterError::GrpcStatus { code, .. } => {
             crate::grpc::retry::is_transient_status(*code)
         }
+        TbankAdapterError::InstrumentMetadataUnresolved(_)
+        | TbankAdapterError::FuturesMarginUnresolved(_) => true,
         _ => false,
     }
 }
@@ -317,13 +337,23 @@ pub(super) async fn publish_reconnect_reconciliation(
             && let Some(stop) = stop_by_id.get(stop_id.as_str())
         {
             activated_stop_ids.insert(stop_id.clone());
-            let lot_size = query_client.lot_size_for_stop_order(stop).await?;
+            let metadata = match query_client.metadata_for_stop_order(stop).await {
+                Ok(metadata) => metadata,
+                Err(error) if reconciliation_adapter_error_is_safe_to_skip(&error) => {
+                    tracing::warn!(
+                        %error,
+                        "skipping T-Bank activated stop order with unsupported or invalid event identity during reconciliation"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             query_client.record_broker_order_id(
                 TbankBrokerOrderRoute::StopOrder,
                 stop.stop_order_id.as_str(),
             );
             if let Some(client_order_id) = stop_client_order_ids.get(stop_id.as_str()) {
-                query_client.record_stop_order_context(client_order_id, stop, lot_size);
+                query_client.record_stop_order_context(client_order_id, stop, &metadata);
             }
             if !state.order_id.is_empty() {
                 query_client.record_activated_stop_child_mapping(
@@ -335,22 +365,28 @@ pub(super) async fn publish_reconnect_reconciliation(
                     state.order_id.as_str(),
                 );
             }
-            match activated_stop_child_status_report(
+            let managed_order_type = query_client.managed_order_type_for_client_order_id(
+                stop_client_order_ids
+                    .get(stop_id.as_str())
+                    .map(String::as_str),
+            );
+            match activated_stop_child_status_report_with_context(
                 query_client.account_id(),
                 stop,
                 &state,
                 ts_init,
-                lot_size,
+                metadata.lot,
                 stop_client_order_ids
                     .get(stop_id.as_str())
                     .map(String::as_str),
+                Some(&query_client.instruments),
+                managed_order_type,
             ) {
                 Ok(report) => order_reports.push(report),
-                Err(error) => tracing::warn!(
-                    %error,
-                    %stop_id,
-                    "skipping malformed activated T-Bank stop child during reconnect reconciliation"
-                ),
+                Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
+                    tracing::warn!(%error, "skipping activated T-Bank stop child event during reconnect reconciliation");
+                }
+                Err(error) => return Err(error),
             }
             continue;
         }
@@ -359,12 +395,10 @@ pub(super) async fn publish_reconnect_reconciliation(
             .await
         {
             Ok(report) => order_reports.push(report),
-            Err(error) if reconnect_reconciliation_error_is_transient(&error) => {
-                return Err(error);
+            Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
+                tracing::warn!(%error, "skipping T-Bank order event during reconnect reconciliation");
             }
-            Err(error) => {
-                tracing::warn!(%error, "skipping malformed T-Bank order during reconnect reconciliation")
-            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -377,22 +411,42 @@ pub(super) async fn publish_reconnect_reconciliation(
             .lock()
             .expect("broker_order_index lock")
             .client_order_id_for_venue_order_id(stop.stop_order_id.as_str());
+        let metadata = match query_client.metadata_for_stop_order(&stop).await {
+            Ok(metadata) => metadata,
+            Err(error) if reconciliation_adapter_error_is_safe_to_skip(&error) => {
+                tracing::warn!(
+                    %error,
+                        "skipping T-Bank stop order with unsupported or invalid event identity during reconciliation"
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         query_client.record_broker_order_id(
             TbankBrokerOrderRoute::StopOrder,
             stop.stop_order_id.as_str(),
         );
-        let lot_size = query_client.lot_size_for_stop_order(&stop).await?;
         if let Some(client_order_id) = client_order_id.as_deref() {
-            query_client.record_stop_order_context(client_order_id, &stop, lot_size);
+            query_client.record_stop_order_context(client_order_id, &stop, &metadata);
         }
-        match stop_order_status_report(query_client.account_id(), stop, ts_init, lot_size) {
+        let managed_order_type =
+            query_client.managed_order_type_for_client_order_id(client_order_id.as_deref());
+        match stop_order_status_report_with_context(
+            query_client.account_id(),
+            stop,
+            ts_init,
+            metadata.lot,
+            Some(&query_client.instruments),
+            managed_order_type,
+        ) {
             Ok(mut report) => {
                 report.client_order_id = client_order_id.map(Into::into);
                 order_reports.push(report);
             }
-            Err(error) => {
-                tracing::warn!(%error, "skipping malformed T-Bank stop order during reconnect reconciliation")
+            Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
+                tracing::warn!(%error, "skipping T-Bank stop order event during reconnect reconciliation");
             }
+            Err(error) => return Err(error),
         }
     }
 
@@ -402,20 +456,56 @@ pub(super) async fn publish_reconnect_reconciliation(
     query_client.ensure_lifecycle_active()?;
     let mut fill_reports = Vec::new();
     for item in &operations.items {
-        for report in fill_reports_from_operation(query_client.account_id(), item, ts_init) {
-            let report = report.map(|report| {
-                let source_identity = (
-                    report.venue_order_id.to_string(),
-                    report.trade_id.to_string(),
+        if fill_side_from_operation_type(item.r#type).is_none() {
+            continue;
+        }
+        match query_client
+            .load_supported_metadata_for_identity(
+                &item.instrument_uid,
+                &item.figi,
+                &item.ticker,
+                &item.class_code,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(TbankAdapterError::InstrumentOutOfScope(_)) => {
+                tracing::debug!(
+                    "ignoring T-Bank reconciliation fill outside the supported adapter scope"
                 );
-                let report = canonicalize_reconciled_stop_fill(
-                    &query_client,
-                    report,
-                    &stop_id_by_exchange_order_id,
-                    &stop_client_order_ids,
+                continue;
+            }
+            Err(error) if TbankExecutionRuntime::metadata_error_is_event_rejection(&error) => {
+                tracing::warn!(
+                    %error,
+                    "skipping malformed T-Bank reconciliation fill with invalid instrument identity"
                 );
-                (source_identity, report)
-            });
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        for report in fill_reports_from_cursor_operation_with_instruments(
+            query_client.account_id(),
+            item,
+            ts_init,
+            Some(&query_client.instruments),
+        ) {
+            let report = report
+                .map_err(TbankReconciliationEventError)
+                .map_err(anyhow::Error::from)
+                .map(|report| {
+                    let source_identity = (
+                        report.venue_order_id.to_string(),
+                        report.trade_id.to_string(),
+                    );
+                    let report = canonicalize_reconciled_stop_fill(
+                        &query_client,
+                        report,
+                        &stop_id_by_exchange_order_id,
+                        &stop_client_order_ids,
+                    );
+                    (source_identity, report)
+                });
             match report.and_then(|(source_identity, report)| {
                 project_and_settle_reconciled_trade_fill(
                     &query_client,
@@ -429,9 +519,10 @@ pub(super) async fn publish_reconnect_reconciliation(
                         fill_reports.push(report);
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "skipping malformed T-Bank fill during reconnect reconciliation")
+                Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
+                    tracing::warn!(%error, "skipping malformed T-Bank fill during reconnect reconciliation");
                 }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -483,7 +574,9 @@ pub(super) fn project_and_settle_reconciled_trade_fill(
     query_client
         .lifecycle_active
         .run_if_active(|| {
-            let report = query_client.project_trade_fill_report(report)?;
+            let report = query_client
+                .project_trade_fill_report(report)
+                .map_err(TbankReconciliationEventError)?;
             settle_reconciled_buffered_trade_fill(
                 &query_client.unresolved_trade_fills,
                 source_venue_order_id,
@@ -589,7 +682,7 @@ pub(super) fn schedule_regular_order_reconciliation(
                         .lock()
                         .expect("broker_order_index lock")
                         .identity_for(client_order_id.as_deref(), None)
-                        .and_then(|identity| identity.broker_order_id)
+                        .map(|identity| identity.broker_order_id)
                         .unwrap_or(reconciled_venue_order_id);
                     if let Err(error) = publish_buffered_trade_fills_for_venue(
                         current_order_id.as_str(),
@@ -696,28 +789,34 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                     let ts_init = current_unix_nanos();
                     let report = match query_client
                         .resolve_activated_stop_mapping(
-                            Some(state.order_request_id.as_str()),
                             venue_order_id.as_str(),
+                            Some(state.order_request_id.as_str()),
                         )
                         .await
                     {
                         Ok(Some((stop, client_order_id))) => {
-                            let report = match query_client.lot_size_for_stop_order(&stop).await {
-                                Ok(lot_size) => {
+                            let report = match query_client.metadata_for_stop_order(&stop).await {
+                                Ok(metadata) => {
                                     if let Some(client_order_id) = client_order_id.as_deref() {
                                         query_client.record_stop_order_context(
                                             client_order_id,
                                             &stop,
-                                            lot_size,
+                                            &metadata,
                                         );
                                     }
-                                    activated_stop_child_status_report(
+                                    let managed_order_type =
+                                        query_client.managed_order_type_for_client_order_id(
+                                            client_order_id.as_deref(),
+                                        );
+                                    activated_stop_child_status_report_with_context(
                                         query_client.account_id(),
                                         &stop,
                                         &state,
                                         ts_init,
-                                        lot_size,
+                                        metadata.lot,
                                         client_order_id.as_deref(),
+                                        Some(&query_client.instruments),
+                                        managed_order_type,
                                     )
                                     .map(|report| (report, true))
                                 }
@@ -845,7 +944,12 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                     "publishing unresolved T-Bank fill with external regular-order identity after lookup exhaustion"
                 );
                 let activated_stop = match query_client
-                    .resolve_activated_stop_mapping(None, venue_order_id.as_str())
+                    .resolve_activated_stop_mapping(
+                        venue_order_id.as_str(),
+                        latest_order_state
+                            .as_ref()
+                            .map(|state| state.order_request_id.as_str()),
+                    )
                     .await
                 {
                     Ok(Some(_)) => true,

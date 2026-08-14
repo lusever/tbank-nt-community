@@ -1,6 +1,7 @@
 //! NautilusTrader [`ExecutionClient`] boundary for the T-Bank client.
 
 use super::*;
+use crate::common::venue::TbankVenue;
 use anyhow::Context;
 
 pub(super) fn order_report_matches_command(
@@ -79,6 +80,12 @@ impl ExecutionClient for TbankExecutionClient {
         self.core.venue
     }
 
+    fn handles_order_venue(&self, venue: Venue) -> bool {
+        crate::common::venue::TbankVenue::from_str(venue.as_str())
+            .ok()
+            .is_some_and(|venue| TbankVenue::all().contains(&venue))
+    }
+
     fn oms_type(&self) -> OmsType {
         self.core.oms_type
     }
@@ -107,6 +114,7 @@ impl ExecutionClient for TbankExecutionClient {
         if !self.runtime.emitter.is_initialized() {
             self.runtime.emitter.set_sender(get_exec_event_sender());
         }
+        self.subscribe_instrument_updates();
         self.core.set_started();
         Ok(())
     }
@@ -129,6 +137,7 @@ impl ExecutionClient for TbankExecutionClient {
                 "cannot reset T-Bank execution client while broker mutation outcomes are unresolved"
             );
         }
+        self.unsubscribe_instrument_updates();
         self.runtime.reset_state();
         self.core.set_stopped();
         Ok(())
@@ -143,6 +152,7 @@ impl ExecutionClient for TbankExecutionClient {
                 "cannot dispose T-Bank execution client while broker mutation outcomes are unresolved"
             );
         }
+        self.unsubscribe_instrument_updates();
         self.core.set_stopped();
         Ok(())
     }
@@ -181,21 +191,28 @@ impl ExecutionClient for TbankExecutionClient {
         let client_order_id = cmd.client_order_id;
         let order_type = cmd.order_init.order_type;
         let emitter = self.runtime.emitter.clone();
-        self.runtime.spawn_mutating_command_task(async move {
+        let route_runtime = self.runtime.clone();
+        let route_client_order_id = client_order_id;
+        self.runtime.spawn_mutating_command_task_with(async move {
             let prepared = match prepare_nautilus_order(&mut client, cmd).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     tracing::warn!(%error, %client_order_id, "denying Nautilus order during local preflight");
+                    client.remove_unresolved_broker_order_route(client_order_id.as_str());
                     emitter.emit_order_denied(&order, &error.to_string());
                     return;
                 }
             };
-            client.prepare_submit_route(&client_order_id, order_type);
             emitter.emit_order_submitted(&order);
             if let Err(error) = submit_prepared_nautilus_order(&mut client, prepared, emitter).await
             {
                 tracing::error!(%error, "failed to submit Nautilus order to T-Bank");
             }
+        }, move || {
+            // The task is registered but has not started its async preflight.
+            // Publish the route at this acceptance boundary so a concurrent
+            // CancelOrder cannot fall back to OrdersService.
+            route_runtime.prepare_submit_route(&route_client_order_id, order_type);
         })?;
         Ok(())
     }
@@ -225,7 +242,22 @@ impl ExecutionClient for TbankExecutionClient {
         }
         let mut client = self.runtime.clone();
         let emitter = self.runtime.emitter.clone();
-        self.runtime.spawn_mutating_command_task(async move {
+        let submit_routes = if commands.iter().any(|command| {
+            command
+                .order_init
+                .contingency_type
+                .is_some_and(|value| value != ContingencyType::NoContingency)
+        }) {
+            Vec::new()
+        } else {
+            commands
+                .iter()
+                .map(|command| (command.client_order_id, command.order_init.order_type))
+                .collect::<Vec<_>>()
+        };
+        let submit_routes_for_cleanup = submit_routes.clone();
+        let route_runtime = self.runtime.clone();
+        self.runtime.spawn_mutating_command_task_with(async move {
             if commands
                 .iter()
                 .any(|command| {
@@ -245,11 +277,13 @@ impl ExecutionClient for TbankExecutionClient {
             let mut prepared = Vec::with_capacity(commands.len());
             for command in commands {
                 let client_order_id = command.client_order_id;
-                let order_type = command.order_init.order_type;
                 match prepare_nautilus_order(&mut client, command).await {
-                    Ok(order) => prepared.push((order, client_order_id, order_type)),
+                    Ok(order) => prepared.push((order, client_order_id)),
                     Err(error) => {
                         let reason = format!("order list preflight failed: {error}");
+                        for (client_order_id, _) in &submit_routes_for_cleanup {
+                            client.remove_unresolved_broker_order_route(client_order_id.as_str());
+                        }
                         for order in &orders {
                             emitter.emit_order_denied(order, &reason);
                         }
@@ -258,16 +292,21 @@ impl ExecutionClient for TbankExecutionClient {
                 }
             }
 
-            for ((prepared, client_order_id, order_type), order) in
+            for ((prepared, client_order_id), order) in
                 prepared.into_iter().zip(orders)
             {
-                client.prepare_submit_route(&client_order_id, order_type);
                 emitter.emit_order_submitted(&order);
                 if let Err(error) =
                     submit_prepared_nautilus_order(&mut client, prepared, emitter.clone()).await
                 {
                     tracing::error!(%error, %client_order_id, "failed to submit order-list leg to T-Bank");
                 }
+            }
+        }, move || {
+            // Register every list-leg route while the mutating task is already
+            // visible, before its first metadata preflight await.
+            for (client_order_id, order_type) in submit_routes {
+                route_runtime.prepare_submit_route(&client_order_id, order_type);
             }
         })?;
         Ok(())
@@ -310,7 +349,10 @@ impl ExecutionClient for TbankExecutionClient {
                         %client_order_id,
                         "failed to resolve T-Bank cancel target"
                     );
-                    if classify_cancel_failure(&error) == CancelFailureKind::BrokerRejected {
+                    if matches!(
+                        classify_cancel_failure(&error),
+                        CancelFailureKind::BrokerRejected | CancelFailureKind::LocalFailure
+                    ) {
                         emitter.emit_order_cancel_rejected_event(
                             cmd.strategy_id,
                             cmd.instrument_id,
@@ -556,13 +598,23 @@ impl ExecutionClient for TbankExecutionClient {
                 && let Some(stop) = stop_by_id.get(stop_id.as_str())
             {
                 activated_stop_ids.insert(stop_id.clone());
-                let lot_size = client.lot_size_for_stop_order(stop).await?;
+                let metadata = match client.metadata_for_stop_order(stop).await {
+                    Ok(metadata) => metadata,
+                    Err(error) if reconciliation_adapter_error_is_safe_to_skip(&error) => {
+                        tracing::warn!(
+                            %error,
+                            "skipping T-Bank activated stop order with unsupported or invalid event identity"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 client.record_broker_order_id(
                     TbankBrokerOrderRoute::StopOrder,
                     stop.stop_order_id.as_str(),
                 );
                 if let Some(client_order_id) = stop_client_order_ids.get(stop_id.as_str()) {
-                    client.record_stop_order_context(client_order_id, stop, lot_size);
+                    client.record_stop_order_context(client_order_id, stop, &metadata);
                 }
                 if !state.order_id.is_empty() {
                     client.record_activated_stop_child_mapping(
@@ -574,26 +626,44 @@ impl ExecutionClient for TbankExecutionClient {
                         state.order_id.as_str(),
                     );
                 }
-                reports.push(activated_stop_child_status_report(
+                let managed_order_type = client.managed_order_type_for_client_order_id(
+                    stop_client_order_ids
+                        .get(stop_id.as_str())
+                        .map(String::as_str),
+                );
+                match activated_stop_child_status_report_with_context(
                     client.account_id(),
                     stop,
                     &state,
                     cmd.ts_init,
-                    lot_size,
+                    metadata.lot,
                     stop_client_order_ids
                         .get(stop_id.as_str())
                         .map(String::as_str),
-                )?);
+                    Some(&client.instruments),
+                    managed_order_type,
+                ) {
+                    Ok(report) => reports.push(report),
+                    Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
+                        tracing::warn!(%error, "skipping T-Bank activated stop order event");
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
-                reports.push(
-                    client
-                        .order_status_report_from_state_with_lots(
-                            client.account_id(),
-                            state,
-                            cmd.ts_init,
-                        )
-                        .await?,
-                );
+                match client
+                    .order_status_report_from_state_with_lots(
+                        client.account_id(),
+                        state,
+                        cmd.ts_init,
+                    )
+                    .await
+                {
+                    Ok(report) => reports.push(report),
+                    Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
+                        tracing::warn!(%error, "skipping T-Bank order event");
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         for stop in stops {
@@ -607,16 +677,42 @@ impl ExecutionClient for TbankExecutionClient {
                 continue;
             }
             let client_order_id = stop_client_order_ids.get(stop.stop_order_id.as_str());
-            let lot_size = client.lot_size_for_stop_order(&stop).await?;
+            let metadata = match client.metadata_for_stop_order(&stop).await {
+                Ok(metadata) => metadata,
+                Err(error) if reconciliation_adapter_error_is_safe_to_skip(&error) => {
+                    tracing::warn!(
+                        %error,
+                        "skipping T-Bank stop order with unsupported or invalid event identity"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             client.record_broker_order_id(
                 TbankBrokerOrderRoute::StopOrder,
                 stop.stop_order_id.as_str(),
             );
             if let Some(client_order_id) = client_order_id {
-                client.record_stop_order_context(client_order_id, &stop, lot_size);
+                client.record_stop_order_context(client_order_id, &stop, &metadata);
             }
-            let mut report =
-                stop_order_status_report(client.account_id(), stop, cmd.ts_init, lot_size)?;
+            let managed_order_type = client.managed_order_type_for_client_order_id(
+                client_order_id.map(|value| value.as_str()),
+            );
+            let mut report = match stop_order_status_report_with_context(
+                client.account_id(),
+                stop,
+                cmd.ts_init,
+                metadata.lot,
+                Some(&client.instruments),
+                managed_order_type,
+            ) {
+                Ok(report) => report,
+                Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
+                    tracing::warn!(%error, "skipping T-Bank stop order event");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             report.client_order_id = client_order_id.map(|value| value.as_str().into());
             reports.push(report);
         }
@@ -635,9 +731,8 @@ impl ExecutionClient for TbankExecutionClient {
                 Some(
                     client
                         .load_instrument_metadata(&instrument_id)
-                        .await
-                        .map(|metadata| metadata.instrument_uid)
-                        .unwrap_or_else(|_| id.symbol.as_str().to_string()),
+                        .await?
+                        .instrument_uid,
                 )
             }
             None => None,
@@ -649,16 +744,47 @@ impl ExecutionClient for TbankExecutionClient {
                 cmd.end.map(|value| i128::from(value.as_u64())),
             )
             .await?;
-        let mut reports = response
-            .items
-            .iter()
-            .flat_map(|item| fill_reports_from_operation(client.account_id(), item, cmd.ts_init))
-            .map(|report| {
-                report.map(|report| {
+        let mut reports = Vec::new();
+        for item in &response.items {
+            if fill_side_from_operation_type(item.r#type).is_none() {
+                continue;
+            }
+            match client
+                .load_supported_metadata_for_identity(
+                    &item.instrument_uid,
+                    &item.figi,
+                    &item.ticker,
+                    &item.class_code,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(TbankAdapterError::InstrumentOutOfScope(_)) => {
+                    tracing::debug!(
+                        "ignoring T-Bank fill operation outside the supported adapter scope"
+                    );
+                    continue;
+                }
+                Err(error) if TbankExecutionRuntime::metadata_error_is_event_rejection(&error) => {
+                    tracing::warn!(
+                        %error,
+                        "skipping malformed T-Bank fill operation with invalid instrument identity"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            for report in fill_reports_from_cursor_operation_with_instruments(
+                client.account_id(),
+                item,
+                cmd.ts_init,
+                Some(&client.instruments),
+            ) {
+                reports.push(report.map(|report| {
                     canonicalize_managed_trade_fill_report(&self.runtime.broker_order_index, report)
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+                })?);
+            }
+        }
         reports.retain(|report| fill_report_matches_command(report, &cmd));
         Ok(reports)
     }
@@ -674,19 +800,85 @@ impl ExecutionClient for TbankExecutionClient {
         } else {
             nautilus_account_id(&positions.account_id)
         };
-        let mut reports = positions
-            .securities
-            .iter()
-            .filter_map(|position| {
-                position_status_report_from_security(account_id, position, cmd.ts_init)
-            })
-            .collect::<Vec<_>>();
+        let mut snapshot_complete = !positions.limits_loading_in_progress;
+        let mut reports = Vec::new();
+        for position in &positions.securities {
+            match client
+                .metadata_resolution_for_identity(
+                    &position.instrument_uid,
+                    &position.figi,
+                    &position.ticker,
+                    &position.class_code,
+                )
+                .await?
+            {
+                TbankInstrumentMetadataResolution::Enabled => {}
+                TbankInstrumentMetadataResolution::OutOfScope => {
+                    tracing::debug!(
+                        "ignoring T-Bank security position outside the supported adapter scope"
+                    );
+                    continue;
+                }
+                TbankInstrumentMetadataResolution::Rejected => {
+                    snapshot_complete = false;
+                    tracing::warn!(
+                        "skipping malformed T-Bank security position without a trustworthy instrument identity"
+                    );
+                    continue;
+                }
+            }
+            match position_status_report_from_security_with_instruments(
+                account_id,
+                position,
+                cmd.ts_init,
+                Some(&client.instruments),
+            ) {
+                Some(report) => reports.push(report),
+                None => snapshot_complete = false,
+            }
+        }
+        for position in &positions.futures {
+            match client
+                .metadata_resolution_for_identity(
+                    &position.instrument_uid,
+                    &position.figi,
+                    &position.ticker,
+                    &position.class_code,
+                )
+                .await?
+            {
+                TbankInstrumentMetadataResolution::Enabled => {}
+                TbankInstrumentMetadataResolution::OutOfScope => {
+                    tracing::debug!(
+                        "ignoring T-Bank futures position outside the supported adapter scope"
+                    );
+                    continue;
+                }
+                TbankInstrumentMetadataResolution::Rejected => {
+                    snapshot_complete = false;
+                    tracing::warn!(
+                        "skipping malformed T-Bank futures position without a trustworthy instrument identity"
+                    );
+                    continue;
+                }
+            }
+            match position_status_report_from_future_with_instruments(
+                account_id,
+                position,
+                cmd.ts_init,
+                &client.instruments,
+            ) {
+                Some(report) => reports.push(report),
+                None => snapshot_complete = false,
+            }
+        }
         apply_position_snapshot(
             &client.position_projection,
             account_id,
             &mut reports,
             cmd.ts_init,
-            !positions.limits_loading_in_progress,
+            TbankPositionProjectionSource::SecuritiesSnapshot,
+            snapshot_complete,
         );
         reports.retain(|report| position_report_matches_command(report, cmd));
         Ok(reports)
@@ -750,7 +942,9 @@ impl ExecutionClient for TbankExecutionClient {
     }
 
     fn on_instrument(&mut self, instrument: InstrumentAny) {
-        if let Some(metadata) = metadata_from_instrument(&instrument) {
+        if let Some(metadata) =
+            metadata_from_instrument(&instrument).filter(TbankInstrumentMetadata::is_supported)
+        {
             self.runtime
                 .instruments
                 .lock()

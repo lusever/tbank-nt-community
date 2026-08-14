@@ -7,6 +7,6 @@ pub mod provider;
 
 pub use mapper::{
     TbankInstrumentMapper, TbankInstrumentMetadata, TbankMarketDataInstrumentMetadata,
-    build_equity_instrument, build_index_instrument,
+    build_equity_instrument, build_futures_instrument, build_index_instrument,
 };
 pub use provider::TbankInstrumentProvider;

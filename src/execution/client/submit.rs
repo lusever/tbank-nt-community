@@ -1,6 +1,9 @@
 //! Order submission pipeline and failure classification.
 
 use super::*;
+use crate::grpc::generated::{
+    StopOrderDirection, StopOrderType, post_stop_order_request, stop_order,
+};
 use uuid::Uuid;
 
 const TBANK_SUBMIT_TRADE_NAMESPACE: Uuid =
@@ -74,9 +77,9 @@ pub(super) enum SubmitPipelineOutcome {
 }
 
 pub(super) struct PreparedNautilusOrder {
-    cmd: nautilus_common::messages::execution::SubmitOrder,
-    order: TbankSubmitOrder,
-    metadata: TbankInstrumentMetadata,
+    pub(super) cmd: nautilus_common::messages::execution::SubmitOrder,
+    pub(super) order: TbankSubmitOrder,
+    pub(super) metadata: TbankInstrumentMetadata,
 }
 
 pub(super) async fn prepare_nautilus_order(
@@ -97,7 +100,7 @@ pub(super) async fn prepare_nautilus_order(
         side: tbank_side(cmd.order_init.order_side)?,
         order_type: tbank_order_type(cmd.order_init.order_type)?,
         time_in_force: cmd.order_init.time_in_force,
-        quantity_shares: cmd.order_init.quantity.as_decimal(),
+        quantity_units: cmd.order_init.quantity.as_decimal(),
         limit_price: cmd.order_init.price.map(|price| price.as_decimal()),
         trigger_price: cmd.order_init.trigger_price.map(|price| price.as_decimal()),
         trailing: trailing_stop_params(&cmd.order_init)?,
@@ -109,6 +112,34 @@ pub(super) async fn prepare_nautilus_order(
     let metadata = client
         .load_instrument_metadata(&order.instrument_id)
         .await?;
+    if !metadata.api_trade_available {
+        anyhow::bail!(
+            "T-Bank API trading is unavailable for {}",
+            metadata.instrument_id
+        );
+    }
+    if !metadata.required_tests.is_empty() {
+        anyhow::bail!(
+            "T-Bank instrument tests are required for {}: {}",
+            metadata.instrument_id,
+            metadata.required_tests.join(", ")
+        );
+    }
+    match order.side {
+        crate::common::TbankOrderSide::Buy if !metadata.buy_available => {
+            anyhow::bail!(
+                "T-Bank buying is unavailable for {}",
+                metadata.instrument_id
+            );
+        }
+        crate::common::TbankOrderSide::Sell if !metadata.sell_available => {
+            anyhow::bail!(
+                "T-Bank selling is unavailable for {}",
+                metadata.instrument_id
+            );
+        }
+        _ => {}
+    }
     match order.service(client.config.environment) {
         TbankExecutionService::LiveOrders => {
             build_post_order_request(&order, &account_id, &metadata)?;
@@ -121,7 +152,7 @@ pub(super) async fn prepare_nautilus_order(
                 build_post_order_request(&order, &account_id, &metadata)?;
             }
             crate::common::TbankOrderType::StopMarket
-            | crate::common::TbankOrderType::TakeProfitMarket
+            | crate::common::TbankOrderType::MarketIfTouched
             | crate::common::TbankOrderType::TrailingStopMarket
             | crate::common::TbankOrderType::TrailingStopLimit => {
                 build_post_stop_order_request(&order, &account_id, &metadata)?;
@@ -262,7 +293,7 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
         client_order_id = %order.client_order_id,
         side = ?order.side,
         order_type = ?order.order_type,
-        quantity_shares = %order.quantity_shares,
+        quantity_units = %order.quantity_units,
         confirm_margin_trade = order.confirm_margin_trade,
         "submitting Nautilus order to T-Bank"
     );
@@ -279,19 +310,10 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
             tracing::warn!(
                 %error,
                 client_order_id = %cmd.client_order_id,
-                "T-Bank submit response failed; running query-only order reconciliation"
+                "T-Bank submit response failed; running broker reconciliation"
             );
-            let submitted_ts = client
-                .pending_submit_submitted_ts(cmd.client_order_id.as_str())
-                .unwrap_or(ts_init);
             let unresolved_reason = match client
-                .reconcile_submit_outcome(
-                    &order,
-                    cmd.order_init.clone(),
-                    &metadata,
-                    submitted_ts,
-                    ts_init,
-                )
+                .reconcile_submit_outcome(&order, &metadata, ts_init)
                 .await
             {
                 Ok(Some(reconciled)) => {
@@ -321,14 +343,7 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
                 Some(ts_init),
             );
             if let Some(emitter) = recovery_emitter {
-                client.spawn_submit_outcome_recovery(
-                    order,
-                    cmd.order_init.clone(),
-                    metadata,
-                    submitted_ts,
-                    ts_init,
-                    emitter,
-                );
+                client.spawn_submit_outcome_recovery(order, metadata, ts_init, emitter);
             }
             return Ok(SubmitPipelineOutcome::Reports(Vec::new()));
         }
@@ -379,7 +394,7 @@ pub(super) fn submit_response_execution_reports(
                 client.account_id(),
                 cmd,
                 response,
-                metadata.lot,
+                metadata,
                 ts_init,
             )?;
             let trade_id = synthetic_fill_trade_id(
@@ -430,7 +445,7 @@ pub(super) fn broker_order_route_for_submit(
             if matches!(
                 order.order_type,
                 crate::common::TbankOrderType::StopMarket
-                    | crate::common::TbankOrderType::TakeProfitMarket
+                    | crate::common::TbankOrderType::MarketIfTouched
                     | crate::common::TbankOrderType::TrailingStopMarket
                     | crate::common::TbankOrderType::TrailingStopLimit
             ) =>
@@ -440,6 +455,69 @@ pub(super) fn broker_order_route_for_submit(
         TbankExecutionService::LiveOrders | TbankExecutionService::Sandbox => {
             TbankBrokerOrderRoute::RegularOrder
         }
+    }
+}
+
+pub(super) fn stop_order_matches_submit(
+    order: &TbankSubmitOrder,
+    metadata: &TbankInstrumentMetadata,
+    stop: &StopOrder,
+) -> bool {
+    let Ok(expected) = build_post_stop_order_request(order, "", metadata) else {
+        return false;
+    };
+    if stop.stop_order_id.is_empty()
+        || stop.instrument_uid != expected.instrument_id
+        || stop.ticker != metadata.ticker
+        || stop.class_code != metadata.class_code
+        || stop.lots_requested != expected.quantity
+        || stop.direction != expected.direction
+        || stop.order_type != expected.stop_order_type
+        || stop.exchange_order_type != expected.exchange_order_type
+        || stop.take_profit_type != expected.take_profit_type
+        || !money_value_matches(expected.price.as_ref(), stop.price.as_ref())
+        || !money_value_matches(expected.stop_price.as_ref(), stop.stop_price.as_ref())
+    {
+        return false;
+    }
+    trailing_data_matches(expected.trailing_data.as_ref(), stop.trailing_data.as_ref())
+}
+
+fn money_value_matches(expected: Option<&Quotation>, actual: Option<&MoneyValue>) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => {
+            crate::common::decimal::quotation_to_decimal(expected)
+                == crate::common::decimal::money_value_to_decimal(actual)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn trailing_data_matches(
+    expected: Option<&post_stop_order_request::TrailingData>,
+    actual: Option<&stop_order::TrailingData>,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected.indent_type == actual.indent_type
+                && expected.spread_type == actual.spread_type
+                && quotation_matches(expected.indent.as_ref(), actual.indent.as_ref())
+                && quotation_matches(expected.spread.as_ref(), actual.spread.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn quotation_matches(expected: Option<&Quotation>, actual: Option<&Quotation>) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => {
+            crate::common::decimal::quotation_to_decimal(expected)
+                == crate::common::decimal::quotation_to_decimal(actual)
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -467,19 +545,25 @@ pub(super) fn classify_cancel_failure(error: &TbankAdapterError) -> CancelFailur
         },
         TbankAdapterError::RateLimited(_)
         | TbankAdapterError::InstrumentNotFound(_)
+        | TbankAdapterError::InstrumentMetadataUnresolved(_)
+        | TbankAdapterError::FuturesMarginUnresolved(_)
+        | TbankAdapterError::SubmitOutcomeUnknown(_)
         | TbankAdapterError::ReconnectFailed(_) => CancelFailureKind::OutcomeUnknown,
         TbankAdapterError::ConfigError(_)
         | TbankAdapterError::MissingToken
         | TbankAdapterError::MissingAccountId
         | TbankAdapterError::InvalidEndpoint
         | TbankAdapterError::UnsupportedInstrument(_)
+        | TbankAdapterError::InstrumentOutOfScope(_)
         | TbankAdapterError::UnsupportedOrderType(_)
         | TbankAdapterError::UnsupportedTimeInForce(_)
         | TbankAdapterError::InvalidQuantity(_)
         | TbankAdapterError::InvalidPrice(_)
         | TbankAdapterError::QuantityNotMultipleOfLot { .. }
         | TbankAdapterError::PriceNotMultipleOfTick { .. }
-        | TbankAdapterError::ConversionError(_) => CancelFailureKind::LocalFailure,
+        | TbankAdapterError::ConversionError(_)
+        | TbankAdapterError::InvalidInstrumentIdentity(_)
+        | TbankAdapterError::BrokerOrderIdentityUnresolved(_) => CancelFailureKind::LocalFailure,
     }
 }
 
@@ -490,19 +574,24 @@ pub(super) fn classify_submit_failure(error: &TbankAdapterError) -> SubmitFailur
         | TbankAdapterError::MissingAccountId
         | TbankAdapterError::InvalidEndpoint
         | TbankAdapterError::UnsupportedInstrument(_)
+        | TbankAdapterError::InstrumentOutOfScope(_)
         | TbankAdapterError::UnsupportedOrderType(_)
         | TbankAdapterError::UnsupportedTimeInForce(_)
         | TbankAdapterError::InvalidQuantity(_)
         | TbankAdapterError::InvalidPrice(_)
         | TbankAdapterError::QuantityNotMultipleOfLot { .. }
         | TbankAdapterError::PriceNotMultipleOfTick { .. }
-        | TbankAdapterError::ConversionError(_) => SubmitFailureKind::LocalRejected,
+        | TbankAdapterError::ConversionError(_)
+        | TbankAdapterError::InvalidInstrumentIdentity(_)
+        | TbankAdapterError::BrokerOrderIdentityUnresolved(_) => SubmitFailureKind::LocalRejected,
         TbankAdapterError::PermissionDenied(_) | TbankAdapterError::RateLimited(_) => {
             SubmitFailureKind::BrokerRejected
         }
-        TbankAdapterError::InstrumentNotFound(_) | TbankAdapterError::ReconnectFailed(_) => {
-            SubmitFailureKind::OutcomeUnknown
-        }
+        TbankAdapterError::InstrumentNotFound(_)
+        | TbankAdapterError::InstrumentMetadataUnresolved(_)
+        | TbankAdapterError::FuturesMarginUnresolved(_)
+        | TbankAdapterError::SubmitOutcomeUnknown(_)
+        | TbankAdapterError::ReconnectFailed(_) => SubmitFailureKind::OutcomeUnknown,
         TbankAdapterError::GrpcStatus { code, .. } => classify_submit_grpc_status(*code),
     }
 }
@@ -571,7 +660,7 @@ pub(super) fn update_pending_submit(
     tracing::debug!(
         instrument_id = %pending.instrument_id,
         submitted_ts = %pending.submitted_ts,
-        quantity_shares = %pending.quantity_shares,
+        quantity_units = %pending.quantity_units,
         side = ?pending.side,
         stage = ?pending.stage,
         "updated T-Bank pending submit state"
@@ -625,12 +714,7 @@ pub(super) fn settle_order_report_mutation_state(
     unresolved_cancellations
         .lock()
         .expect("unresolved_cancellations lock")
-        .retain(|identity| {
-            identity
-                .broker_order_id
-                .as_ref()
-                .is_none_or(|order_id| !related_order_ids.contains(order_id))
-        });
+        .retain(|identity| !related_order_ids.contains(&identity.broker_order_id));
 }
 
 pub(super) fn mark_pending_submit_fill_report(
@@ -692,7 +776,13 @@ pub(super) fn tbank_order_type_from_stop_order(
     }
     match StopOrderType::try_from(stop.order_type).ok() {
         Some(StopOrderType::StopLoss) => Some(crate::common::TbankOrderType::StopMarket),
-        Some(StopOrderType::TakeProfit) => Some(crate::common::TbankOrderType::TakeProfitMarket),
+        Some(StopOrderType::TakeProfit) => {
+            match crate::grpc::generated::ExchangeOrderType::try_from(stop.exchange_order_type).ok()
+            {
+                Some(crate::grpc::generated::ExchangeOrderType::Limit) => None,
+                _ => Some(crate::common::TbankOrderType::MarketIfTouched),
+            }
+        }
         Some(StopOrderType::Unspecified | StopOrderType::StopLimit) | None => None,
     }
 }
@@ -701,7 +791,7 @@ pub(super) fn order_status_report_from_post_order_response(
     account_id: AccountId,
     cmd: &nautilus_common::messages::execution::SubmitOrder,
     response: &PostOrderResponse,
-    lot_size: u32,
+    metadata: &TbankInstrumentMetadata,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let mut report = OrderStatusReport::new(
@@ -717,8 +807,8 @@ pub(super) fn order_status_report_from_post_order_response(
             response.lots_requested,
             response.lots_executed,
         ),
-        lots_to_quantity(response.lots_requested, lot_size)?,
-        lots_to_quantity(response.lots_executed, lot_size)?,
+        lots_to_quantity(response.lots_requested, metadata.lot)?,
+        lots_to_quantity(response.lots_executed, metadata.lot)?,
         ts_init,
         ts_init,
         cmd.ts_init,
@@ -733,12 +823,15 @@ pub(super) fn order_status_report_from_post_order_response(
     if let Some(trigger_type) = cmd.order_init.trigger_type {
         report = report.with_trigger_type(trigger_type);
     }
+    // PostOrderResponse.executed_order_price is already the average price per instrument;
+    // only GetOrderState.executed_order_price is a cumulative value divided by lots.
     if let Some(avg_px) = response
         .executed_order_price
         .as_ref()
-        .map(crate::common::decimal::money_value_to_decimal)
+        .map(|value| average_price_from_money_value_for_instrument(value, Some(metadata)))
+        .transpose()?
     {
-        report = report.with_avg_px(avg_px);
+        report = report.with_avg_px(avg_px.as_decimal());
     }
     Ok(with_default_stop_trigger_type(report))
 }
@@ -785,26 +878,35 @@ pub(super) fn order_initialized_instrument_id(
         let command_is_supported = is_supported_tbank_submit_instrument(&cmd.instrument_id);
         let initialized_is_supported =
             is_supported_tbank_submit_instrument(&initialized_instrument_id);
-        if command_is_supported && !initialized_is_supported {
+        if command_is_supported {
             tracing::warn!(
                 command_instrument_id = %cmd.instrument_id,
                 order_initialized_instrument_id = %initialized_instrument_id,
                 client_order_id = %cmd.client_order_id,
-                "Nautilus OrderInitialized instrument_id was unsupported; using SubmitOrder instrument_id"
+                "Nautilus SubmitOrder instrument_id differed from OrderInitialized; using the canonical SubmitOrder instrument_id"
             );
             return cmd.instrument_id;
         }
-        tracing::warn!(
-            command_instrument_id = %cmd.instrument_id,
-            order_initialized_instrument_id = %initialized_instrument_id,
-            client_order_id = %cmd.client_order_id,
-            "Nautilus SubmitOrder instrument_id differed from OrderInitialized; using OrderInitialized instrument_id"
-        );
+        if initialized_is_supported {
+            tracing::warn!(
+                command_instrument_id = %cmd.instrument_id,
+                order_initialized_instrument_id = %initialized_instrument_id,
+                client_order_id = %cmd.client_order_id,
+                "Nautilus SubmitOrder instrument_id was not a supported T-Bank instrument; using OrderInitialized instrument_id"
+            );
+        } else {
+            tracing::warn!(
+                command_instrument_id = %cmd.instrument_id,
+                order_initialized_instrument_id = %initialized_instrument_id,
+                client_order_id = %cmd.client_order_id,
+                "Nautilus SubmitOrder and OrderInitialized instrument_ids were not recognized as supported T-Bank instruments; preserving OrderInitialized instrument_id for validation"
+            );
+        }
     }
     initialized_instrument_id
 }
 
 pub(super) fn is_supported_tbank_submit_instrument(instrument_id: &InstrumentId) -> bool {
     crate::common::ids::TbankInstrumentIdParts::from_str(&instrument_id.to_string())
-        .is_ok_and(|parts| parts.is_moex_tqbr_equity())
+        .is_ok_and(|parts| parts.is_supported_family())
 }

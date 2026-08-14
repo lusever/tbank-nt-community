@@ -1,23 +1,24 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     str::FromStr,
     sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
+        Arc, RwLock,
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use crate::{
+    common::venue::TbankVenue,
     common::{
         Result, TbankAdapterError,
         consts::TBANK_CLIENT_ID,
-        ids::{TbankInstrumentIdParts, instrument_id_from_ticker_class},
+        ids::{TbankInstrumentIdParts, instrument_id_from_ticker_class_for_venue},
         time::unix_nanos_to_timestamp,
     },
-    config::TbankDataClientConfig,
+    config::{TbankDataClientConfig, TbankIndicativeInstrumentConfig},
     grpc::{
         TbankAuthInterceptor, TbankGrpcClients, connect_channel,
         generated::{
@@ -30,7 +31,7 @@ use crate::{
         },
         with_timeout,
     },
-    instruments::TbankInstrumentProvider,
+    instruments::{TbankInstrumentMetadata, TbankInstrumentProvider},
     market_data::{
         MarketDataInstrumentMetadata, TbankBar, TbankCandleReadinessEvent,
         TbankCandleReadinessState, TbankMarketDataStreamEvent, TbankMarketDataStreamState,
@@ -64,6 +65,7 @@ use nautilus_common::{
             UnsubscribeBars, UnsubscribeBookDepth10, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
+    msgbus::{self, TypedHandler, switchboard},
     providers::InstrumentProvider,
 };
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
@@ -71,6 +73,7 @@ use nautilus_model::{
     data::{Bar, BarType, BookOrder, DEPTH10_LEN, Data, OrderBookDepth10, QuoteTick, TradeTick},
     enums::{AggregationSource, AggressorSide, BarAggregation, BookType, OrderSide},
     identifiers::{ClientId, InstrumentId, TradeId, Venue},
+    instruments::InstrumentAny,
     types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
@@ -84,6 +87,14 @@ type MarketDataStreamClient =
 const RECONNECT_CATCH_UP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_QUOTES_PER_STREAM: usize = 300;
 const MAX_PRE_ACK_MESSAGES: usize = 2_048;
+
+type SharedInstrumentMetadata = Arc<RwLock<HashMap<String, MarketDataInstrumentMetadata>>>;
+
+fn instrument_metadata_snapshot(
+    metadata: &SharedInstrumentMetadata,
+) -> HashMap<String, MarketDataInstrumentMetadata> {
+    metadata.read().expect("market-data metadata lock").clone()
+}
 
 fn bar_watermarks_for_subscriptions(
     subscriptions: &[(String, BarType)],
@@ -135,8 +146,54 @@ fn publish_instrument_definitions(instrument_provider: &TbankInstrumentProvider)
     }
 }
 
+async fn refresh_published_instrument_catalogue(
+    config: &TbankDataClientConfig,
+    configured_stream_ids: &HashMap<String, String>,
+    instrument_metadata: &SharedInstrumentMetadata,
+) -> Result<()> {
+    let (provider, _, resolved_metadata) =
+        load_resolved_instrument_catalogue(config, configured_stream_ids).await?;
+
+    // Merge successful refreshes so a transiently unresolved auto-discovered contract cannot
+    // remove decoder metadata from an already active subscription. Full connect remains the
+    // owner of routing-map replacement.
+    instrument_metadata
+        .write()
+        .expect("market-data metadata lock")
+        .extend(resolved_metadata);
+    publish_instrument_definitions(&provider);
+    Ok(())
+}
+
+async fn load_resolved_instrument_catalogue(
+    config: &TbankDataClientConfig,
+    configured_stream_ids: &HashMap<String, String>,
+) -> Result<(
+    TbankInstrumentProvider,
+    HashMap<String, String>,
+    HashMap<String, MarketDataInstrumentMetadata>,
+)> {
+    // Keep provider selection tied to the immutable user configuration. Runtime stream routing
+    // may contain auto-discovered shares after connect, but must never widen futures enrichment.
+    let mut provider_config = config.clone();
+    provider_config.instrument_stream_ids = configured_stream_ids.clone();
+    let mut provider = TbankInstrumentProvider::new(provider_config);
+    provider
+        .load_all_current(None)
+        .await
+        .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
+    provider.ensure_configured_futures_resolved(configured_stream_ids)?;
+    let (resolved_stream_ids, resolved_metadata) = resolve_instrument_metadata(
+        configured_stream_ids,
+        &config.indicative_instruments,
+        provider.market_data_metadata(),
+    )?;
+    Ok((provider, resolved_stream_ids, resolved_metadata))
+}
+
 fn resolve_instrument_metadata<'a>(
     configured_stream_ids: &HashMap<String, String>,
+    indicative_instruments: &HashMap<String, TbankIndicativeInstrumentConfig>,
     provider_metadata: impl IntoIterator<
         Item = &'a crate::instruments::TbankMarketDataInstrumentMetadata,
     >,
@@ -162,6 +219,7 @@ fn resolve_instrument_metadata<'a>(
         let resolved_metadata = MarketDataInstrumentMetadata {
             lot_size: metadata.lot_size,
             price_precision: metadata.price_precision,
+            preserve_instrument_id: indicative_instruments.contains_key(&metadata.instrument_id),
         };
         instrument_metadata.insert(metadata.instrument_id.clone(), resolved_metadata);
         instrument_metadata.insert(metadata.instrument_uid.clone(), resolved_metadata);
@@ -173,39 +231,46 @@ fn resolve_instrument_metadata<'a>(
 pub struct TbankDataClient {
     client_id: ClientId,
     config: TbankDataClientConfig,
+    /// The user-selected stream map, kept separate from broker-catalog discovery.
+    configured_instrument_stream_ids: HashMap<String, String>,
     subscriptions: TbankSubscriptionRegistry,
     cache: Option<CacheView>,
-    instrument_metadata: HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: SharedInstrumentMetadata,
+    instrument_subscriptions: Vec<(Venue, TypedHandler<InstrumentAny>)>,
     clients: Option<TbankGrpcClients<TbankAuthInterceptor>>,
     stream_tasks: HashMap<String, JoinHandle<()>>,
     bar_stream_task: Option<JoinHandle<()>>,
     quote_stream_task: Option<JoinHandle<()>>,
+    instrument_refresh_task: Option<JoinHandle<()>>,
+    message_sequence: Arc<AtomicU64>,
     bar_subscriptions: HashMap<String, nautilus_model::data::BarType>,
     quote_subscriptions: HashMap<String, InstrumentId>,
     historical_request_limiter: HistoricalRequestLimiter,
-    instrument_provider: TbankInstrumentProvider,
 }
 
 impl TbankDataClient {
     /// Creates a new instance.
     pub fn new(config: TbankDataClientConfig) -> Self {
-        let instrument_provider = TbankInstrumentProvider::new(config.clone());
+        let configured_instrument_stream_ids = config.instrument_stream_ids.clone();
         let historical_request_limiter =
             HistoricalRequestLimiter::new(config.historical_candle_request_delay);
         Self {
             client_id: *TBANK_CLIENT_ID,
             config,
+            configured_instrument_stream_ids,
             subscriptions: TbankSubscriptionRegistry::default(),
             cache: None,
-            instrument_metadata: HashMap::new(),
+            instrument_metadata: Arc::new(RwLock::new(HashMap::new())),
+            instrument_subscriptions: Vec::new(),
             clients: None,
             stream_tasks: HashMap::new(),
             bar_stream_task: None,
             quote_stream_task: None,
+            instrument_refresh_task: None,
+            message_sequence: Arc::new(AtomicU64::new(0)),
             bar_subscriptions: HashMap::new(),
             quote_subscriptions: HashMap::new(),
             historical_request_limiter,
-            instrument_provider,
         }
     }
 
@@ -221,29 +286,98 @@ impl TbankDataClient {
         self
     }
 
+    fn subscribe_instrument_updates(&mut self) {
+        if !self.instrument_subscriptions.is_empty() {
+            return;
+        }
+
+        let configured_indicatives = Arc::new(
+            self.config
+                .indicative_instruments
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+        );
+        for configured_venue in TbankVenue::all() {
+            let venue = configured_venue.venue();
+            let metadata = Arc::downgrade(&self.instrument_metadata);
+            let configured_indicatives = configured_indicatives.clone();
+            let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
+                let Some(metadata_store) = metadata.upgrade() else {
+                    return;
+                };
+                let Some(instrument_metadata) =
+                    TbankInstrumentMetadata::from_instrument(instrument)
+                else {
+                    return;
+                };
+                if instrument_metadata.venue != configured_venue
+                    || !instrument_metadata.is_supported()
+                {
+                    return;
+                }
+                let Ok(price_precision) = u8::try_from(instrument_metadata.price_precision) else {
+                    tracing::warn!(
+                        instrument_id = %instrument_metadata.instrument_id,
+                        price_precision = instrument_metadata.price_precision,
+                        "ignoring T-Bank instrument update with unsupported price precision"
+                    );
+                    return;
+                };
+                let mut store = metadata_store.write().expect("market-data metadata lock");
+                let preserve_instrument_id = configured_indicatives
+                    .contains(&instrument_metadata.instrument_id)
+                    || store
+                        .get(&instrument_metadata.instrument_id)
+                        .is_some_and(|value| value.preserve_instrument_id);
+                let resolved = MarketDataInstrumentMetadata {
+                    lot_size: instrument_metadata.lot,
+                    price_precision,
+                    preserve_instrument_id,
+                };
+                store.insert(instrument_metadata.instrument_id.clone(), resolved);
+                store.insert(instrument_metadata.instrument_uid.clone(), resolved);
+            });
+            msgbus::subscribe_instruments(
+                switchboard::get_instruments_pattern(venue),
+                handler.clone(),
+                None,
+            );
+            self.instrument_subscriptions.push((venue, handler));
+        }
+    }
+
+    fn unsubscribe_instrument_updates(&mut self) {
+        for (venue, handler) in self.instrument_subscriptions.drain(..) {
+            msgbus::unsubscribe_instruments(switchboard::get_instruments_pattern(venue), &handler);
+        }
+    }
+
     /// Connects the client to the configured T-Bank endpoint.
     pub async fn connect(&mut self) -> Result<()> {
         if self.is_connected() {
             return Ok(());
         }
         self.config.validate()?;
-        self.instrument_provider = TbankInstrumentProvider::new(self.config.clone());
-        self.instrument_provider
-            .load_all(None)
-            .await
-            .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
+        let (instrument_provider, instrument_stream_ids, instrument_metadata) =
+            load_resolved_instrument_catalogue(
+                &self.config,
+                &self.configured_instrument_stream_ids,
+            )
+            .await?;
         let token = self.config.resolve_token_secret()?;
         let endpoint = self.config.endpoint_uri()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(&token)?;
-        let (instrument_stream_ids, instrument_metadata) = resolve_instrument_metadata(
-            &self.config.instrument_stream_ids,
-            self.instrument_provider.market_data_metadata(),
-        )?;
         self.config.instrument_stream_ids = instrument_stream_ids;
-        self.instrument_metadata = instrument_metadata;
+        *self
+            .instrument_metadata
+            .write()
+            .expect("market-data metadata lock") = instrument_metadata;
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
-        publish_instrument_definitions(&self.instrument_provider);
+        self.subscribe_instrument_updates();
+        publish_instrument_definitions(&instrument_provider);
+        self.schedule_instrument_refresh();
         tracing::info!(
             environment = ?self.config.environment,
             endpoint = endpoint.as_str(),
@@ -264,8 +398,47 @@ impl TbankDataClient {
         if let Some(task) = self.quote_stream_task.take() {
             task.abort();
         }
+        if let Some(task) = self.instrument_refresh_task.take() {
+            task.abort();
+        }
+        self.unsubscribe_instrument_updates();
         self.clients = None;
         tracing::info!("disconnected T-Bank data client");
+    }
+
+    fn schedule_instrument_refresh(&mut self) {
+        if let Some(task) = self.instrument_refresh_task.take() {
+            task.abort();
+        }
+        let refresh_interval = self.config.instrument_refresh_interval;
+        if refresh_interval.is_zero() {
+            return;
+        }
+        let config = self.config.clone();
+        let configured_stream_ids = self.configured_instrument_stream_ids.clone();
+        let instrument_metadata = Arc::clone(&self.instrument_metadata);
+        self.instrument_refresh_task = Some(get_runtime().spawn(async move {
+            let mut interval = tokio::time::interval(refresh_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The connect path has just loaded and published the same authoritative catalogue.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(error) = refresh_published_instrument_catalogue(
+                    &config,
+                    &configured_stream_ids,
+                    &instrument_metadata,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        %error,
+                        interval_ms = refresh_interval.as_millis(),
+                        "failed to refresh T-Bank instrument catalogue"
+                    );
+                }
+            }
+        }));
     }
 
     /// Returns whether the client is connected.
@@ -705,6 +878,7 @@ impl TbankDataClient {
             let stream_sender = sender.clone();
             let stream_instrument_metadata = instrument_metadata.clone();
             let stream_historical_request_limiter = historical_request_limiter.clone();
+            let stream_message_sequence = self.message_sequence.clone();
             let poll_watermarks =
                 bar_watermarks_for_subscriptions(&poll_subscriptions, &initial_bar_watermarks);
             let task = get_runtime().spawn(async move {
@@ -734,6 +908,7 @@ impl TbankDataClient {
                                 initial_bar_watermarks,
                                 bar_continuity_key_overrides: HashMap::new(),
                                 reconnect_attempt: Arc::new(AtomicU32::new(0)),
+                                message_sequence: stream_message_sequence.clone(),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -788,6 +963,7 @@ impl TbankDataClient {
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
+        let message_sequence = self.message_sequence.clone();
         self.quote_stream_task = Some(get_runtime().spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let futures = groups.into_iter().enumerate().map(
@@ -820,6 +996,7 @@ impl TbankDataClient {
                         initial_bar_watermarks: HashMap::new(),
                         bar_continuity_key_overrides: HashMap::new(),
                         reconnect_attempt: Arc::new(AtomicU32::new(0)),
+                        message_sequence: message_sequence.clone(),
                     })
                 },
             );
@@ -853,6 +1030,7 @@ impl TbankDataClient {
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
+        let message_sequence = self.message_sequence.clone();
         let task = get_runtime().spawn(run_market_data_stream(MarketDataStreamContext {
             market_data_stream,
             market_data_client,
@@ -866,6 +1044,7 @@ impl TbankDataClient {
             initial_bar_watermarks: HashMap::new(),
             bar_continuity_key_overrides: HashMap::new(),
             reconnect_attempt: Arc::new(AtomicU32::new(0)),
+            message_sequence,
         }));
         self.stream_tasks.insert(task_key, task);
         Ok(())
@@ -975,7 +1154,7 @@ async fn run_periodic_candle_poll(
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     config: TbankDataClientConfig,
     historical_request_limiter: HistoricalRequestLimiter,
-    instrument_metadata: HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: SharedInstrumentMetadata,
     subscriptions: Vec<(String, BarType)>,
     initial_bar_watermarks: HashMap<String, i128>,
     continuity_key_overrides: HashMap<String, String>,
@@ -994,7 +1173,7 @@ async fn run_periodic_candle_poll(
             max_retries: config.historical_candle_max_retries,
             retry_base_delay: config.historical_candle_retry_base_delay,
             require_complete_candles: true,
-            instrument_metadata: instrument_metadata.clone(),
+            instrument_metadata: instrument_metadata_snapshot(&instrument_metadata),
             request_limiter: historical_request_limiter.clone(),
         };
 
@@ -1077,11 +1256,12 @@ struct MarketDataStreamContext {
     kind: TbankStreamKind,
     config: TbankDataClientConfig,
     historical_request_limiter: HistoricalRequestLimiter,
-    instrument_metadata: HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: SharedInstrumentMetadata,
     task_key: String,
     initial_bar_watermarks: HashMap<String, i128>,
     bar_continuity_key_overrides: HashMap<String, String>,
     reconnect_attempt: Arc<AtomicU32>,
+    message_sequence: Arc<AtomicU64>,
 }
 
 fn run_market_data_stream(
@@ -1155,6 +1335,7 @@ fn run_market_data_stream_worker(
             initial_bar_watermarks,
             bar_continuity_key_overrides,
             reconnect_attempt,
+            message_sequence: message_sequence_counter,
         } = context;
         let timestamp_mode = config.candle_timestamp_mode;
         let mut instrument_count = kind.instrument_count();
@@ -1226,6 +1407,8 @@ fn run_market_data_stream_worker(
                         {
                             StreamMessageOutcome::Message(response) => {
                                 let received_at = now_unix_nanos();
+                                let message_sequence =
+                                    message_sequence_counter.fetch_add(1, Ordering::Relaxed);
                                 let subscription_ack =
                                     is_market_data_subscription_ack(&response, &kind);
                                 if let Err(rejection) =
@@ -1371,6 +1554,8 @@ fn run_market_data_stream_worker(
                                                     bar_continuity_key_overrides:
                                                         isolated_continuity_keys,
                                                     reconnect_attempt: Arc::new(AtomicU32::new(0)),
+                                                    message_sequence:
+                                                        message_sequence_counter.clone(),
                                                 }),
                                             ));
                                         }
@@ -1521,7 +1706,11 @@ fn run_market_data_stream_worker(
                                                 },
                                             );
                                         }
-                                        pre_ack_messages.push_back((response, received_at));
+                                        pre_ack_messages.push_back((
+                                            response,
+                                            received_at,
+                                            message_sequence,
+                                        ));
                                     }
                                     continue;
                                 }
@@ -1536,6 +1725,7 @@ fn run_market_data_stream_worker(
                                     &bar_continuity_key_overrides,
                                     &mut continuity,
                                     &mut attempt,
+                                    message_sequence,
                                 );
                                 reconnect_attempt.store(attempt, Ordering::Relaxed);
                             }
@@ -1803,7 +1993,7 @@ async fn recover_pending_bars_after_stream_ack(
     instrument_count: usize,
     config: &TbankDataClientConfig,
     historical_request_limiter: &HistoricalRequestLimiter,
-    instrument_metadata: &HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: &SharedInstrumentMetadata,
     attempt: u32,
 ) {
     trace_market_data_stream_event(MarketDataStreamEventInput {
@@ -2126,7 +2316,7 @@ async fn reconnect_catch_up_bars(
     instrument_count: usize,
     config: &TbankDataClientConfig,
     request_limiter: &HistoricalRequestLimiter,
-    instrument_metadata: &HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: &SharedInstrumentMetadata,
 ) -> ReconnectCatchUpOutcome {
     let TbankStreamKind::Bars { bar_types } = kind else {
         return ReconnectCatchUpOutcome::default();
@@ -2201,7 +2391,7 @@ async fn reconnect_catch_up_bars(
         max_retries: config.historical_candle_max_retries,
         retry_base_delay: config.historical_candle_retry_base_delay,
         require_complete_candles: true,
-        instrument_metadata: instrument_metadata.clone(),
+        instrument_metadata: instrument_metadata_snapshot(instrument_metadata),
         request_limiter: request_limiter.clone(),
     };
 
@@ -2449,10 +2639,10 @@ impl TbankStreamKind {
 
 #[allow(clippy::too_many_arguments)]
 fn drain_pre_ack_messages(
-    messages: &mut VecDeque<(MarketDataResponse, UnixNanos)>,
+    messages: &mut VecDeque<(MarketDataResponse, UnixNanos, u64)>,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     kind: &TbankStreamKind,
-    instrument_metadata: &HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: &SharedInstrumentMetadata,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     task_key: &str,
     bar_continuity_key_overrides: &HashMap<String, String>,
@@ -2460,7 +2650,7 @@ fn drain_pre_ack_messages(
     attempt: &mut u32,
 ) {
     let buffered = messages.len();
-    while let Some((response, received_at)) = messages.pop_front() {
+    while let Some((response, received_at, message_sequence)) = messages.pop_front() {
         publish_ready_market_data_response(
             sender,
             response,
@@ -2472,6 +2662,7 @@ fn drain_pre_ack_messages(
             bar_continuity_key_overrides,
             continuity,
             attempt,
+            message_sequence,
         );
     }
     if buffered > 0 {
@@ -2495,13 +2686,14 @@ fn publish_ready_market_data_response(
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     response: MarketDataResponse,
     kind: &TbankStreamKind,
-    instrument_metadata: &HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: &SharedInstrumentMetadata,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     received_at: UnixNanos,
     task_key: &str,
     bar_continuity_key_overrides: &HashMap<String, String>,
     continuity: &mut HashMap<String, BarContinuityTracker>,
     attempt: &mut u32,
+    message_sequence: u64,
 ) {
     let Some(response) = filter_market_data_response_for_continuity(
         response,
@@ -2521,6 +2713,7 @@ fn publish_ready_market_data_response(
         instrument_metadata,
         timestamp_mode,
         received_at,
+        message_sequence,
     ) {
         tracing::warn!(%error, task_key, "failed to publish T-Bank market data event");
     }
@@ -2530,9 +2723,10 @@ fn publish_market_data_response(
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     response: MarketDataResponse,
     kind: &TbankStreamKind,
-    instrument_metadata: &HashMap<String, MarketDataInstrumentMetadata>,
+    instrument_metadata: &SharedInstrumentMetadata,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     received_at: UnixNanos,
+    message_sequence: u64,
 ) -> anyhow::Result<()> {
     let Some(payload) = response.payload else {
         return Ok(());
@@ -2575,6 +2769,7 @@ fn publish_market_data_response(
                 *instrument_id,
                 metadata,
                 received_at,
+                message_sequence,
             )?))
         }
         (
@@ -2625,10 +2820,11 @@ fn publish_market_data_response(
 }
 
 fn market_data_metadata_for(
-    metadata: &HashMap<String, MarketDataInstrumentMetadata>,
+    metadata: &SharedInstrumentMetadata,
     instrument_uid: &str,
     instrument_id: Option<InstrumentId>,
 ) -> anyhow::Result<MarketDataInstrumentMetadata> {
+    let metadata = metadata.read().expect("market-data metadata lock");
     metadata
         .get(instrument_uid)
         .or_else(|| instrument_id.and_then(|id| metadata.get(&id.to_string())))
@@ -2653,11 +2849,12 @@ fn instrument_id_from_stream_parts(
     ticker: &str,
     class_code: &str,
     fallback: InstrumentId,
+    preserve_fallback: bool,
 ) -> anyhow::Result<InstrumentId> {
-    if ticker.is_empty() || class_code.is_empty() {
+    if preserve_fallback || ticker.is_empty() || class_code.is_empty() {
         return Ok(fallback);
     }
-    instrument_id_from_ticker_class(ticker, class_code)
+    instrument_id_from_ticker_class_for_venue(ticker, class_code, fallback.venue.as_str())
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid stream instrument id: {error}"))
 }
@@ -2716,16 +2913,21 @@ fn nautilus_trade_from_tbank(
     fallback_instrument_id: InstrumentId,
     metadata: MarketDataInstrumentMetadata,
     received_at: UnixNanos,
+    message_sequence: u64,
 ) -> anyhow::Result<TradeTick> {
     let tick = trade_to_tick(trade, i128::from(received_at.as_u64()))?;
-    let instrument_id =
-        instrument_id_from_stream_parts(&trade.ticker, &trade.class_code, fallback_instrument_id)?;
+    let instrument_id = instrument_id_from_stream_parts(
+        &trade.ticker,
+        &trade.class_code,
+        fallback_instrument_id,
+        metadata.preserve_instrument_id,
+    )?;
     let aggressor_side = match tick.side {
         crate::market_data::trades::TbankTradeSide::Buy => AggressorSide::Buyer,
         crate::market_data::trades::TbankTradeSide::Sell => AggressorSide::Seller,
         crate::market_data::trades::TbankTradeSide::Unknown => AggressorSide::NoAggressor,
     };
-    let trade_id = TradeId::new(format!("{}", tick.ts_event));
+    let trade_id = tbank_trade_id(trade, instrument_id, message_sequence);
     TradeTick::new_checked(
         instrument_id,
         decimal_price(tick.price, metadata.price_precision)?,
@@ -2736,6 +2938,51 @@ fn nautilus_trade_from_tbank(
         unix_nanos(tick.ts_init)?,
     )
     .map_err(|error| anyhow::anyhow!("invalid T-Bank trade tick: {error}"))
+}
+
+/// Builds a bounded synthetic trade ID because T-Bank's public `Trade` message has no
+/// venue-provided match identifier. The message sequence is the collision-free part within
+/// this client instance; the fingerprint keeps the ID tied to the immutable source fields and
+/// makes it deterministic for a given source message and sequence.
+fn tbank_trade_id(trade: &Trade, instrument_id: InstrumentId, message_sequence: u64) -> TradeId {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut fingerprint = FNV_OFFSET;
+    let mut update = |bytes: &[u8]| {
+        for byte in bytes {
+            fingerprint ^= u64::from(*byte);
+            fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+        }
+        fingerprint ^= 0xff;
+        fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+    };
+
+    update(instrument_id.to_string().as_bytes());
+    update(trade.figi.as_bytes());
+    update(trade.instrument_uid.as_bytes());
+    update(trade.ticker.as_bytes());
+    update(trade.class_code.as_bytes());
+    update(&trade.direction.to_le_bytes());
+    update(&trade.trade_source.to_le_bytes());
+    update(&trade.quantity.to_le_bytes());
+    match trade.price.as_ref() {
+        Some(price) => {
+            update(&price.units.to_le_bytes());
+            update(&price.nano.to_le_bytes());
+        }
+        None => update(&[]),
+    }
+    match trade.time.as_ref() {
+        Some(time) => {
+            update(&time.seconds.to_le_bytes());
+            update(&time.nanos.to_le_bytes());
+        }
+        None => update(&[]),
+    }
+
+    // `TradeId` is capped at 36 ASCII characters: "tb-" + 16 hex chars + "-" + 16 hex chars.
+    TradeId::new(format!("tb-{fingerprint:016x}-{message_sequence:016x}"))
 }
 
 fn nautilus_quote_from_orderbook(
@@ -2752,6 +2999,7 @@ fn nautilus_quote_from_orderbook(
         &orderbook.ticker,
         &orderbook.class_code,
         fallback_instrument_id,
+        metadata.preserve_instrument_id,
     )?;
     QuoteTick::new_checked(
         instrument_id,
@@ -2777,6 +3025,7 @@ fn nautilus_depth10_from_orderbook(
         &orderbook.ticker,
         &orderbook.class_code,
         fallback_instrument_id,
+        metadata.preserve_instrument_id,
     )?;
     let mut bids = [BookOrder::default(); DEPTH10_LEN];
     let mut asks = [BookOrder::default(); DEPTH10_LEN];
@@ -2856,6 +3105,7 @@ mod tests {
         MarketDataInstrumentMetadata {
             lot_size: 10,
             price_precision: 2,
+            preserve_instrument_id: false,
         }
     }
 
@@ -2969,8 +3219,11 @@ mod tests {
             })),
             ..MarketDataResponse::default()
         };
-        let mut buffered = VecDeque::from([(response, UnixNanos::from(1_000_000_000_000_u64))]);
-        let metadata = HashMap::from([("sber-uid".to_string(), sber_market_data_metadata())]);
+        let mut buffered = VecDeque::from([(response, UnixNanos::from(1_000_000_000_000_u64), 0)]);
+        let metadata = Arc::new(RwLock::new(HashMap::from([(
+            "sber-uid".to_string(),
+            sber_market_data_metadata(),
+        )])));
         let mut attempt = 2;
 
         drain_pre_ack_messages(
@@ -3012,6 +3265,68 @@ mod tests {
         assert_eq!(client.stream_id(sber_id()), "sber-real-uid");
     }
 
+    #[tokio::test]
+    async fn instrument_refresh_task_follows_client_lifecycle() {
+        let mut disabled = TbankDataClient::new(TbankDataClientConfig {
+            instrument_refresh_interval: Duration::ZERO,
+            ..TbankDataClientConfig::default()
+        });
+        disabled.schedule_instrument_refresh();
+        assert!(disabled.instrument_refresh_task.is_none());
+
+        let mut enabled = TbankDataClient::new(TbankDataClientConfig {
+            instrument_refresh_interval: Duration::from_secs(60 * 60),
+            ..TbankDataClientConfig::default()
+        });
+        enabled.schedule_instrument_refresh();
+        assert!(enabled.instrument_refresh_task.is_some());
+        enabled.disconnect();
+        assert!(enabled.instrument_refresh_task.is_none());
+    }
+
+    #[test]
+    fn reconnect_resolution_rebuilds_runtime_streams_from_explicit_config() {
+        let client = TbankDataClient::new(TbankDataClientConfig {
+            instrument_stream_ids: HashMap::from([(
+                "SBER_TQBR.MOEX".to_string(),
+                "sber-current-uid".to_string(),
+            )]),
+            ..TbankDataClientConfig::default()
+        });
+        let future = crate::instruments::TbankMarketDataInstrumentMetadata {
+            instrument_id: "Si-9.26_SPBFUT.MOEX".to_string(),
+            instrument_uid: "si-current-uid".to_string(),
+            lot_size: 1,
+            price_precision: 0,
+        };
+        let share = crate::instruments::TbankMarketDataInstrumentMetadata {
+            instrument_id: "SBER_TQBR.MOEX".to_string(),
+            instrument_uid: "sber-current-uid".to_string(),
+            lot_size: 10,
+            price_precision: 2,
+        };
+
+        let (first_streams, _) = resolve_instrument_metadata(
+            &client.configured_instrument_stream_ids,
+            &HashMap::new(),
+            [&share, &future],
+        )
+        .unwrap();
+        assert!(first_streams.contains_key("Si-9.26_SPBFUT.MOEX"));
+
+        let (reconnected_streams, _) = resolve_instrument_metadata(
+            &client.configured_instrument_stream_ids,
+            &HashMap::new(),
+            [&share],
+        )
+        .unwrap();
+        assert!(!reconnected_streams.contains_key("Si-9.26_SPBFUT.MOEX"));
+        assert_eq!(
+            reconnected_streams.get("SBER_TQBR.MOEX"),
+            Some(&"sber-current-uid".to_string())
+        );
+    }
+
     #[test]
     fn instrument_metadata_resolution_is_atomic_on_configured_uid_mismatch() {
         let configured = HashMap::from([
@@ -3036,10 +3351,38 @@ mod tests {
             },
         ];
 
-        let error = resolve_instrument_metadata(&configured, &provider_metadata).unwrap_err();
+        let error = resolve_instrument_metadata(&configured, &HashMap::new(), &provider_metadata)
+            .unwrap_err();
 
         assert!(error.to_string().contains("stale-sber-uid"));
         assert_eq!(configured["SBER_TQBR.MOEX"], "stale-sber-uid");
+    }
+
+    #[test]
+    fn configured_indicative_metadata_marks_registered_id_as_canonical() {
+        let indicative_instruments = HashMap::from([(
+            "IMOEX2.MOEX".to_string(),
+            TbankIndicativeInstrumentConfig {
+                currency: "RUB".to_string(),
+                price_increment: Decimal::ONE,
+            },
+        )]);
+        let provider_metadata = [crate::instruments::TbankMarketDataInstrumentMetadata {
+            instrument_id: "IMOEX2.MOEX".to_string(),
+            instrument_uid: "imoex2-uid".to_string(),
+            lot_size: 1,
+            price_precision: 0,
+        }];
+
+        let (_, metadata) = resolve_instrument_metadata(
+            &HashMap::new(),
+            &indicative_instruments,
+            &provider_metadata,
+        )
+        .unwrap();
+
+        assert!(metadata["IMOEX2.MOEX"].preserve_instrument_id);
+        assert!(metadata["imoex2-uid"].preserve_instrument_id);
     }
 
     #[test]
@@ -3541,9 +3884,13 @@ mod tests {
                 ..MarketDataResponse::default()
             },
             &kind,
-            &HashMap::from([("sber-uid".to_string(), sber_market_data_metadata())]),
+            &Arc::new(RwLock::new(HashMap::from([(
+                "sber-uid".to_string(),
+                sber_market_data_metadata(),
+            )]))),
             TbankCandleTimestampMode::StartAsBarEnd,
             UnixNanos::from(1_070_000_000_000_u64),
+            0,
         )
         .unwrap();
 
@@ -3575,9 +3922,10 @@ mod tests {
                 ..MarketDataResponse::default()
             },
             &kind,
-            &HashMap::new(),
+            &Arc::new(RwLock::new(HashMap::new())),
             TbankCandleTimestampMode::StartAsBarEnd,
             UnixNanos::from(1_070_000_000_000_u64),
+            0,
         )
         .unwrap_err();
 
@@ -3665,15 +4013,40 @@ mod tests {
         };
 
         let received_at = UnixNanos::from(2_000_000_000_u64);
-        let tick =
-            nautilus_trade_from_tbank(&trade, sber_id(), sber_market_data_metadata(), received_at)
-                .unwrap();
+        let tick = nautilus_trade_from_tbank(
+            &trade,
+            sber_id(),
+            sber_market_data_metadata(),
+            received_at,
+            0,
+        )
+        .unwrap();
 
         assert_eq!(tick.instrument_id, sber_id());
         assert_eq!(tick.aggressor_side, AggressorSide::Seller);
         assert_eq!(tick.price.as_f64(), 251.0);
         assert_eq!(tick.size.as_f64(), 30.0);
         assert_eq!(tick.ts_init, received_at);
+
+        let replay = nautilus_trade_from_tbank(
+            &trade,
+            sber_id(),
+            sber_market_data_metadata(),
+            received_at,
+            0,
+        )
+        .unwrap();
+        let same_timestamp = nautilus_trade_from_tbank(
+            &trade,
+            sber_id(),
+            sber_market_data_metadata(),
+            received_at,
+            1,
+        )
+        .unwrap();
+        assert_eq!(tick.trade_id, replay.trade_id);
+        assert_ne!(tick.trade_id, same_timestamp.trade_id);
+        assert_eq!(tick.trade_id.as_str().len(), 36);
     }
 
     #[test]
@@ -3736,6 +4109,55 @@ mod tests {
         assert_eq!(depth.bid_counts[0], 1);
         assert_eq!(depth.ts_init, received_at);
         assert_eq!(depth.ask_counts[1], 1);
+    }
+
+    #[test]
+    fn configured_indicative_events_keep_registered_id() {
+        let instrument_id: InstrumentId = "IMOEX2.MOEX".parse().unwrap();
+        let metadata = MarketDataInstrumentMetadata {
+            lot_size: 1,
+            price_precision: 0,
+            preserve_instrument_id: true,
+        };
+        let trade = Trade {
+            direction: TradeDirection::Buy as i32,
+            price: q(3_000, 0),
+            quantity: 1,
+            time: Some(ts(1_000)),
+            instrument_uid: "imoex2-uid".to_string(),
+            ticker: "IMOEX2".to_string(),
+            class_code: "INDEX".to_string(),
+            ..Trade::default()
+        };
+        let orderbook = OrderBook {
+            bids: vec![Order {
+                price: q(2_999, 0),
+                quantity: 1,
+            }],
+            asks: vec![Order {
+                price: q(3_001, 0),
+                quantity: 1,
+            }],
+            time: Some(ts(1_000)),
+            instrument_uid: "imoex2-uid".to_string(),
+            ticker: "IMOEX2".to_string(),
+            class_code: "INDEX".to_string(),
+            ..OrderBook::default()
+        };
+        let received_at = UnixNanos::from(2_000_000_000_u64);
+
+        let tick =
+            nautilus_trade_from_tbank(&trade, instrument_id, metadata, received_at, 0).unwrap();
+        let quote = nautilus_quote_from_orderbook(&orderbook, instrument_id, metadata, received_at)
+            .unwrap()
+            .unwrap();
+        let depth =
+            nautilus_depth10_from_orderbook(&orderbook, instrument_id, metadata, received_at)
+                .unwrap();
+
+        assert_eq!(tick.instrument_id, instrument_id);
+        assert_eq!(quote.instrument_id, instrument_id);
+        assert_eq!(depth.instrument_id, instrument_id);
     }
 
     #[test]

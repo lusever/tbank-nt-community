@@ -1,6 +1,7 @@
 //! Translation between T-Bank protobuf models and Nautilus reports.
 
 use super::*;
+use crate::grpc::generated::{StopOrderDirection, StopOrderType};
 use anyhow::Context;
 
 pub(super) fn tbank_side(side: OrderSide) -> anyhow::Result<crate::common::TbankOrderSide> {
@@ -18,6 +19,7 @@ pub(super) fn tbank_order_type(
         OrderType::Market => Ok(crate::common::TbankOrderType::Market),
         OrderType::Limit => Ok(crate::common::TbankOrderType::Limit),
         OrderType::StopMarket => Ok(crate::common::TbankOrderType::StopMarket),
+        OrderType::MarketIfTouched => Ok(crate::common::TbankOrderType::MarketIfTouched),
         OrderType::TrailingStopMarket => Ok(crate::common::TbankOrderType::TrailingStopMarket),
         OrderType::TrailingStopLimit => Ok(crate::common::TbankOrderType::TrailingStopLimit),
         other => anyhow::bail!("unsupported T-Bank order type {other:?}"),
@@ -45,14 +47,116 @@ pub(super) fn nautilus_stop_order_type(stop: &StopOrder) -> OrderType {
         };
     }
     match StopOrderType::try_from(stop.order_type).ok() {
-        Some(StopOrderType::StopLoss | StopOrderType::TakeProfit) => OrderType::StopMarket,
+        Some(StopOrderType::StopLoss) => OrderType::StopMarket,
+        Some(StopOrderType::StopLimit) => OrderType::StopLimit,
+        Some(StopOrderType::TakeProfit) => {
+            match crate::grpc::generated::ExchangeOrderType::try_from(stop.exchange_order_type).ok()
+            {
+                Some(crate::grpc::generated::ExchangeOrderType::Limit) => OrderType::LimitIfTouched,
+                _ => OrderType::MarketIfTouched,
+            }
+        }
         _ => OrderType::StopMarket,
     }
+}
+
+fn nautilus_stop_order_type_with_context(
+    stop: &StopOrder,
+    managed_order_type: Option<crate::common::TbankOrderType>,
+) -> OrderType {
+    managed_order_type
+        .map(|order_type| nautilus_stream_stop_order_type(Some(order_type)))
+        .unwrap_or_else(|| nautilus_stop_order_type(stop))
+}
+
+fn currency_price_to_nautilus_decimal(
+    value: Decimal,
+    metadata: Option<&TbankInstrumentMetadata>,
+) -> anyhow::Result<Decimal> {
+    // Keep this for fields whose endpoint contract is explicitly currency;
+    // point-valued response fields must use a direct parser instead.
+    match metadata.filter(|metadata| metadata.price_in_points) {
+        Some(metadata) => crate::common::decimal::futures_currency_to_points(
+            value,
+            metadata.min_price_increment,
+            metadata.min_price_increment_amount.ok_or_else(|| {
+                anyhow::anyhow!("futures price conversion requires min price increment amount")
+            })?,
+        )
+        .map_err(anyhow::Error::from),
+        None => Ok(value),
+    }
+}
+
+fn average_currency_price_to_nautilus_decimal(
+    value: Decimal,
+    metadata: Option<&TbankInstrumentMetadata>,
+) -> anyhow::Result<Decimal> {
+    // Execution averages are currency-valued and may legitimately fall
+    // between futures ticks, so they use the non-validating conversion.
+    match metadata.filter(|metadata| metadata.price_in_points) {
+        Some(metadata) => {
+            crate::common::decimal::futures_currency_to_points_without_tick_validation(
+                value,
+                metadata.min_price_increment,
+                metadata.min_price_increment_amount.ok_or_else(|| {
+                    anyhow::anyhow!("futures price conversion requires min price increment amount")
+                })?,
+            )
+            .map_err(anyhow::Error::from)
+        }
+        None => Ok(value),
+    }
+}
+
+/// Converts a currency-valued execution price into Nautilus price points.
+///
+/// T-Bank may report a cumulative execution average between futures ticks, so this conversion
+/// intentionally does not validate the resulting point price against the tick size.
+pub(super) fn execution_price_from_money_value_for_instrument(
+    value: &MoneyValue,
+    metadata: Option<&TbankInstrumentMetadata>,
+) -> anyhow::Result<Price> {
+    let points = average_currency_price_to_nautilus_decimal(
+        crate::common::decimal::money_value_to_decimal(value),
+        metadata,
+    )?;
+    Price::from_decimal(points).map_err(anyhow::Error::from)
+}
+
+pub(super) fn average_price_from_money_value_for_instrument(
+    value: &MoneyValue,
+    metadata: Option<&TbankInstrumentMetadata>,
+) -> anyhow::Result<Price> {
+    execution_price_from_money_value_for_instrument(value, metadata)
+}
+
+pub(super) fn cached_instrument_metadata(
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+    instrument_uid: &str,
+    figi: &str,
+    instrument_id: &str,
+) -> Option<TbankInstrumentMetadata> {
+    instruments.and_then(|instruments| {
+        instruments
+            .lock()
+            .expect("instruments lock")
+            .values()
+            .find(|metadata| {
+                (!instrument_uid.is_empty() && metadata.instrument_uid == instrument_uid)
+                    || (!figi.is_empty() && metadata.figi == figi)
+                    || (!instrument_id.is_empty() && metadata.instrument_id == instrument_id)
+            })
+            .cloned()
+    })
 }
 
 pub(super) fn trailing_params_from_stop(
     stop: &StopOrder,
 ) -> anyhow::Result<Option<crate::execution::TbankTrailingStopParams>> {
+    // GetStopOrders returns futures stop prices in Nautilus points. Absolute
+    // trailing values use the same point unit as the explicit point-valued
+    // PostStopOrder request; equities retain their native currency number.
     if !matches!(
         crate::grpc::generated::TakeProfitType::try_from(stop.take_profit_type).ok(),
         Some(crate::grpc::generated::TakeProfitType::Trailing)
@@ -116,7 +220,8 @@ pub(super) fn trailing_params_from_stop(
         activation_price: stop
             .stop_price
             .as_ref()
-            .map(crate::common::decimal::money_value_to_decimal),
+            .map(|value| price_from_point_valued_money_value(value).map(|price| price.as_decimal()))
+            .transpose()?,
         trailing_offset,
         trailing_offset_type,
         limit_offset,
@@ -237,12 +342,44 @@ pub(super) fn nautilus_stop_order_status(status: i32) -> OrderStatus {
     }
 }
 
+pub(super) fn average_price_from_executed_order_price(
+    value: &MoneyValue,
+    lots_executed: i64,
+    metadata: Option<&TbankInstrumentMetadata>,
+) -> anyhow::Result<Option<Decimal>> {
+    if lots_executed <= 0 {
+        return Ok(None);
+    }
+    let average_price =
+        crate::common::decimal::money_value_to_decimal(value) / Decimal::from(lots_executed);
+    average_currency_price_to_nautilus_decimal(average_price, metadata).map(Some)
+}
+
+#[allow(dead_code)]
 pub(super) fn order_status_report_from_state(
     account_id: AccountId,
     state: OrderState,
     ts_init: UnixNanos,
     instrument_id: nautilus_model::identifiers::InstrumentId,
     lot: u32,
+) -> anyhow::Result<OrderStatusReport> {
+    order_status_report_from_state_with_metadata(
+        account_id,
+        state,
+        ts_init,
+        instrument_id,
+        lot,
+        None,
+    )
+}
+
+pub(super) fn order_status_report_from_state_with_metadata(
+    account_id: AccountId,
+    state: OrderState,
+    ts_init: UnixNanos,
+    instrument_id: nautilus_model::identifiers::InstrumentId,
+    lot: u32,
+    metadata: Option<&TbankInstrumentMetadata>,
 ) -> anyhow::Result<OrderStatusReport> {
     let ts_event = state
         .order_date
@@ -279,21 +416,21 @@ pub(super) fn order_status_report_from_state(
     if let Some(price) = state
         .initial_security_price
         .as_ref()
-        .map(price_from_money_value)
+        .map(|value| price_from_money_value_for_instrument(value, metadata))
         .transpose()?
     {
         report = report.with_price(price);
     }
-    if let Some(avg_px) = state
-        .executed_order_price
-        .as_ref()
-        .map(crate::common::decimal::money_value_to_decimal)
+    if let Some(value) = state.executed_order_price.as_ref()
+        && let Some(avg_px) =
+            average_price_from_executed_order_price(value, state.lots_executed, metadata)?
     {
         report = report.with_avg_px(avg_px);
     }
     Ok(report)
 }
 
+#[cfg(test)]
 pub(super) fn stream_order_status_report_from_state(
     state: order_state_stream_response::OrderState,
     venue_order_id: &str,
@@ -301,11 +438,61 @@ pub(super) fn stream_order_status_report_from_state(
     client_order_id_override: Option<&str>,
     managed_time_in_force: Option<TimeInForce>,
 ) -> anyhow::Result<OrderStatusReport> {
-    let instrument_id = instrument_id_from_ticker_class_or_uid(
-        &state.ticker,
-        &state.class_code,
-        &state.trade_order_id,
-    )?;
+    stream_order_status_report_from_state_with_instruments(
+        state,
+        venue_order_id,
+        ts_init,
+        client_order_id_override,
+        managed_time_in_force,
+        None,
+    )
+}
+
+pub(super) fn stream_order_status_report_from_state_with_instruments(
+    state: order_state_stream_response::OrderState,
+    venue_order_id: &str,
+    ts_init: UnixNanos,
+    client_order_id_override: Option<&str>,
+    managed_time_in_force: Option<TimeInForce>,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+) -> anyhow::Result<OrderStatusReport> {
+    let instrument_id = match instruments {
+        Some(instruments) => instrument_id_from_ticker_class_or_cached_identity(
+            &state.ticker,
+            &state.class_code,
+            &state.instrument_uid,
+            "",
+            Some(instruments),
+        )?,
+        None => {
+            #[cfg(test)]
+            {
+                instrument_id_from_ticker_class_or_identity(
+                    &state.ticker,
+                    &state.class_code,
+                    &state.instrument_uid,
+                    "",
+                )?
+            }
+            #[cfg(not(test))]
+            {
+                anyhow::bail!(
+                    "instrument metadata cache is required for T-Bank order-state translation"
+                );
+            }
+        }
+    };
+    let metadata = instruments.and_then(|instruments| {
+        instruments
+            .lock()
+            .expect("instruments lock")
+            .values()
+            .find(|metadata| {
+                metadata.instrument_uid == state.instrument_uid
+                    || metadata.instrument_id == instrument_id.to_string()
+            })
+            .cloned()
+    });
     let lot = u32::try_from(state.lot_size.max(1)).unwrap_or(1);
     let ts_accepted = state
         .created_at
@@ -345,17 +532,14 @@ pub(super) fn stream_order_status_report_from_state(
     if let Some(price) = state
         .order_price
         .as_ref()
-        .map(price_from_money_value)
+        .map(price_from_point_valued_money_value)
         .transpose()?
     {
         report = report.with_price(price);
     }
-    if let Some(avg_px) = state
-        .executed_order_price
-        .as_ref()
-        .map(crate::common::decimal::money_value_to_decimal)
-    {
-        report = report.with_avg_px(avg_px);
+    if let Some(value) = state.executed_order_price.as_ref() {
+        let avg_px = average_price_from_money_value_for_instrument(value, metadata.as_ref())?;
+        report = report.with_avg_px(avg_px.as_decimal());
     }
     Ok(report)
 }
@@ -398,9 +582,7 @@ pub(super) fn resolve_stream_order_venue_id(
     if let Some(identity) = index.identity_for(None, Some(trade_order_id))
         && identity.route == TbankBrokerOrderRoute::StopOrder
     {
-        let stop_order_id = identity
-            .broker_order_id
-            .unwrap_or_else(|| trade_order_id.to_string());
+        let stop_order_id = identity.broker_order_id;
         let child_order_id = if order_id.is_empty() {
             stop_order_id.clone()
         } else {
@@ -428,7 +610,7 @@ pub(super) fn resolve_stream_order_venue_id(
             if should_cancel {
                 pending_cancel = Some(TbankBrokerOrderIdentity {
                     route: TbankBrokerOrderRoute::RegularOrder,
-                    broker_order_id: Some(child_order_id),
+                    broker_order_id: child_order_id,
                 });
             }
         }
@@ -458,7 +640,7 @@ pub(super) fn resolve_stream_order_venue_id(
             if should_cancel {
                 pending_cancel = Some(TbankBrokerOrderIdentity {
                     route: TbankBrokerOrderRoute::RegularOrder,
-                    broker_order_id: Some(order_id.to_string()),
+                    broker_order_id: order_id.to_string(),
                 });
             }
         }
@@ -470,8 +652,8 @@ pub(super) fn resolve_stream_order_venue_id(
 
     if let Some(client_order_id) = client_order_id.as_deref()
         && let Some(identity) = index.identity_for(Some(client_order_id), None)
-        && let Some(known_exchange_id) = identity.broker_order_id
     {
+        let known_exchange_id = identity.broker_order_id;
         let canonical_order_id = index.canonical_venue_order_id_or_self(&known_exchange_id);
         let mut pending_cancel = None;
         if !is_initial_ack && !order_id.is_empty() && order_id != known_exchange_id {
@@ -485,7 +667,7 @@ pub(super) fn resolve_stream_order_venue_id(
             if should_cancel {
                 pending_cancel = Some(TbankBrokerOrderIdentity {
                     route: TbankBrokerOrderRoute::RegularOrder,
-                    broker_order_id: Some(order_id.to_string()),
+                    broker_order_id: order_id.to_string(),
                 });
             }
         }
@@ -511,15 +693,14 @@ pub(super) fn resolve_stream_order_venue_id(
         return None;
     }
     let pending_cancel = if let Some(client_order_id) = client_order_id.as_deref() {
+        let route = index
+            .route_for_client_order_id(client_order_id)
+            .unwrap_or(TbankBrokerOrderRoute::RegularOrder);
         index
-            .record_mapping(
-                TbankBrokerOrderRoute::RegularOrder,
-                client_order_id,
-                venue_order_id,
-            )
+            .record_mapping(route, client_order_id, venue_order_id)
             .then(|| TbankBrokerOrderIdentity {
-                route: TbankBrokerOrderRoute::RegularOrder,
-                broker_order_id: Some(venue_order_id.to_string()),
+                route,
+                broker_order_id: venue_order_id.to_string(),
             })
     } else {
         index.record_venue_order_id(TbankBrokerOrderRoute::RegularOrder, venue_order_id);
@@ -531,11 +712,28 @@ pub(super) fn resolve_stream_order_venue_id(
     })
 }
 
+#[cfg(test)]
 pub(super) fn stream_stop_order_status_report_from_state(
     state: order_state_stream_response::StopOrderState,
     ts_init: UnixNanos,
     pending_submits: &Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
     broker_order_index: &Arc<Mutex<TbankBrokerOrderIndex>>,
+) -> anyhow::Result<Option<OrderStatusReport>> {
+    stream_stop_order_status_report_from_state_with_instruments(
+        state,
+        ts_init,
+        pending_submits,
+        broker_order_index,
+        None,
+    )
+}
+
+pub(super) fn stream_stop_order_status_report_from_state_with_instruments(
+    state: order_state_stream_response::StopOrderState,
+    ts_init: UnixNanos,
+    pending_submits: &Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
+    broker_order_index: &Arc<Mutex<TbankBrokerOrderIndex>>,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
 ) -> anyhow::Result<Option<OrderStatusReport>> {
     let client_order_id = {
         let index = broker_order_index.lock().expect("broker_order_index lock");
@@ -553,8 +751,9 @@ pub(super) fn stream_stop_order_status_report_from_state(
         Some(pending) => TbankManagedOrderContext {
             side: Some(pending.side),
             order_type: Some(pending.order_type),
+            report_order_type: None,
             time_in_force: Some(pending.time_in_force),
-            quantity_shares: Some(pending.quantity_shares),
+            quantity_units: Some(pending.quantity_units),
             trailing: pending.trailing,
         },
         None => {
@@ -564,16 +763,19 @@ pub(super) fn stream_stop_order_status_report_from_state(
                 .unwrap_or(TbankManagedOrderContext {
                     side: None,
                     order_type: Some(crate::common::TbankOrderType::StopMarket),
+                    report_order_type: None,
                     time_in_force: Some(TimeInForce::Gtc),
-                    quantity_shares: None,
+                    quantity_units: None,
                     trailing: None,
                 })
         }
     };
-    let instrument_id = instrument_id_from_ticker_class_or_uid(
+    let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
         &state.ticker,
         &state.class_code,
         &state.instrument_uid,
+        "",
+        instruments,
     )?;
     let ts_event = state
         .created_at
@@ -587,10 +789,10 @@ pub(super) fn stream_stop_order_status_report_from_state(
         Some(client_order_id.as_str().into()),
         state.stop_order_id.as_str().into(),
         nautilus_order_side(state.direction),
-        nautilus_stream_stop_order_type(managed_context.order_type),
+        nautilus_stream_stop_order_type_from_context(&managed_context),
         TimeInForce::Gtc,
         nautilus_stop_order_status(state.status),
-        Quantity::from_decimal(managed_context.quantity_shares.unwrap_or(Decimal::ZERO))?,
+        Quantity::from_decimal(managed_context.quantity_units.unwrap_or(Decimal::ZERO))?,
         Quantity::from(0),
         ts_event,
         ts_event,
@@ -600,7 +802,7 @@ pub(super) fn stream_stop_order_status_report_from_state(
     if let Some(price) = state
         .price
         .as_ref()
-        .map(price_from_money_value)
+        .map(price_from_point_valued_money_value)
         .transpose()?
     {
         report = report.with_price(price);
@@ -608,7 +810,7 @@ pub(super) fn stream_stop_order_status_report_from_state(
     if let Some(trigger_price) = state
         .stop_price
         .as_ref()
-        .map(price_from_money_value)
+        .map(price_from_point_valued_money_value)
         .transpose()?
     {
         if managed_context.trailing.is_some() {
@@ -625,11 +827,8 @@ pub(super) fn nautilus_stream_stop_order_type(
     order_type: Option<crate::common::TbankOrderType>,
 ) -> OrderType {
     match order_type {
-        Some(
-            crate::common::TbankOrderType::StopMarket
-            | crate::common::TbankOrderType::TakeProfitMarket,
-        )
-        | None => OrderType::StopMarket,
+        Some(crate::common::TbankOrderType::StopMarket) | None => OrderType::StopMarket,
+        Some(crate::common::TbankOrderType::MarketIfTouched) => OrderType::MarketIfTouched,
         Some(crate::common::TbankOrderType::Market) => OrderType::Market,
         Some(crate::common::TbankOrderType::Limit) => OrderType::Limit,
         Some(crate::common::TbankOrderType::TrailingStopMarket) => OrderType::TrailingStopMarket,
@@ -637,10 +836,28 @@ pub(super) fn nautilus_stream_stop_order_type(
     }
 }
 
+pub(super) fn nautilus_stream_stop_order_type_from_context(
+    context: &TbankManagedOrderContext,
+) -> OrderType {
+    context
+        .report_order_type
+        .or_else(|| {
+            context
+                .order_type
+                .map(|order_type| nautilus_stream_stop_order_type(Some(order_type)))
+        })
+        .unwrap_or(OrderType::StopMarket)
+}
+
 pub(super) fn with_default_stop_trigger_type(report: OrderStatusReport) -> OrderStatusReport {
     if matches!(
         report.order_type,
-        OrderType::StopMarket | OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
+        OrderType::StopMarket
+            | OrderType::StopLimit
+            | OrderType::TrailingStopMarket
+            | OrderType::TrailingStopLimit
+            | OrderType::MarketIfTouched
+            | OrderType::LimitIfTouched
     ) && report.trigger_type.is_none()
     {
         report.with_trigger_type(TriggerType::Default)
@@ -649,16 +866,41 @@ pub(super) fn with_default_stop_trigger_type(report: OrderStatusReport) -> Order
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn stop_order_status_report(
     account_id: AccountId,
     stop: StopOrder,
     ts_init: UnixNanos,
     lot_size: u32,
 ) -> anyhow::Result<OrderStatusReport> {
-    let instrument_id = instrument_id_from_ticker_class_or_uid(
+    stop_order_status_report_with_instruments(account_id, stop, ts_init, lot_size, None)
+}
+
+#[allow(dead_code)]
+pub(super) fn stop_order_status_report_with_instruments(
+    account_id: AccountId,
+    stop: StopOrder,
+    ts_init: UnixNanos,
+    lot_size: u32,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+) -> anyhow::Result<OrderStatusReport> {
+    stop_order_status_report_with_context(account_id, stop, ts_init, lot_size, instruments, None)
+}
+
+pub(super) fn stop_order_status_report_with_context(
+    account_id: AccountId,
+    stop: StopOrder,
+    ts_init: UnixNanos,
+    lot_size: u32,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+    managed_order_type: Option<crate::common::TbankOrderType>,
+) -> anyhow::Result<OrderStatusReport> {
+    let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
         &stop.ticker,
         &stop.class_code,
         &stop.instrument_uid,
+        &stop.figi,
+        instruments,
     )?;
     let ts_event = stop
         .create_date
@@ -672,7 +914,7 @@ pub(super) fn stop_order_status_report(
         None,
         stop.stop_order_id.as_str().into(),
         nautilus_stop_order_side(stop.direction),
-        nautilus_stop_order_type(&stop),
+        nautilus_stop_order_type_with_context(&stop, managed_order_type),
         TimeInForce::Gtc,
         nautilus_stop_order_status(stop.status),
         lots_to_quantity(stop.lots_requested, lot_size)?,
@@ -685,7 +927,7 @@ pub(super) fn stop_order_status_report(
     if let Some(price) = stop
         .price
         .as_ref()
-        .map(price_from_money_value)
+        .map(price_from_point_valued_money_value)
         .transpose()?
     {
         report = report.with_price(price);
@@ -693,7 +935,7 @@ pub(super) fn stop_order_status_report(
     if let Some(trigger_price) = stop
         .stop_price
         .as_ref()
-        .map(price_from_money_value)
+        .map(price_from_point_valued_money_value)
         .transpose()?
     {
         if matches!(
@@ -709,6 +951,7 @@ pub(super) fn stop_order_status_report(
     Ok(with_default_stop_trigger_type(report))
 }
 
+#[allow(dead_code)]
 pub(super) fn activated_stop_child_status_report(
     account_id: AccountId,
     stop: &StopOrder,
@@ -717,7 +960,37 @@ pub(super) fn activated_stop_child_status_report(
     lot_size: u32,
     client_order_id: Option<&str>,
 ) -> anyhow::Result<OrderStatusReport> {
-    let mut report = stop_order_status_report(account_id, stop.clone(), ts_init, lot_size)?;
+    activated_stop_child_status_report_with_context(
+        account_id,
+        stop,
+        state,
+        ts_init,
+        lot_size,
+        client_order_id,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn activated_stop_child_status_report_with_context(
+    account_id: AccountId,
+    stop: &StopOrder,
+    state: &OrderState,
+    ts_init: UnixNanos,
+    lot_size: u32,
+    client_order_id: Option<&str>,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+    managed_order_type: Option<crate::common::TbankOrderType>,
+) -> anyhow::Result<OrderStatusReport> {
+    let mut report = stop_order_status_report_with_context(
+        account_id,
+        stop.clone(),
+        ts_init,
+        lot_size,
+        instruments,
+        managed_order_type,
+    )?;
     report.client_order_id = client_order_id.map(Into::into);
     report.order_status = activated_stop_child_status(nautilus_order_status(
         state.execution_report_status,
@@ -733,10 +1006,16 @@ pub(super) fn activated_stop_child_status_report(
     {
         report.ts_last = ts_last;
     }
-    if let Some(avg_px) = state
-        .executed_order_price
-        .as_ref()
-        .map(crate::common::decimal::money_value_to_decimal)
+    let instrument_id_string = report.instrument_id.to_string();
+    let metadata = cached_instrument_metadata(
+        instruments,
+        &stop.instrument_uid,
+        &stop.figi,
+        &instrument_id_string,
+    );
+    if let Some(value) = state.executed_order_price.as_ref()
+        && let Some(avg_px) =
+            average_price_from_executed_order_price(value, state.lots_executed, metadata.as_ref())?
     {
         report = report.with_avg_px(avg_px);
     }
@@ -751,89 +1030,31 @@ pub(super) fn activated_stop_child_status(status: OrderStatus) -> OrderStatus {
     }
 }
 
-pub(super) fn stop_order_status_report_from_reconciled_submit(
-    account_id: AccountId,
-    init: nautilus_model::events::OrderInitialized,
-    stop: StopOrder,
-    ts_init: UnixNanos,
-    lot_size: u32,
-) -> anyhow::Result<OrderStatusReport> {
-    let ts_event = stop
-        .create_date
-        .as_ref()
-        .map(timestamp_to_unix_nanos)
-        .transpose()?
-        .unwrap_or(ts_init);
-    let mut report = OrderStatusReport::new(
-        account_id,
-        init.instrument_id,
-        Some(init.client_order_id),
-        stop.stop_order_id.as_str().into(),
-        init.order_side,
-        init.order_type,
-        init.time_in_force,
-        nautilus_stop_order_status(stop.status),
-        lots_to_quantity(stop.lots_requested, lot_size)?,
-        Quantity::from(0),
-        init.ts_event,
-        ts_event,
-        ts_init,
-        Some(UUID4::new()),
-    );
-    if let Some(price) = stop
-        .price
-        .as_ref()
-        .map(price_from_money_value)
-        .transpose()?
-        .or(init.price)
-    {
-        report = report.with_price(price);
-    }
-    if let Some(trigger_price) = stop
-        .stop_price
-        .as_ref()
-        .map(price_from_money_value)
-        .transpose()?
-        .or(init.trigger_price)
-    {
-        if matches!(
-            init.order_type,
-            OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
-        ) {
-            report = report.with_activation_price(trigger_price);
-        } else {
-            report = report.with_trigger_price(trigger_price);
-        }
-    }
-    let reconciled_trailing = trailing_params_from_stop(&stop)?.or_else(|| {
-        matches!(
-            init.order_type,
-            OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
-        )
-        .then_some(crate::execution::TbankTrailingStopParams {
-            activation_price: init.activation_price.map(|price| price.as_decimal()),
-            trailing_offset: init.trailing_offset?,
-            trailing_offset_type: init.trailing_offset_type?,
-            limit_offset: init.limit_offset,
-            trigger_type: init.trigger_type,
-        })
-    });
-    report = apply_trailing_params(report, reconciled_trailing)?;
-    Ok(with_default_stop_trigger_type(report))
-}
-
-pub(super) fn fill_reports_from_operation(
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn fill_reports_from_cursor_operation(
     account_id: AccountId,
     item: &OperationItem,
     ts_init: UnixNanos,
 ) -> Vec<anyhow::Result<FillReport>> {
+    fill_reports_from_cursor_operation_with_instruments(account_id, item, ts_init, None)
+}
+
+pub(super) fn fill_reports_from_cursor_operation_with_instruments(
+    account_id: AccountId,
+    item: &OperationItem,
+    ts_init: UnixNanos,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+) -> Vec<anyhow::Result<FillReport>> {
     let Some(side) = fill_side_from_operation_type(item.r#type) else {
         return Vec::new();
     };
-    let instrument_id = match instrument_id_from_ticker_class_or_uid(
+    let instrument_id = match instrument_id_from_ticker_class_or_cached_identity(
         &item.ticker,
         &item.class_code,
         &item.instrument_uid,
+        &item.figi,
+        instruments,
     ) {
         Ok(value) => value,
         Err(error) => return vec![Err(error)],
@@ -864,7 +1085,12 @@ pub(super) fn fill_reports_from_operation(
                 trade.num.as_str().into(),
                 side,
                 Quantity::from_decimal(Decimal::from(trade.quantity))?,
-                price_from_money_value_required(trade.price.as_ref())?,
+                price_from_point_valued_money_value(
+                    trade
+                        .price
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing trade price"))?,
+                )?,
                 commission,
                 LiquiditySide::NoLiquiditySide,
                 None,
@@ -897,8 +1123,13 @@ pub(super) fn fill_report_from_order_trade(
     ts_init: UnixNanos,
     instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
 ) -> anyhow::Result<FillReport> {
-    let instrument_id =
-        instrument_id_from_ticker_class_or_cached_uid("", "", &order.instrument_uid, instruments)?;
+    let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
+        "",
+        "",
+        &order.instrument_uid,
+        &order.figi,
+        Some(instruments),
+    )?;
     let ts_event = trade
         .date_time
         .as_ref()
@@ -912,7 +1143,7 @@ pub(super) fn fill_report_from_order_trade(
         trade.trade_id.as_str().into(),
         nautilus_order_side(order.direction),
         Quantity::from_decimal(Decimal::from(trade.quantity))?,
-        quotation_price_required(trade.price.as_ref())?,
+        quotation_price_from_points_required(trade.price.as_ref())?,
         Money::from_decimal(Decimal::ZERO, Currency::from("RUB"))?,
         LiquiditySide::NoLiquiditySide,
         None,
@@ -948,15 +1179,28 @@ pub(super) fn canonicalize_managed_trade_fill_report(
     report
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn position_status_report_from_portfolio(
     account_id: AccountId,
     position: &PortfolioPosition,
     ts_init: UnixNanos,
 ) -> Option<PositionStatusReport> {
-    let instrument_id = instrument_id_from_ticker_class_or_uid(
+    position_status_report_from_portfolio_with_instruments(account_id, position, ts_init, None)
+}
+
+pub(super) fn position_status_report_from_portfolio_with_instruments(
+    account_id: AccountId,
+    position: &PortfolioPosition,
+    ts_init: UnixNanos,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+) -> Option<PositionStatusReport> {
+    let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
         &position.ticker,
         &position.class_code,
         &position.instrument_uid,
+        &position.figi,
+        instruments,
     )
     .ok()?;
     let quantity = position
@@ -966,10 +1210,37 @@ pub(super) fn position_status_report_from_portfolio(
         .unwrap_or(Decimal::ZERO);
     let side = position_side(quantity);
     let abs_qty = Quantity::from_decimal(quantity.abs()).ok()?;
-    let avg_px = position
-        .average_position_price
+    let instrument_id_string = instrument_id.to_string();
+    let metadata = cached_instrument_metadata(
+        instruments,
+        &position.instrument_uid,
+        &position.figi,
+        &instrument_id_string,
+    );
+    let avg_px = if metadata
         .as_ref()
-        .map(crate::common::decimal::money_value_to_decimal);
+        .is_some_and(|metadata| metadata.price_in_points)
+    {
+        #[allow(deprecated)]
+        position
+            .average_position_price_pt
+            .as_ref()
+            .map(crate::common::decimal::quotation_to_decimal)
+            .or_else(|| {
+                position.average_position_price.as_ref().and_then(|value| {
+                    average_currency_price_to_nautilus_decimal(
+                        crate::common::decimal::money_value_to_decimal(value),
+                        metadata.as_ref(),
+                    )
+                    .ok()
+                })
+            })
+    } else {
+        position
+            .average_position_price
+            .as_ref()
+            .map(crate::common::decimal::money_value_to_decimal)
+    };
     Some(PositionStatusReport::new(
         account_id,
         instrument_id,
@@ -983,15 +1254,28 @@ pub(super) fn position_status_report_from_portfolio(
     ))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn position_status_report_from_security(
     account_id: AccountId,
     position: &PositionsSecurities,
     ts_init: UnixNanos,
 ) -> Option<PositionStatusReport> {
-    let instrument_id = instrument_id_from_ticker_class_or_uid(
+    position_status_report_from_security_with_instruments(account_id, position, ts_init, None)
+}
+
+pub(super) fn position_status_report_from_security_with_instruments(
+    account_id: AccountId,
+    position: &PositionsSecurities,
+    ts_init: UnixNanos,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
+) -> Option<PositionStatusReport> {
+    let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
         &position.ticker,
         &position.class_code,
         &position.instrument_uid,
+        &position.figi,
+        instruments,
     )
     .ok()?;
     let quantity = Decimal::from(position.balance);
@@ -1001,6 +1285,35 @@ pub(super) fn position_status_report_from_security(
         account_id,
         instrument_id,
         side,
+        abs_qty,
+        ts_init,
+        ts_init,
+        Some(UUID4::new()),
+        nonempty_position_id(&position.position_uid),
+        None,
+    ))
+}
+
+pub(super) fn position_status_report_from_future_with_instruments(
+    account_id: AccountId,
+    position: &PositionsFutures,
+    ts_init: UnixNanos,
+    instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
+) -> Option<PositionStatusReport> {
+    let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
+        &position.ticker,
+        &position.class_code,
+        &position.instrument_uid,
+        &position.figi,
+        Some(instruments),
+    )
+    .ok()?;
+    let quantity = Decimal::from(position.balance);
+    let abs_qty = Quantity::from_decimal(quantity.abs()).ok()?;
+    Some(PositionStatusReport::new(
+        account_id,
+        instrument_id,
+        position_side(quantity),
         abs_qty,
         ts_init,
         ts_init,
@@ -1026,7 +1339,7 @@ pub(super) fn account_state_from_portfolio(
     let Some(total) = portfolio.total_amount_portfolio.as_ref() else {
         return Ok(None);
     };
-    let currency = Currency::from(total.currency.to_uppercase().as_str());
+    let currency = crate::common::currency::currency_from_code(&total.currency)?;
     let total_amount = crate::common::decimal::money_value_to_decimal(total);
     let free_amount = portfolio
         .total_amount_currencies
@@ -1057,43 +1370,79 @@ pub(super) fn metadata_from_instrument(
     TbankInstrumentMetadata::from_instrument(instrument)
 }
 
-pub(super) fn instrument_id_from_ticker_class_or_uid(
+#[cfg(test)]
+pub(super) fn instrument_id_from_ticker_class_or_identity(
     ticker: &str,
     class_code: &str,
-    fallback: &str,
+    instrument_uid: &str,
+    figi: &str,
 ) -> anyhow::Result<nautilus_model::identifiers::InstrumentId> {
     let value = if !ticker.is_empty() && !class_code.is_empty() {
         crate::common::ids::instrument_id_from_ticker_class(ticker, class_code)
+    } else if !instrument_uid.is_empty() {
+        instrument_uid.to_string()
+    } else if !figi.is_empty() {
+        figi.to_string()
     } else {
-        fallback.to_string()
+        anyhow::bail!("instrument event has no complete identity");
     };
     value
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid instrument id {value}: {error}"))
 }
 
-pub(super) fn instrument_id_from_ticker_class_or_cached_uid(
+pub(super) fn instrument_id_from_ticker_class_or_cached_identity(
     ticker: &str,
     class_code: &str,
-    uid_or_figi: &str,
-    instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
+    instrument_uid: &str,
+    figi: &str,
+    instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
 ) -> anyhow::Result<nautilus_model::identifiers::InstrumentId> {
-    if !ticker.is_empty() && !class_code.is_empty() {
-        return instrument_id_from_ticker_class_or_uid(ticker, class_code, uid_or_figi);
-    }
-    if let Some(metadata) = instruments
-        .lock()
-        .expect("instruments lock")
-        .values()
-        .find(|metadata| metadata.instrument_uid == uid_or_figi || metadata.figi == uid_or_figi)
-        .cloned()
-    {
+    let has_authoritative_identity = !instrument_uid.is_empty() || !figi.is_empty();
+    if let Some(metadata) = instruments.and_then(|instruments| {
+        let instruments = instruments.lock().expect("instruments lock");
+        if has_authoritative_identity {
+            instruments
+                .values()
+                .find(|metadata| {
+                    metadata_matches_event_identity(
+                        metadata,
+                        instrument_uid,
+                        figi,
+                        ticker,
+                        class_code,
+                    )
+                })
+                .cloned()
+        } else if !ticker.is_empty() && !class_code.is_empty() {
+            let mut matches = instruments.values().filter(|metadata| {
+                metadata.ticker.eq_ignore_ascii_case(ticker)
+                    && metadata.class_code.eq_ignore_ascii_case(class_code)
+            });
+            let first = matches.next().cloned();
+            first.filter(|_| matches.next().is_none())
+        } else {
+            None
+        }
+    }) {
         return metadata
             .instrument_id
             .parse()
             .map_err(|error| anyhow::anyhow!("invalid cached instrument id: {error}"));
     }
-    instrument_id_from_ticker_class_or_uid(ticker, class_code, uid_or_figi)
+    #[cfg(test)]
+    if instruments.is_none() {
+        return instrument_id_from_ticker_class_or_identity(
+            ticker,
+            class_code,
+            instrument_uid,
+            figi,
+        );
+    }
+    let identity = super::instrument_metadata_identity(instrument_uid, figi, ticker, class_code);
+    Err(anyhow::anyhow!(
+        "instrument metadata is unavailable for {identity}; refusing to infer venue"
+    ))
 }
 
 pub(super) fn nonempty_client_order_id(
@@ -1135,16 +1484,6 @@ pub(super) fn timestamp_to_unix_nanos(
     Ok(UnixNanos::from(value))
 }
 
-pub(super) fn stop_order_create_date_matches_submit_window(
-    create_ts: UnixNanos,
-    submitted_ts: UnixNanos,
-) -> bool {
-    let min_create_ts = submitted_ts
-        .as_u64()
-        .saturating_sub(STOP_ORDER_RECONCILIATION_CREATE_DATE_TOLERANCE_NANOS);
-    create_ts.as_u64() >= min_create_ts
-}
-
 pub(super) fn current_unix_nanos() -> UnixNanos {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1152,23 +1491,34 @@ pub(super) fn current_unix_nanos() -> UnixNanos {
     UnixNanos::from(now.as_secs().saturating_mul(1_000_000_000) + u64::from(now.subsec_nanos()))
 }
 
-pub(super) fn price_from_money_value(value: &MoneyValue) -> anyhow::Result<Price> {
+/// Parses a T-Bank response price whose unit is already the Nautilus price
+/// point. Futures use this representation in the point-valued stream,
+/// stop-order, order-trade, and cursor-operation fields even though the
+/// protobuf type is still `MoneyValue`.
+pub(super) fn price_from_point_valued_money_value(value: &MoneyValue) -> anyhow::Result<Price> {
     Price::from_decimal(crate::common::decimal::money_value_to_decimal(value))
         .map_err(anyhow::Error::from)
 }
 
-pub(super) fn price_from_money_value_required(value: Option<&MoneyValue>) -> anyhow::Result<Price> {
-    price_from_money_value(value.ok_or_else(|| anyhow::anyhow!("missing price"))?)
+pub(super) fn price_from_money_value_for_instrument(
+    value: &MoneyValue,
+    metadata: Option<&TbankInstrumentMetadata>,
+) -> anyhow::Result<Price> {
+    let value = crate::common::decimal::money_value_to_decimal(value);
+    let points = currency_price_to_nautilus_decimal(value, metadata)?;
+    Price::from_decimal(points).map_err(anyhow::Error::from)
 }
 
-pub(super) fn quotation_price_required(value: Option<&Quotation>) -> anyhow::Result<Price> {
+pub(super) fn quotation_price_from_points_required(
+    value: Option<&Quotation>,
+) -> anyhow::Result<Price> {
     let value = value.ok_or_else(|| anyhow::anyhow!("missing price"))?;
     Price::from_decimal(crate::common::decimal::quotation_to_decimal(value))
         .map_err(anyhow::Error::from)
 }
 
 pub(super) fn money_from_value(value: &MoneyValue) -> anyhow::Result<Money> {
-    let currency = Currency::from(value.currency.to_uppercase().as_str());
+    let currency = crate::common::currency::currency_from_code(&value.currency)?;
     Money::from_decimal(
         crate::common::decimal::money_value_to_decimal(value),
         currency,
