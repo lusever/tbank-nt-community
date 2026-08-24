@@ -6,9 +6,9 @@ use std::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{OrderStatus, PositionSideSpecified},
-    identifiers::{AccountId, InstrumentId, PositionId},
+    identifiers::{AccountId, InstrumentId},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Currency, Money, Quantity},
+    types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 
@@ -21,6 +21,7 @@ pub(super) struct TbankFillProjection {
 pub(super) struct TbankOrderFillProjection {
     cumulative_filled_quantity: Decimal,
     emitted_fill_quantity: Decimal,
+    emitted_fill_notional: Decimal,
     emitted_commission: Option<Money>,
     unmatched_emitted_quantity: Decimal,
     seen_trade_ids: HashSet<String>,
@@ -47,6 +48,9 @@ pub(super) fn merge_fill_projection_alias(
     canonical.emitted_fill_quantity = canonical
         .emitted_fill_quantity
         .max(alias.emitted_fill_quantity);
+    canonical.emitted_fill_notional = canonical
+        .emitted_fill_notional
+        .max(alias.emitted_fill_notional);
     canonical.unmatched_emitted_quantity = canonical
         .unmatched_emitted_quantity
         .max(alias.unmatched_emitted_quantity);
@@ -75,7 +79,6 @@ pub(super) struct TbankProjectedOrderStatus {
 pub(super) struct TbankProjectedPosition {
     pub(super) account_id: AccountId,
     pub(super) instrument_id: InstrumentId,
-    pub(super) venue_position_id: Option<PositionId>,
     pub(super) source: TbankPositionProjectionSource,
     pub(super) is_flat: bool,
     pub(super) ts_last: UnixNanos,
@@ -242,6 +245,7 @@ mod tests {
         assert_eq!(empty_snapshot[0].instrument_id, instrument_id);
         assert_eq!(empty_snapshot[0].position_side, PositionSideSpecified::Flat);
         assert_eq!(empty_snapshot[0].quantity.as_decimal(), Decimal::ZERO);
+        assert_eq!(empty_snapshot[0].venue_position_id, None);
         {
             let projection = projection.lock().unwrap();
             let tombstone = projection.values().next().unwrap();
@@ -524,7 +528,6 @@ pub(super) fn projected_position_from_report(
     let mut position = TbankProjectedPosition {
         account_id: report.account_id,
         instrument_id: report.instrument_id,
-        venue_position_id: report.venue_position_id,
         source,
         is_flat: report.position_side == PositionSideSpecified::Flat
             || report.quantity.as_decimal() == Decimal::ZERO,
@@ -594,7 +597,8 @@ pub(super) fn project_order_status_report(
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TbankProjectedFill {
-    pub(super) quantity: Decimal,
+    pub(super) quantity: Quantity,
+    pub(super) price: Price,
     pub(super) commission: Money,
 }
 
@@ -602,25 +606,41 @@ pub(super) fn project_cumulative_order_fill(
     projection: &Arc<Mutex<TbankFillProjection>>,
     order_id: &str,
     cumulative_quantity: Decimal,
+    cumulative_notional: Decimal,
     cumulative_commission: Option<Money>,
 ) -> anyhow::Result<Option<TbankProjectedFill>> {
     if cumulative_quantity <= Decimal::ZERO {
         return Ok(None);
     }
     let mut projection = projection.lock().expect("fill_projection lock");
-    let order = projection.orders.entry(order_id.to_string()).or_default();
+    let mut order = projection.orders.get(order_id).cloned().unwrap_or_default();
     if cumulative_quantity > order.cumulative_filled_quantity {
         order.cumulative_filled_quantity = cumulative_quantity;
     }
-    let quantity = cumulative_quantity - order.emitted_fill_quantity;
-    if quantity <= Decimal::ZERO {
+    let quantity_decimal = cumulative_quantity - order.emitted_fill_quantity;
+    if quantity_decimal <= Decimal::ZERO {
+        projection.orders.insert(order_id.to_string(), order);
         return Ok(None);
     }
-    order.emitted_fill_quantity += quantity;
-    order.unmatched_emitted_quantity += quantity;
-    let commission = project_cumulative_commission(order, cumulative_commission)?;
+    let residual_notional = cumulative_notional - order.emitted_fill_notional;
+    anyhow::ensure!(
+        residual_notional >= Decimal::ZERO,
+        "cumulative execution notional regressed for order {order_id}: cumulative={cumulative_notional}, emitted={}",
+        order.emitted_fill_notional,
+    );
+    let quantity = Quantity::from_decimal(quantity_decimal)?;
+    let price = Price::from_decimal_dp(
+        residual_notional / quantity_decimal,
+        nautilus_model::types::fixed::FIXED_PRECISION,
+    )?;
+    order.emitted_fill_quantity += quantity_decimal;
+    order.emitted_fill_notional += residual_notional;
+    order.unmatched_emitted_quantity += quantity_decimal;
+    let commission = project_cumulative_commission(&mut order, cumulative_commission)?;
+    projection.orders.insert(order_id.to_string(), order);
     Ok(Some(TbankProjectedFill {
         quantity,
+        price,
         commission,
     }))
 }
@@ -683,7 +703,9 @@ pub(super) fn project_trade_fill_report_locked(
         projection.orders.insert(order_id, order);
         return Ok(None);
     }
+    let emitted_notional = report.last_px.as_decimal() * emit_quantity;
     order.emitted_fill_quantity += emit_quantity;
+    order.emitted_fill_notional += emitted_notional;
     if order.emitted_fill_quantity > order.cumulative_filled_quantity {
         order.cumulative_filled_quantity = order.emitted_fill_quantity;
     }
@@ -806,7 +828,9 @@ pub(super) fn reconcile_position_source_snapshot(
             ts_init,
             ts_init,
             Some(UUID4::new()),
-            position.venue_position_id,
+            // T-Bank uses NETTING semantics; never propagate a venue position
+            // ID from a projection into a Nautilus position status report.
+            None,
             None,
         ));
     }

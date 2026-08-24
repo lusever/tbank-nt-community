@@ -2,6 +2,128 @@
 
 use super::*;
 
+fn project_order_state_fills(
+    context: &TbankOrderStreamContext,
+    report: &OrderStatusReport,
+    raw_fills: Vec<FillReport>,
+) -> anyhow::Result<Vec<FillReport>> {
+    let raw_filled_quantity = raw_fills
+        .iter()
+        .map(|fill| fill.last_qty.as_decimal())
+        .sum::<Decimal>();
+
+    // `state.trades` may be only a partial view of the cumulative execution. In that case the
+    // individual prices cannot be combined with the cumulative average: use the cumulative fill
+    // as the sole source for this snapshot. The projection ledger keeps it incremental and
+    // derives any later remainder from cumulative notional.
+    let cumulative_filled_quantity = report.filled_qty.as_decimal();
+    if cumulative_filled_quantity > Decimal::ZERO
+        && raw_filled_quantity != cumulative_filled_quantity
+        && report.avg_px.is_some()
+    {
+        let synthetic_trade_id = synthetic_fill_trade_id(
+            "stream",
+            report.venue_order_id.as_str(),
+            cumulative_filled_quantity,
+        );
+        return context
+            .query_client
+            .project_order_status_fill_report(
+                report,
+                report.venue_order_id.as_str(),
+                synthetic_trade_id.as_str(),
+                report.ts_last,
+                report
+                    .client_order_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                None,
+            )
+            .map(|fill| fill.into_iter().collect());
+    }
+
+    let mut fills = Vec::new();
+    for raw_fill in raw_fills {
+        if let Some(fill) = project_managed_trade_fill_report(
+            &context.broker_order_index,
+            &context.fill_projection,
+            raw_fill,
+        )? {
+            fills.push(fill);
+        }
+    }
+    Ok(fills)
+}
+
+fn publish_order_state_trade_fills(
+    context: &TbankOrderStreamContext,
+    raw_fills: Vec<FillReport>,
+) -> Option<anyhow::Result<()>> {
+    context.run_if_active(|| {
+        for raw_fill in raw_fills {
+            if let Some(fill) = project_managed_trade_fill_report(
+                &context.broker_order_index,
+                &context.fill_projection,
+                raw_fill,
+            )? {
+                mark_pending_submit_fill_report(&context.pending_submits, &fill);
+                context.emitter.send_fill_report(fill);
+            }
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn publish_order_state_report_or_fills(
+    context: &TbankOrderStreamContext,
+    report: Option<OrderStatusReport>,
+    raw_fills: Vec<FillReport>,
+) -> Option<anyhow::Result<()>> {
+    match report {
+        Some(report) => publish_order_state_report_with_fills(context, report, raw_fills),
+        None => publish_order_state_trade_fills(context, raw_fills),
+    }
+}
+
+fn emit_order_state_report_with_fills(
+    context: &TbankOrderStreamContext,
+    report: OrderStatusReport,
+    fills: Vec<FillReport>,
+) {
+    if let Some(report) = project_order_status_report(&context.order_status_projection, report) {
+        if fills.is_empty() {
+            context.emitter.send_order_status_report(report);
+        } else {
+            context.emitter.send_order_with_fills(report, fills);
+        }
+    } else {
+        for fill in fills {
+            context.emitter.send_fill_report(fill);
+        }
+    }
+}
+
+pub(super) fn publish_order_state_report_with_fills(
+    context: &TbankOrderStreamContext,
+    report: OrderStatusReport,
+    raw_fills: Vec<FillReport>,
+) -> Option<anyhow::Result<()>> {
+    context.run_if_active(|| {
+        // The fill ledger and the Nautilus publication must share one lifecycle gate. Otherwise
+        // disconnect can suppress the event after this projection has already consumed the fill.
+        let fills = project_order_state_fills(context, &report, raw_fills)?;
+        settle_order_report_mutation_state(
+            &context.pending_submits,
+            &context.unresolved_cancellations,
+            &context.broker_order_index,
+            &report,
+        );
+        emit_order_state_report_with_fills(context, report, fills);
+        Ok(())
+    })
+}
+
 pub(super) async fn publish_order_state_stream(
     mut stream: tonic::Streaming<OrderStateStreamResponse>,
     context: TbankOrderStreamContext,
@@ -135,16 +257,37 @@ pub(super) async fn publish_order_state_stream(
                         }
                         let venue_order_id = resolved_identity.venue_order_id;
                         let current_broker_order_id = state.order_id.clone();
+                        let ts_init = current_unix_nanos();
+                        let raw_fill_reports = fill_reports_from_order_state_stream(
+                            &state,
+                            venue_order_id.as_str(),
+                            client_order_id.as_deref(),
+                            ts_init,
+                            &context.instruments,
+                        )
+                        .into_iter()
+                        .filter_map(|result| match result {
+                            Ok(report) => Some(report),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    %venue_order_id,
+                                    "failed to map embedded T-Bank order-state trade"
+                                );
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
                         match stream_order_status_report_from_state_with_instruments(
                             state,
                             venue_order_id.as_str(),
-                            current_unix_nanos(),
+                            ts_init,
                             client_order_id.as_deref(),
                             managed_time_in_force,
                             Some(&context.instruments),
                         ) {
                             Ok(mut report) => {
-                                if activated_from_stop {
+                                let report = if activated_from_stop {
                                     report.order_type = managed_context
                                         .as_ref()
                                         .map(nautilus_stream_stop_order_type_from_context)
@@ -156,48 +299,63 @@ pub(super) async fn publish_order_state_stream(
                                         report,
                                         managed_context.as_ref().and_then(|value| value.trailing),
                                     ) {
-                                        Ok(updated) => report = updated,
+                                        Ok(updated) => {
+                                            Some(with_default_stop_trigger_type(updated))
+                                        }
                                         Err(error) => {
                                             tracing::error!(%error, "failed to preserve trailing-stop context on activated child report");
-                                            continue;
+                                            None
                                         }
                                     }
-                                    report = with_default_stop_trigger_type(report);
-                                }
-                                context.run_if_active(|| {
-                                    settle_order_report_mutation_state(
-                                        &context.pending_submits,
-                                        &context.unresolved_cancellations,
-                                        &context.broker_order_index,
-                                        &report,
-                                    );
-                                    if let Some(report) = project_order_status_report(
-                                        &context.order_status_projection,
-                                        report,
-                                    ) {
-                                        context.emitter.send_order_status_report(report);
-                                    }
-                                });
-                                if context.is_active()
-                                    && let Err(error) = publish_buffered_trade_fills_for_venue(
-                                        current_broker_order_id.as_str(),
-                                        &context.emitter,
-                                        &context.broker_order_index,
-                                        &context.fill_projection,
-                                        &context.pending_submits,
-                                        &context.unresolved_trade_fills,
-                                        &context.lifecycle_active,
-                                    )
-                                {
+                                } else {
+                                    Some(report)
+                                };
+                                if let Some(Err(error)) = publish_order_state_report_or_fills(
+                                    &context,
+                                    report,
+                                    raw_fill_reports,
+                                ) {
                                     tracing::warn!(
                                         %error,
-                                        "failed to publish buffered T-Bank trade fills after order identity resolution"
+                                        %venue_order_id,
+                                        "failed to publish T-Bank order-state report or fills"
                                     );
                                 }
                             }
                             Err(error) => {
-                                tracing::warn!(%error, "failed to map T-Bank order-state stream event")
+                                tracing::warn!(
+                                    %error,
+                                    %venue_order_id,
+                                    "failed to map T-Bank order-state stream event"
+                                );
+                                if let Some(Err(error)) = publish_order_state_report_or_fills(
+                                    &context,
+                                    None,
+                                    raw_fill_reports,
+                                ) {
+                                    tracing::warn!(
+                                        %error,
+                                        %venue_order_id,
+                                        "failed to publish T-Bank order-state report or fills after status mapping failure"
+                                    );
+                                }
                             }
+                        }
+                        if context.is_active()
+                            && let Err(error) = publish_buffered_trade_fills_for_venue(
+                                current_broker_order_id.as_str(),
+                                &context.emitter,
+                                &context.broker_order_index,
+                                &context.fill_projection,
+                                &context.pending_submits,
+                                &context.unresolved_trade_fills,
+                                &context.lifecycle_active,
+                            )
+                        {
+                            tracing::warn!(
+                                %error,
+                                "failed to publish buffered T-Bank trade fills after order identity resolution"
+                            );
                         }
                     }
                     Some(order_state_stream_response::Payload::StopOrderState(state)) => {

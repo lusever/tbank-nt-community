@@ -22,15 +22,23 @@ impl BarContinuityTracker {
         }
     }
 
-    pub fn observe_live_bar(&mut self, ts_event_nanos: i128) -> BarContinuityDecision {
+    pub fn classify_live_bar(&self, ts_event_nanos: i128) -> BarContinuityDecision {
         if self
             .latest_seen
             .is_some_and(|latest| ts_event_nanos <= latest)
         {
             return BarContinuityDecision::Duplicate;
         }
-        self.latest_seen = Some(ts_event_nanos);
         BarContinuityDecision::Accepted
+    }
+
+    pub fn record_live_bar(&mut self, ts_event_nanos: i128) {
+        if self
+            .latest_seen
+            .is_none_or(|latest| ts_event_nanos > latest)
+        {
+            self.latest_seen = Some(ts_event_nanos);
+        }
     }
 
     pub const fn latest_seen(&self) -> Option<i128> {
@@ -69,24 +77,29 @@ mod tests {
     fn sparse_live_bars_are_accepted_without_inferring_missing_minutes() {
         let mut tracker = BarContinuityTracker::default();
 
-        assert_eq!(tracker.observe_live_bar(0), BarContinuityDecision::Accepted);
         assert_eq!(
-            tracker.observe_live_bar(3 * MINUTE),
+            tracker.classify_live_bar(0),
             BarContinuityDecision::Accepted
         );
+        tracker.record_live_bar(0);
+        assert_eq!(
+            tracker.classify_live_bar(3 * MINUTE),
+            BarContinuityDecision::Accepted
+        );
+        tracker.record_live_bar(3 * MINUTE);
         assert_eq!(tracker.latest_seen(), Some(3 * MINUTE));
     }
 
     #[test]
     fn duplicate_and_out_of_order_bars_are_ignored() {
-        let mut tracker = BarContinuityTracker::from_seeded_bar(2 * MINUTE);
+        let tracker = BarContinuityTracker::from_seeded_bar(2 * MINUTE);
 
         assert_eq!(
-            tracker.observe_live_bar(2 * MINUTE),
+            tracker.classify_live_bar(2 * MINUTE),
             BarContinuityDecision::Duplicate
         );
         assert_eq!(
-            tracker.observe_live_bar(MINUTE),
+            tracker.classify_live_bar(MINUTE),
             BarContinuityDecision::Duplicate
         );
         assert_eq!(tracker.latest_seen(), Some(2 * MINUTE));
@@ -99,11 +112,11 @@ mod tests {
 
         assert_eq!(tracker.latest_seen(), Some(10 * MINUTE));
         assert_eq!(
-            tracker.observe_live_bar(10 * MINUTE),
+            tracker.classify_live_bar(10 * MINUTE),
             BarContinuityDecision::Duplicate
         );
         assert_eq!(
-            tracker.observe_live_bar(11 * MINUTE),
+            tracker.classify_live_bar(11 * MINUTE),
             BarContinuityDecision::Accepted
         );
     }

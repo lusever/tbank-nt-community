@@ -2617,25 +2617,20 @@ impl TbankExecutionRuntime {
         if cumulative_quantity <= Decimal::ZERO {
             return Ok(None);
         }
-        let last_px = match (
-            report.avg_px.map(Price::from_decimal).transpose()?,
-            report.price,
-            report.trigger_price,
-        ) {
-            (Some(price), _, _) | (None, Some(price), _) | (None, None, Some(price)) => price,
-            (None, None, None) => {
-                tracing::warn!(
-                    order_id,
-                    order_request_id = order_request_id.unwrap_or(""),
-                    "skipping order-status fill report because T-Bank order state has no execution price"
-                );
-                return Ok(None);
-            }
+        let Some(cumulative_avg_px) = report.avg_px else {
+            tracing::warn!(
+                order_id,
+                order_request_id = order_request_id.unwrap_or(""),
+                "skipping order-status fill report because T-Bank order state has no execution average price"
+            );
+            return Ok(None);
         };
+        let cumulative_notional = cumulative_avg_px * cumulative_quantity;
         let Some(projected) = project_cumulative_order_fill(
             &self.fill_projection,
             order_id,
             cumulative_quantity,
+            cumulative_notional,
             cumulative_commission,
         )?
         else {
@@ -2647,8 +2642,8 @@ impl TbankExecutionRuntime {
             report.venue_order_id,
             trade_id.into(),
             report.order_side,
-            Quantity::from_decimal(projected.quantity)?,
-            last_px,
+            projected.quantity,
+            projected.price,
             projected.commission,
             LiquiditySide::NoLiquiditySide,
             report.client_order_id,

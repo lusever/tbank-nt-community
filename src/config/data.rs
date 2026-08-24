@@ -88,7 +88,7 @@ pub struct TbankDataClientConfig {
     #[builder(default = Duration::from_secs(5))]
     /// Interval between periodic candle polls.
     pub periodic_candle_poll_interval: Duration,
-    #[builder(default = 50)]
+    #[builder(default = 300)]
     /// Maximum candle subscriptions placed on one stream.
     pub max_candle_instruments_per_stream: usize,
     #[builder(default = 25)]

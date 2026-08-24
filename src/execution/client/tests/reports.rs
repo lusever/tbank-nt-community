@@ -68,6 +68,367 @@ fn futures_order_state_price_is_normalized_from_cumulative_value() {
 }
 
 #[test]
+fn order_state_uses_per_instrument_stage_price_over_cumulative_average() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_id = "X5_TQBR.MOEX".to_string();
+    metadata.ticker = "X5".to_string();
+    metadata.instrument_uid = "x5-uid".to_string();
+    metadata.lot = 1;
+    let report = super::order_status_report_from_state_with_metadata(
+        "TBANK-001".into(),
+        OrderState {
+            order_id: "x5-order-1".to_string(),
+            lots_requested: 8,
+            lots_executed: 8,
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            instrument_uid: metadata.instrument_uid.clone(),
+            ticker: metadata.ticker.clone(),
+            class_code: metadata.class_code.clone(),
+            executed_order_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 14_507,
+                nano: 0,
+            }),
+            stages: vec![crate::grpc::generated::OrderStage {
+                price: Some(MoneyValue {
+                    currency: "rub".to_string(),
+                    units: 1_813,
+                    nano: 375_000_000,
+                }),
+                quantity: 8,
+                ..crate::grpc::generated::OrderStage::default()
+            }],
+            ..OrderState::default()
+        },
+        super::current_unix_nanos(),
+        "X5_TQBR.MOEX".parse().unwrap(),
+        metadata.lot,
+        Some(&metadata),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px, Some(Decimal::new(1_813_375, 3)));
+}
+
+#[test]
+fn order_state_stream_uses_embedded_trade_price_for_fill_and_average() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_id = "X5_TQBR.MOEX".to_string();
+    metadata.ticker = "X5".to_string();
+    metadata.instrument_uid = "x5-uid".to_string();
+    metadata.lot = 1;
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+    let state = order_state_stream_response::OrderState {
+        order_id: "x5-order-1".to_string(),
+        trade_order_id: "x5-trade-order-1".to_string(),
+        order_request_id: Some("x5-request-1".to_string()),
+        account_id: "account-1".to_string(),
+        ticker: "X5".to_string(),
+        class_code: "TQBR".to_string(),
+        instrument_uid: "x5-uid".to_string(),
+        lot_size: 1,
+        direction: OrderDirection::Buy as i32,
+        order_type: crate::grpc::generated::OrderType::Market as i32,
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+        lots_requested: 8,
+        lots_executed: 8,
+        executed_order_price: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: 14_507,
+            nano: 0,
+        }),
+        trades: vec![OrderTrade {
+            price: Some(Quotation {
+                units: 1_813,
+                nano: 375_000_000,
+            }),
+            quantity: 8,
+            trade_id: "x5-fill-1".to_string(),
+            ..OrderTrade::default()
+        }],
+        ..order_state_stream_response::OrderState::default()
+    };
+    let report = super::stream_order_status_report_from_state_with_instruments(
+        state.clone(),
+        "x5-order-1",
+        super::current_unix_nanos(),
+        None,
+        None,
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px, Some(Decimal::new(1_813_375, 3)));
+    let fills = super::fill_reports_from_order_state_stream(
+        &state,
+        "x5-order-1",
+        None,
+        super::current_unix_nanos(),
+        &instruments,
+    );
+    let fill = fills.into_iter().next().unwrap().unwrap();
+    assert_eq!(fill.last_qty.as_decimal(), Decimal::from(8));
+    assert_eq!(fill.last_px.as_decimal(), Decimal::new(1_813_375, 3));
+    assert!(fill.client_order_id.is_none());
+}
+
+#[test]
+fn order_state_stream_fill_uses_only_resolved_client_order_id() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+    let state = order_state_stream_response::OrderState {
+        order_id: "external-order-1".to_string(),
+        order_request_id: Some("tbank-request-id".to_string()),
+        account_id: "account-1".to_string(),
+        ticker: "SBER".to_string(),
+        class_code: "TQBR".to_string(),
+        instrument_uid: "sber-uid".to_string(),
+        direction: OrderDirection::Buy as i32,
+        trades: vec![OrderTrade {
+            price: Some(Quotation {
+                units: 100,
+                nano: 0,
+            }),
+            quantity: 1,
+            trade_id: "external-fill-1".to_string(),
+            ..OrderTrade::default()
+        }],
+        ..order_state_stream_response::OrderState::default()
+    };
+
+    let unresolved = super::fill_reports_from_order_state_stream(
+        &state,
+        "external-order-1",
+        None,
+        super::current_unix_nanos(),
+        &instruments,
+    )
+    .into_iter()
+    .next()
+    .unwrap()
+    .unwrap();
+    assert!(unresolved.client_order_id.is_none());
+
+    let resolved = super::fill_reports_from_order_state_stream(
+        &state,
+        "external-order-1",
+        Some("nautilus-order-1"),
+        super::current_unix_nanos(),
+        &instruments,
+    )
+    .into_iter()
+    .next()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        resolved.client_order_id.map(|id| id.to_string()),
+        Some("nautilus-order-1".to_string())
+    );
+}
+
+#[test]
+fn order_state_stream_average_is_bounded_to_nautilus_precision() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+    let report = super::stream_order_status_report_from_state_with_instruments(
+        order_state_stream_response::OrderState {
+            order_id: "stream-order-average-1".to_string(),
+            trade_order_id: "stream-trade-average-1".to_string(),
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            lot_size: 1,
+            lots_requested: 3,
+            lots_executed: 3,
+            trades: vec![
+                OrderTrade {
+                    price: Some(Quotation { units: 100, nano: 0 }),
+                    quantity: 1,
+                    trade_id: "stream-trade-1".to_string(),
+                    ..OrderTrade::default()
+                },
+                OrderTrade {
+                    price: Some(Quotation { units: 101, nano: 0 }),
+                    quantity: 2,
+                    trade_id: "stream-trade-2".to_string(),
+                    ..OrderTrade::default()
+                },
+            ],
+            ..order_state_stream_response::OrderState::default()
+        },
+        "stream-order-average-1",
+        super::current_unix_nanos(),
+        None,
+        None,
+        Some(&instruments),
+    )
+    .unwrap();
+
+    let expected = Price::from_decimal_dp(
+        Decimal::from(302) / Decimal::from(3),
+        nautilus_model::types::fixed::FIXED_PRECISION,
+    )
+    .unwrap()
+    .as_decimal();
+    assert_eq!(report.avg_px, Some(expected));
+    assert!(Price::from_decimal(report.avg_px.unwrap()).is_ok());
+}
+
+#[test]
+fn order_state_average_uses_cumulative_fallback_for_incomplete_stages() {
+    let metadata = sber_metadata();
+    let report = super::order_status_report_from_state_with_metadata(
+        "TBANK-001".into(),
+        OrderState {
+            order_id: "state-order-average-1".to_string(),
+            lots_requested: 10,
+            lots_executed: 10,
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            executed_order_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 1_050,
+                nano: 0,
+            }),
+            stages: vec![
+                crate::grpc::generated::OrderStage {
+                    price: Some(MoneyValue {
+                        currency: "rub".to_string(),
+                        units: 100,
+                        nano: 0,
+                    }),
+                    quantity: 5,
+                    ..crate::grpc::generated::OrderStage::default()
+                },
+                crate::grpc::generated::OrderStage {
+                    quantity: 5,
+                    ..crate::grpc::generated::OrderStage::default()
+                },
+            ],
+            ..OrderState::default()
+        },
+        super::current_unix_nanos(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        metadata.lot,
+        Some(&metadata),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px, Some(Decimal::from(105)));
+}
+
+#[test]
+fn order_state_stream_average_uses_cumulative_fallback_for_incomplete_trades() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+    let report = super::stream_order_status_report_from_state_with_instruments(
+        order_state_stream_response::OrderState {
+            order_id: "stream-order-average-2".to_string(),
+            trade_order_id: "stream-trade-average-2".to_string(),
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            lot_size: 1,
+            lots_requested: 10,
+            lots_executed: 10,
+            executed_order_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 105,
+                nano: 0,
+            }),
+            trades: vec![
+                OrderTrade {
+                    price: Some(Quotation { units: 100, nano: 0 }),
+                    quantity: 5,
+                    trade_id: "stream-trade-3".to_string(),
+                    ..OrderTrade::default()
+                },
+                OrderTrade {
+                    quantity: 5,
+                    trade_id: "stream-trade-4".to_string(),
+                    ..OrderTrade::default()
+                },
+            ],
+            ..order_state_stream_response::OrderState::default()
+        },
+        "stream-order-average-2",
+        super::current_unix_nanos(),
+        None,
+        None,
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert_eq!(report.avg_px, Some(Decimal::from(105)));
+}
+
+#[test]
+fn order_state_stream_does_not_create_average_from_partial_trades() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata,
+    )])));
+    let report = super::stream_order_status_report_from_state_with_instruments(
+        order_state_stream_response::OrderState {
+            order_id: "stream-order-average-3".to_string(),
+            trade_order_id: "stream-trade-average-3".to_string(),
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            lot_size: 1,
+            lots_requested: 10,
+            lots_executed: 10,
+            order_price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 100,
+                nano: 0,
+            }),
+            trades: vec![
+                OrderTrade {
+                    price: Some(Quotation { units: 100, nano: 0 }),
+                    quantity: 5,
+                    trade_id: "stream-trade-5".to_string(),
+                    ..OrderTrade::default()
+                },
+                OrderTrade {
+                    quantity: 5,
+                    trade_id: "stream-trade-6".to_string(),
+                    ..OrderTrade::default()
+                },
+            ],
+            ..order_state_stream_response::OrderState::default()
+        },
+        "stream-order-average-3",
+        super::current_unix_nanos(),
+        None,
+        None,
+        Some(&instruments),
+    )
+    .unwrap();
+
+    assert!(report.avg_px.is_none());
+}
+
+#[test]
 fn futures_portfolio_fallback_price_is_converted_to_points() {
     let metadata = si_futures_metadata();
     let instruments = Arc::new(Mutex::new(HashMap::from([(
@@ -97,6 +458,68 @@ fn futures_portfolio_fallback_price_is_converted_to_points() {
     .unwrap();
 
     assert_eq!(report.avg_px_open, Some(Decimal::from(70_000)));
+}
+
+#[test]
+fn netting_position_reports_do_not_expose_tbank_position_uid_as_venue_id() {
+    let metadata = sber_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let portfolio = PortfolioPosition {
+        instrument_uid: metadata.instrument_uid.clone(),
+        figi: metadata.figi.clone(),
+        ticker: metadata.ticker.clone(),
+        class_code: metadata.class_code.clone(),
+        position_uid: metadata.position_uid.clone(),
+        quantity: Some(Quotation { units: -2, nano: 0 }),
+        ..PortfolioPosition::default()
+    };
+    let portfolio_report = super::position_status_report_from_portfolio_with_instruments(
+        "TBANK-001".into(),
+        &portfolio,
+        super::current_unix_nanos(),
+        Some(&instruments),
+    )
+    .unwrap();
+    assert_eq!(portfolio_report.venue_position_id, None);
+
+    let security = PositionsSecurities {
+        instrument_uid: metadata.instrument_uid.clone(),
+        figi: metadata.figi.clone(),
+        ticker: metadata.ticker.clone(),
+        class_code: metadata.class_code.clone(),
+        position_uid: metadata.position_uid.clone(),
+        balance: -2,
+        ..PositionsSecurities::default()
+    };
+    let security_report = super::position_status_report_from_security_with_instruments(
+        "TBANK-001".into(),
+        &security,
+        super::current_unix_nanos(),
+        Some(&instruments),
+    )
+    .unwrap();
+    assert_eq!(security_report.venue_position_id, None);
+
+    let future = crate::grpc::generated::PositionsFutures {
+        instrument_uid: metadata.instrument_uid,
+        figi: metadata.figi,
+        ticker: metadata.ticker,
+        class_code: metadata.class_code,
+        position_uid: metadata.position_uid,
+        balance: -2,
+        ..crate::grpc::generated::PositionsFutures::default()
+    };
+    let future_report = super::position_status_report_from_future_with_instruments(
+        "TBANK-001".into(),
+        &future,
+        super::current_unix_nanos(),
+        &instruments,
+    )
+    .unwrap();
+    assert_eq!(future_report.venue_position_id, None);
 }
 
 #[test]
@@ -338,7 +761,7 @@ fn order_state_stream_average_price_is_not_divided_by_lots() {
 #[test]
 fn stop_order_maps_to_order_status_report() {
     let ts_init = super::current_unix_nanos();
-    let report = super::stop_order_status_report(
+    let report = super::stop_order_status_report_with_context(
         "account-1".into(),
         StopOrder {
             stop_order_id: "stop-1".to_string(),
@@ -358,6 +781,8 @@ fn stop_order_maps_to_order_status_report() {
         },
         ts_init,
         10,
+        None,
+        None,
     )
     .unwrap();
 
@@ -406,7 +831,7 @@ fn managed_market_if_touched_type_survives_stop_query_translation() {
 
 #[test]
 fn limit_take_profit_stop_query_preserves_limit_if_touched_type() {
-    let report = super::stop_order_status_report(
+    let report = super::stop_order_status_report_with_context(
         "account-1".into(),
         StopOrder {
             stop_order_id: "limit-tp-stop-1".to_string(),
@@ -426,6 +851,8 @@ fn limit_take_profit_stop_query_preserves_limit_if_touched_type() {
         },
         super::current_unix_nanos(),
         10,
+        None,
+        None,
     )
     .unwrap();
 
@@ -549,7 +976,7 @@ fn futures_stop_stream_report_preserves_point_prices() {
 
 #[test]
 fn take_profit_stop_query_falls_back_to_market_if_touched() {
-    let report = super::stop_order_status_report(
+    let report = super::stop_order_status_report_with_context(
         "account-1".into(),
         StopOrder {
             stop_order_id: "mit-stop-after-restart".to_string(),
@@ -568,6 +995,8 @@ fn take_profit_stop_query_falls_back_to_market_if_touched() {
         },
         super::current_unix_nanos(),
         10,
+        None,
+        None,
     )
     .unwrap();
 
@@ -577,7 +1006,7 @@ fn take_profit_stop_query_falls_back_to_market_if_touched() {
 #[test]
 fn trailing_stop_query_preserves_native_offsets() {
     let ts_init = super::current_unix_nanos();
-    let report = super::stop_order_status_report(
+    let report = super::stop_order_status_report_with_context(
         "account-1".into(),
         StopOrder {
             stop_order_id: "trailing-1".to_string(),
@@ -612,6 +1041,8 @@ fn trailing_stop_query_preserves_native_offsets() {
         },
         ts_init,
         10,
+        None,
+        None,
     )
     .unwrap();
 
@@ -694,6 +1125,7 @@ fn futures_cursor_operation_trade_price_is_already_in_points() {
             instrument_uid: metadata.instrument_uid.clone(),
             ticker: metadata.ticker.clone(),
             class_code: metadata.class_code.clone(),
+            position_uid: metadata.position_uid.clone(),
             trades_info: Some(OperationItemTrades {
                 trades: vec![OperationItemTrade {
                     num: "future-trade-1".to_string(),
@@ -714,6 +1146,7 @@ fn futures_cursor_operation_trade_price_is_already_in_points() {
 
     let report = reports.into_iter().next().unwrap().unwrap();
     assert_eq!(report.last_px.as_decimal(), Decimal::from(70_000));
+    assert_eq!(report.venue_position_id, None);
 }
 
 #[test]
@@ -776,7 +1209,7 @@ fn trailing_stop_query_rejects_mixed_offset_units() {
 #[test]
 fn open_order_status_report_converts_lots_to_shares() {
     let ts_init = super::current_unix_nanos();
-    let report = super::order_status_report_from_state(
+    let report = super::order_status_report_from_state_with_metadata(
         "account-1".into(),
         OrderState {
             order_id: "order-1".to_string(),
@@ -793,6 +1226,7 @@ fn open_order_status_report_converts_lots_to_shares() {
         ts_init,
         "SBER_TQBR.MOEX".parse().unwrap(),
         10,
+        None,
     )
     .unwrap();
 
@@ -815,7 +1249,7 @@ fn order_status_fill_projection_dedupes_late_stream_fill() {
         .lock()
         .unwrap()
         .insert(metadata.instrument_id.clone(), metadata);
-    let report = super::order_status_report_from_state(
+    let report = super::order_status_report_from_state_with_metadata(
         "account-1".into(),
         OrderState {
             order_id: "exchange-order-1".to_string(),
@@ -837,6 +1271,7 @@ fn order_status_fill_projection_dedupes_late_stream_fill() {
         ts_init,
         "SBER_TQBR.MOEX".parse().unwrap(),
         10,
+        None,
     )
     .unwrap();
 
@@ -884,6 +1319,113 @@ fn order_status_fill_projection_dedupes_late_stream_fill() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn order_status_fill_projection_requires_execution_average_price() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    let ts = super::current_unix_nanos();
+    let report = OrderStatusReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        Some("client-order-1".into()),
+        "venue-order-1".into(),
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Day,
+        OrderStatus::Filled,
+        Quantity::from(10),
+        Quantity::from(10),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    )
+    .with_price(Price::from("100"));
+
+    assert!(client
+        .runtime
+        .project_order_status_fill_report(
+            &report,
+            "venue-order-1",
+            "synthetic-trade-1",
+            ts,
+            Some("client-order-1"),
+            None,
+        )
+        .unwrap()
+        .is_none());
+    assert!(client.runtime.fill_projection.lock().unwrap().orders.is_empty());
+}
+
+#[test]
+fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    let ts = super::current_unix_nanos();
+    let first = OrderStatusReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        Some("client-order-1".into()),
+        "venue-order-1".into(),
+        OrderSide::Buy,
+        OrderType::Market,
+        TimeInForce::Day,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(10),
+        Quantity::from(5),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    )
+    .with_avg_px(Decimal::from(100));
+    let first_fill = client
+        .runtime
+        .project_order_status_fill_report(
+            &first,
+            "venue-order-1",
+            "synthetic-trade-1",
+            ts,
+            Some("client-order-1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_fill.last_qty.as_decimal(), Decimal::from(5));
+    assert_eq!(first_fill.last_px.as_decimal(), Decimal::from(100));
+
+    let second = OrderStatusReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        Some("client-order-1".into()),
+        "venue-order-1".into(),
+        OrderSide::Buy,
+        OrderType::Market,
+        TimeInForce::Day,
+        OrderStatus::Filled,
+        Quantity::from(10),
+        Quantity::from(10),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    )
+    .with_avg_px(Decimal::from(105));
+    let second_fill = client
+        .runtime
+        .project_order_status_fill_report(
+            &second,
+            "venue-order-1",
+            "synthetic-trade-2",
+            ts,
+            Some("client-order-1"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(second_fill.last_qty.as_decimal(), Decimal::from(5));
+    assert_eq!(second_fill.last_px.as_decimal(), Decimal::from(110));
 }
 
 #[tokio::test]

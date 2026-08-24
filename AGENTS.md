@@ -36,10 +36,10 @@ cargo test --locked --features sandbox-tests --test sandbox_integration -- \
 
 - Missing sandbox credentials or account configuration must fail affected tests. Capability-based
   skips are allowed only for unsupported or unavailable sandbox behavior and must be reported.
-- Do not expose tokens, authorization metadata, account identifiers, venue order or position
-  identifiers, broker request/idempotency IDs, or other private broker tracking metadata. Public
-  instrument identifiers (`ticker`, `class_code`, `FIGI`, and `instrument_uid`) are not secrets or
-  private tracking metadata and may be included in human-readable diagnostics when useful.
+- Do not expose tokens, authorization metadata, or account identifiers. Broker request/idempotency
+  IDs, venue order/position IDs, and public instrument identifiers (`ticker`, `class_code`, `FIGI`,
+  and `instrument_uid`) may be included in human-readable diagnostics when useful for routing,
+  reconciliation, or lifecycle debugging. Never log credentials or authorization metadata.
 - Do not change order lifecycle, broker request-id, or persisted projection contracts without
   updating every producer, consumer, fixture, test, and documented version in the same change.
 - On execution mutex poisoning, fail the runtime; never recover corrupted projections. Commit

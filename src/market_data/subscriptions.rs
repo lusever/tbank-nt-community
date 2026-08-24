@@ -6,6 +6,7 @@ use crate::grpc::generated::{
     SubscribeTradesRequest, SubscriptionAction, SubscriptionInterval, TradeInstrument,
     TradeSourceType, get_candles_request, market_data_request,
 };
+use nautilus_model::identifiers::InstrumentId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Identity of an order-book subscription.
@@ -16,16 +17,38 @@ pub struct BookSubscription {
     pub depth: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StableBookSubscription {
+    instrument_id: InstrumentId,
+    depth: i32,
+}
+
 #[derive(Debug, Clone, Default)]
 /// Registry of desired market-data subscriptions used across reconnects.
 pub struct TbankSubscriptionRegistry {
+    // UID-only entries are retained for the public low-level helpers below. Nautilus DataClient
+    // commands use the stable InstrumentId-backed entries, whose broker route is resolved only
+    // when a concrete restore request is built.
     bars_1m: HashSet<String>,
     trades: HashSet<String>,
     quotes: HashSet<String>,
     books: HashSet<BookSubscription>,
+    stable_bars_1m: HashSet<InstrumentId>,
+    stable_trades: HashSet<InstrumentId>,
+    stable_books: HashSet<StableBookSubscription>,
 }
 
 impl TbankSubscriptionRegistry {
+    /// Registers a one-minute bar subscription owned by a stable Nautilus instrument identity.
+    pub fn subscribe_bars_1m_for_instrument(
+        &mut self,
+        instrument_id: InstrumentId,
+        stream_id: impl Into<String>,
+    ) -> MarketDataRequest {
+        self.stable_bars_1m.insert(instrument_id);
+        bars_request(SubscriptionAction::Subscribe, stream_id.into())
+    }
+
     /// Registers a one-minute bar subscription.
     pub fn subscribe_bars_1m(&mut self, instrument_uid: impl Into<String>) -> MarketDataRequest {
         let instrument_uid = instrument_uid.into();
@@ -54,6 +77,26 @@ impl TbankSubscriptionRegistry {
         bars_request(SubscriptionAction::Unsubscribe, instrument_uid.to_string())
     }
 
+    /// Removes a one-minute bar subscription by stable Nautilus instrument identity.
+    pub fn unsubscribe_bars_1m_for_instrument(
+        &mut self,
+        instrument_id: InstrumentId,
+        stream_id: impl Into<String>,
+    ) -> MarketDataRequest {
+        self.stable_bars_1m.remove(&instrument_id);
+        bars_request(SubscriptionAction::Unsubscribe, stream_id.into())
+    }
+
+    /// Registers a trade subscription owned by a stable Nautilus instrument identity.
+    pub fn subscribe_trades_for_instrument(
+        &mut self,
+        instrument_id: InstrumentId,
+        stream_id: impl Into<String>,
+    ) -> MarketDataRequest {
+        self.stable_trades.insert(instrument_id);
+        trades_request(SubscriptionAction::Subscribe, stream_id.into())
+    }
+
     /// Registers a trade subscription.
     pub fn subscribe_trades(&mut self, instrument_uid: impl Into<String>) -> MarketDataRequest {
         let instrument_uid = instrument_uid.into();
@@ -65,6 +108,31 @@ impl TbankSubscriptionRegistry {
     pub fn unsubscribe_trades(&mut self, instrument_uid: &str) -> MarketDataRequest {
         self.trades.remove(instrument_uid);
         trades_request(SubscriptionAction::Unsubscribe, instrument_uid.to_string())
+    }
+
+    /// Removes a trade subscription by stable Nautilus instrument identity.
+    pub fn unsubscribe_trades_for_instrument(
+        &mut self,
+        instrument_id: InstrumentId,
+        stream_id: impl Into<String>,
+    ) -> MarketDataRequest {
+        self.stable_trades.remove(&instrument_id);
+        trades_request(SubscriptionAction::Unsubscribe, stream_id.into())
+    }
+
+    /// Replaces order-book depths for a stable Nautilus instrument identity.
+    pub fn replace_order_books_for_instrument(
+        &mut self,
+        instrument_id: InstrumentId,
+        depths: impl IntoIterator<Item = i32>,
+    ) {
+        self.stable_books
+            .retain(|subscription| subscription.instrument_id != instrument_id);
+        self.stable_books
+            .extend(depths.into_iter().map(|depth| StableBookSubscription {
+                instrument_id,
+                depth,
+            }));
     }
 
     /// Registers a quote subscription.
@@ -92,6 +160,22 @@ impl TbankSubscriptionRegistry {
             depth,
         });
         book_request(SubscriptionAction::Subscribe, instrument_uid, depth)
+    }
+
+    /// Replaces all active order-book depths for an instrument.
+    pub fn replace_order_books(
+        &mut self,
+        instrument_uid: impl Into<String>,
+        depths: impl IntoIterator<Item = i32>,
+    ) {
+        let instrument_uid = instrument_uid.into();
+        self.books
+            .retain(|subscription| subscription.instrument_uid != instrument_uid);
+        self.books
+            .extend(depths.into_iter().map(|depth| BookSubscription {
+                instrument_uid: instrument_uid.clone(),
+                depth,
+            }));
     }
 
     /// Removes an order-book subscription.
@@ -132,6 +216,27 @@ impl TbankSubscriptionRegistry {
         )
     }
 
+    /// Removes all non-quote order-book depths by stable Nautilus instrument identity.
+    pub fn unsubscribe_depth_books_for_instrument(
+        &mut self,
+        instrument_id: InstrumentId,
+        stream_id: impl Into<String>,
+    ) -> MarketDataRequest {
+        let depth = self
+            .stable_books
+            .iter()
+            .filter(|subscription| {
+                subscription.instrument_id == instrument_id && subscription.depth != 1
+            })
+            .map(|subscription| subscription.depth)
+            .max()
+            .unwrap_or(10);
+        self.stable_books.retain(|subscription| {
+            subscription.instrument_id != instrument_id || subscription.depth == 1
+        });
+        book_request(SubscriptionAction::Unsubscribe, stream_id.into(), depth)
+    }
+
     /// Builds requests that restore all registered subscriptions.
     pub fn restore_requests(&self) -> Vec<MarketDataRequest> {
         let mut requests = Vec::new();
@@ -157,6 +262,34 @@ impl TbankSubscriptionRegistry {
             book_request(
                 SubscriptionAction::Subscribe,
                 subscription.instrument_uid.clone(),
+                subscription.depth,
+            )
+        }));
+        requests
+    }
+
+    /// Builds restore requests for stable Nautilus subscriptions using the current broker route.
+    pub fn restore_requests_with_stream_ids(
+        &self,
+        resolve_stream_id: impl Fn(InstrumentId) -> String,
+    ) -> Vec<MarketDataRequest> {
+        let mut requests = self.restore_requests();
+        requests.extend(self.stable_bars_1m.iter().map(|instrument_id| {
+            bars_request(
+                SubscriptionAction::Subscribe,
+                resolve_stream_id(*instrument_id),
+            )
+        }));
+        requests.extend(self.stable_trades.iter().map(|instrument_id| {
+            trades_request(
+                SubscriptionAction::Subscribe,
+                resolve_stream_id(*instrument_id),
+            )
+        }));
+        requests.extend(self.stable_books.iter().map(|subscription| {
+            book_request(
+                SubscriptionAction::Subscribe,
+                resolve_stream_id(subscription.instrument_id),
                 subscription.depth,
             )
         }));
@@ -264,6 +397,31 @@ mod tests {
         assert_eq!(registry.restore_requests().len(), 2);
 
         registry.unsubscribe_order_book("sber", 1);
+
+        assert_eq!(registry.restore_requests().len(), 1);
+    }
+
+    #[test]
+    fn replacing_order_books_removes_stale_depths_and_keeps_desired_union() {
+        let mut registry = TbankSubscriptionRegistry::default();
+        registry.subscribe_order_book("sber", 5);
+        registry.replace_order_books("sber", [1, 10]);
+
+        let mut depths = registry
+            .restore_requests()
+            .into_iter()
+            .filter_map(|request| match request.payload {
+                Some(market_data_request::Payload::SubscribeOrderBookRequest(request)) => {
+                    Some(request.instruments[0].depth)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        depths.sort_unstable();
+
+        assert_eq!(depths, vec![1, 10]);
+
+        registry.replace_order_books("sber", [1]);
 
         assert_eq!(registry.restore_requests().len(), 1);
     }

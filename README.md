@@ -293,11 +293,21 @@ acknowledgement is held in a bounded per-stream buffer and drained in order afte
 at startup and after reconnects behind one client-wide request limiter shared by every stream group
 and periodic poller. Recovery never runs in front of a closed stream, never resets reconnect
 backoff, and does not infer missing data from sparse wall-clock minutes. Stream and recovery
-transitions are emitted through structured tracing and typed `TbankMarketDataStreamEvent`s for
-consumer health projection. A panicked stream session is converted into a supervised failure and
-reconnected instead of silently detaching its task. Every Nautilus market-data `Price` uses the
-instrument precision derived from `min_price_increment`; wire-value scale is never treated as
-instrument metadata. Consumers own readiness policy and any durable operational storage.
+transitions are emitted through structured tracing and the ordered typed `TbankMarketDataEvent`
+stream for consumer health projection. The adapter hides reconnect generations and publishes
+stable logical stream/readiness IDs, including explicit retirement events. A panicked stream
+session is converted into a supervised failure and reconnected instead of silently detaching its
+task. Normal worker completion is also supervised;
+an exhausted reconnect burst enters a bounded historical-gap recovery and a delayed half-open
+probe. Historical recovery is single-flight deduplicated across stream groups and periodic polls,
+shares the client-wide limiter, and opens a circuit after repeated failures. A new subscription ACK
+does not publish candle readiness until its watermark gap has been recovered, unless the first
+acknowledged live candle establishes the initial baseline because there is no bounded gap to check.
+Terminal stream health
+is reflected by `is_connected() == false`; consumers own the execution gate, process-stop policy,
+and any durable operational storage. Every Nautilus market-data `Price` uses the instrument
+precision derived from `min_price_increment`; wire-value scale is never treated as instrument
+metadata.
 
 ## Tools
 

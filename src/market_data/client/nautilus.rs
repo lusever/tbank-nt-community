@@ -1,5 +1,19 @@
 use super::*;
 
+impl TbankDataClient {
+    fn sync_nautilus_order_book_registry(&mut self, instrument_id: InstrumentId) {
+        let mut depths = HashSet::new();
+        if self.quote_subscriptions.contains(&instrument_id) {
+            depths.insert(1);
+        }
+        if let Some(depth) = self.depth10_subscriptions.get(&instrument_id) {
+            depths.insert(*depth);
+        }
+        self.subscriptions
+            .replace_order_books_for_instrument(instrument_id, depths);
+    }
+}
+
 #[async_trait(?Send)]
 impl DataClient for TbankDataClient {
     fn client_id(&self) -> ClientId {
@@ -23,9 +37,7 @@ impl DataClient for TbankDataClient {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.disconnect();
-        self.subscriptions = TbankSubscriptionRegistry::default();
-        self.bar_subscriptions.clear();
-        self.quote_subscriptions.clear();
+        self.clear_market_data_subscription_state();
         Ok(())
     }
 
@@ -54,23 +66,20 @@ impl DataClient for TbankDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        let stream_id = self.stream_id(cmd.instrument_id);
-        self.quote_subscriptions
-            .insert(stream_id, cmd.instrument_id);
+        self.quote_subscriptions.insert(cmd.instrument_id);
+        // Nautilus quotes are projected from the exchange order book at depth one, so the restore
+        // snapshot is keyed by the stable instrument identity and resolves its broker route when
+        // the request is rebuilt.
+        self.sync_nautilus_order_book_registry(cmd.instrument_id);
         self.schedule_quote_stream()
     }
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         let stream_id = self.stream_id(cmd.instrument_id);
-        let request = self.subscribe_trades(stream_id.clone());
-        self.spawn_stream(
-            stream_task_key("trades", &stream_id, "all"),
-            Self::server_side_request_from_subscription(request)?,
-            TbankStreamKind::Trades {
-                instrument_id: cmd.instrument_id,
-                instrument_uid: stream_id,
-            },
-        )
+        self.trade_subscriptions.insert(cmd.instrument_id);
+        self.subscriptions
+            .subscribe_trades_for_instrument(cmd.instrument_id, stream_id);
+        self.schedule_trade_stream(cmd.instrument_id)
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
@@ -79,8 +88,10 @@ impl DataClient for TbankDataClient {
             anyhow::bail!("T-Bank data client supports only 1-minute bars in v1");
         }
         let stream_id = self.stream_id(cmd.bar_type.instrument_id());
-        self.subscribe_bars_1m(stream_id.clone());
-        self.bar_subscriptions.insert(stream_id, cmd.bar_type);
+        self.subscriptions
+            .subscribe_bars_1m_for_instrument(cmd.bar_type.instrument_id(), stream_id);
+        self.bar_subscriptions
+            .insert(cmd.bar_type.instrument_id(), cmd.bar_type);
         self.schedule_bar_streams()
     }
 
@@ -91,42 +102,50 @@ impl DataClient for TbankDataClient {
         let depth = cmd.depth.map_or(DEPTH10_LEN as i32, |depth| {
             depth.get().min(DEPTH10_LEN) as i32
         });
-        let stream_id = self.stream_id(cmd.instrument_id);
-        let request = self.subscribe_order_book(stream_id.clone(), depth);
-        self.spawn_stream(
-            stream_task_key("depth10", &stream_id, "book"),
-            Self::server_side_request_from_subscription(request)?,
-            TbankStreamKind::Depth10 {
-                instrument_id: cmd.instrument_id,
-                instrument_uid: stream_id,
-            },
-        )
+        self.depth10_subscriptions.insert(cmd.instrument_id, depth);
+        self.sync_nautilus_order_book_registry(cmd.instrument_id);
+        self.schedule_depth10_stream(cmd.instrument_id, depth)
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        let stream_id = self.stream_id(cmd.instrument_id);
-        self.quote_subscriptions.remove(&stream_id);
+        self.quote_subscriptions.remove(&cmd.instrument_id);
+        self.sync_nautilus_order_book_registry(cmd.instrument_id);
         self.schedule_quote_stream()
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
         let stream_id = self.stream_id(cmd.instrument_id);
-        self.unsubscribe_trades(stream_id.as_str());
-        self.abort_stream(&stream_task_key("trades", &stream_id, "all"));
+        self.trade_subscriptions.remove(&cmd.instrument_id);
+        self.subscriptions
+            .unsubscribe_trades_for_instrument(cmd.instrument_id, stream_id);
+        self.abort_stream(&stream_task_key(
+            "trades",
+            &cmd.instrument_id.to_string(),
+            "all",
+        ));
         Ok(())
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
-        let stream_id = self.stream_id(cmd.bar_type.instrument_id());
-        self.unsubscribe_bars_1m(stream_id.as_str());
-        self.bar_subscriptions.remove(&stream_id);
+        let instrument_id = cmd.bar_type.instrument_id();
+        let stream_id = self.stream_id(instrument_id);
+        self.bar_subscriptions.remove(&cmd.bar_type.instrument_id());
+        self.subscriptions
+            .unsubscribe_bars_1m_for_instrument(instrument_id, stream_id);
         self.schedule_bar_streams()
     }
 
     fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
+        self.depth10_subscriptions.remove(&cmd.instrument_id);
         let stream_id = self.stream_id(cmd.instrument_id);
-        self.unsubscribe_depth_books(stream_id.as_str());
-        self.abort_stream(&stream_task_key("depth10", &stream_id, "book"));
+        self.subscriptions
+            .unsubscribe_depth_books_for_instrument(cmd.instrument_id, stream_id);
+        self.sync_nautilus_order_book_registry(cmd.instrument_id);
+        self.abort_stream(&stream_task_key(
+            "depth10",
+            &cmd.instrument_id.to_string(),
+            "book",
+        ));
         Ok(())
     }
 

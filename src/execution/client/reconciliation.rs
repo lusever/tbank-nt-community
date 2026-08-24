@@ -527,8 +527,19 @@ pub(super) async fn publish_reconnect_reconciliation(
         }
     }
 
+    let mut fills_by_order_id = HashMap::<String, Vec<FillReport>>::new();
+    for report in fill_reports {
+        fills_by_order_id
+            .entry(report.venue_order_id.to_string())
+            .or_default()
+            .push(report);
+    }
+
     let mut counts = TbankReconnectReconciliationCounts::default();
     for report in order_reports {
+        let fills = fills_by_order_id
+            .remove(report.venue_order_id.as_str())
+            .unwrap_or_default();
         if query_client
             .lifecycle_active
             .run_if_active(|| {
@@ -541,8 +552,18 @@ pub(super) async fn publish_reconnect_reconciliation(
                 if let Some(report) =
                     project_order_status_report(&query_client.order_status_projection, report)
                 {
-                    emitter.send_order_status_report(report);
+                    if fills.is_empty() {
+                        emitter.send_order_status_report(report);
+                    } else {
+                        counts.fills += fills.len();
+                        emitter.send_order_with_fills(report, fills);
+                    }
                     counts.orders += 1;
+                } else {
+                    for report in fills {
+                        emitter.send_fill_report(report);
+                        counts.fills += 1;
+                    }
                 }
             })
             .is_none()
@@ -550,12 +571,14 @@ pub(super) async fn publish_reconnect_reconciliation(
             return Ok(counts);
         }
     }
-    for report in fill_reports {
+    for reports in fills_by_order_id.into_values() {
         if query_client
             .lifecycle_active
             .run_if_active(|| {
-                emitter.send_fill_report(report);
-                counts.fills += 1;
+                for report in reports {
+                    emitter.send_fill_report(report);
+                    counts.fills += 1;
+                }
             })
             .is_none()
         {
@@ -663,20 +686,29 @@ pub(super) fn schedule_regular_order_reconciliation(
                     if !context.is_active() {
                         break;
                     }
-                    let reconciled_venue_order_id = reports.order_report.venue_order_id.to_string();
+                    let TbankOrderReconciliationReports {
+                        order_report,
+                        fill_reports,
+                    } = reports;
+                    let reconciled_venue_order_id = order_report.venue_order_id.to_string();
                     context.run_if_active(|| {
                         if let Some(order_report) = project_order_status_report(
                             &context.order_status_projection,
-                            reports.order_report,
+                            order_report,
                         ) {
-                            context.emitter.send_order_status_report(order_report);
+                            if fill_reports.is_empty() {
+                                context.emitter.send_order_status_report(order_report);
+                            } else {
+                                context
+                                    .emitter
+                                    .send_order_with_fills(order_report, fill_reports);
+                            }
+                        } else {
+                            for fill_report in fill_reports {
+                                context.emitter.send_fill_report(fill_report);
+                            }
                         }
                     });
-                    for fill_report in reports.fill_reports {
-                        context.run_if_active(|| {
-                            context.emitter.send_fill_report(fill_report);
-                        });
-                    }
                     let current_order_id = context
                         .broker_order_index
                         .lock()
@@ -908,38 +940,59 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                                 }
                                 Err(error) => tracing::warn!(
                                     %error,
+                                    %venue_order_id,
                                     "failed to publish buffered fill after exchange-order reconciliation"
                                 ),
                             }
                         }
                         None => tracing::debug!(
+                            %venue_order_id,
                             attempt,
                             "T-Bank order is not yet visible as an activated stop child"
                         ),
                         Some(Err(error)) if reconnect_reconciliation_error_is_transient(&error) => {
-                            tracing::warn!(%error, attempt, "transient T-Bank exchange-order mapping failure");
+                            tracing::warn!(
+                                %error,
+                                %venue_order_id,
+                                attempt,
+                                "transient T-Bank exchange-order mapping failure"
+                            );
                         }
                         Some(Err(error)) => {
-                            tracing::error!(%error, "T-Bank exchange-order mapping failed; retaining buffered fills for durable retry");
+                            tracing::error!(
+                                %error,
+                                %venue_order_id,
+                                "T-Bank exchange-order mapping failed; retaining buffered fills for durable retry"
+                            );
                             permanently_unresolvable = true;
                         }
                     }
                 }
                 Err(error) if tbank_adapter_error_is_transient(&error) => {
-                    tracing::warn!(%error, attempt, "transient unresolved T-Bank trade lookup failure");
+                    tracing::warn!(
+                        %error,
+                        %venue_order_id,
+                        attempt,
+                        "transient unresolved T-Bank trade lookup failure"
+                    );
                 }
                 Err(TbankAdapterError::GrpcStatus {
                     code: tonic::Code::NotFound,
                     ..
                 }) => {}
                 Err(error) => {
-                    tracing::error!(%error, "unresolved T-Bank trade lookup failed; retaining buffered fills for durable retry");
+                    tracing::error!(
+                        %error,
+                        %venue_order_id,
+                        "unresolved T-Bank trade lookup failed; retaining buffered fills for durable retry"
+                    );
                     permanently_unresolvable = true;
                 }
             }
             attempt = attempt.saturating_add(1);
             if permanently_unresolvable || attempt >= SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
                 tracing::error!(
+                    %venue_order_id,
                     attempts = attempt,
                     "publishing unresolved T-Bank fill with external regular-order identity after lookup exhaustion"
                 );
@@ -957,6 +1010,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                     Err(error) if reconnect_reconciliation_error_is_transient(&error) => {
                         tracing::warn!(
                             %error,
+                            %venue_order_id,
                             "could not exclude activated-stop route before unresolved fill fallback"
                         );
                         tokio::time::sleep(crate::grpc::retry::backoff_duration(
@@ -969,6 +1023,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                     Err(error) => {
                         tracing::error!(
                             %error,
+                            %venue_order_id,
                             "permanent StopOrders lookup failure; publishing buffered fill with external regular-order identity"
                         );
                         false
@@ -998,6 +1053,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                             }
                             Err(error) => tracing::warn!(
                                 %error,
+                                %venue_order_id,
                                 "could not build regular-order status report during unresolved fill fallback"
                             ),
                         }
@@ -1048,6 +1104,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                     }
                     Err(error) => tracing::error!(
                         %error,
+                        %venue_order_id,
                         "failed to publish unresolved T-Bank fill fallback"
                     ),
                 }
@@ -1148,6 +1205,8 @@ pub(super) fn schedule_activated_stop_child_reconciliation(
                         ) {
                             tracing::warn!(
                                 %error,
+                                %stop_order_id,
+                                client_order_id = client_order_id.as_deref().unwrap_or(""),
                                 "failed to publish buffered activated-stop fill"
                             );
                         }
@@ -1158,12 +1217,16 @@ pub(super) fn schedule_activated_stop_child_reconciliation(
                 Err(error) if !reconnect_reconciliation_error_is_transient(&error) => {
                     tracing::error!(
                         %error,
+                        %stop_order_id,
+                        client_order_id = client_order_id.as_deref().unwrap_or(""),
                         "activated T-Bank stop child reconciliation failed permanently"
                     );
                     break;
                 }
                 Err(error) => tracing::warn!(
                     %error,
+                    %stop_order_id,
+                    client_order_id = client_order_id.as_deref().unwrap_or(""),
                     attempt,
                     "activated T-Bank stop child reconciliation failed transiently"
                 ),
@@ -1171,6 +1234,8 @@ pub(super) fn schedule_activated_stop_child_reconciliation(
             attempt = attempt.saturating_add(1);
             if attempt >= SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
                 tracing::error!(
+                    %stop_order_id,
+                    client_order_id = client_order_id.as_deref().unwrap_or(""),
                     attempts = attempt,
                     "activated T-Bank stop child reconciliation retry budget exhausted"
                 );

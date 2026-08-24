@@ -1,8 +1,9 @@
 use super::submit::synthetic_fill_trade_id;
 use super::{
     CANCEL_OUTCOME_RECOVERY_ATTEMPTS, CancelFailureKind, MAX_UNRESOLVED_TRADE_FILLS_PER_ORDER,
-    TBANK_CONFIRM_MARGIN_TRADE_PARAM, TbankFillProjection, activated_stop_child_status_report,
-    buffer_unresolved_trade_fill, canonicalize_reconciled_stop_fill, classify_cancel_failure,
+    TBANK_CONFIRM_MARGIN_TRADE_PARAM, TbankFillProjection,
+    activated_stop_child_status_report_with_context, buffer_unresolved_trade_fill,
+    canonicalize_reconciled_stop_fill, classify_cancel_failure,
     current_utc_day_bounds, order_filter_windows, project_and_settle_reconciled_trade_fill,
     project_managed_trade_fill_report, project_trade_fill_report, tbank_account_id,
 };
@@ -271,6 +272,29 @@ fn activate_test_lifecycle(client: &TbankExecutionClient) {
         .store(true, std::sync::atomic::Ordering::Release);
 }
 
+fn order_stream_context(
+    client: &TbankExecutionClient,
+    event_tx: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+    lifecycle_active: Arc<super::TbankLifecycleToken>,
+) -> super::TbankOrderStreamContext {
+    super::TbankOrderStreamContext {
+        emitter: test_emitter(event_tx),
+        query_client: client.runtime.detached_query_clone(),
+        lifecycle_active,
+        pending_submits: client.runtime.pending_submits.clone(),
+        unresolved_trade_fills: client.runtime.unresolved_trade_fills.clone(),
+        unresolved_cancellations: client.runtime.unresolved_cancellations.clone(),
+        broker_order_index: client.runtime.broker_order_index.clone(),
+        fill_projection: client.runtime.fill_projection.clone(),
+        order_status_projection: client.runtime.order_status_projection.clone(),
+        instruments: client.runtime.instruments.clone(),
+        reconnect_policy: client.runtime.config.reconnect_policy.clone(),
+        activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
+        regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
+        reconciliation_tasks: client.runtime.reconciliation_tasks.clone(),
+    }
+}
+
 struct TaskDropSignal(Option<std::sync::mpsc::Sender<()>>);
 
 impl Drop for TaskDropSignal {
@@ -423,6 +447,189 @@ fn stale_stream_generation_cannot_publish_after_new_generation_activates() {
     );
 
     assert!(new_generation.load(Ordering::Acquire));
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[test]
+fn inactive_order_state_does_not_commit_fill_projection() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let lifecycle_active = Arc::new(super::TbankLifecycleToken::new(false));
+    let context = order_stream_context(&client, event_tx, lifecycle_active);
+    let ts = current_unix_nanos();
+    let report = OrderStatusReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        Some("client-order-1".into()),
+        "venue-order-1".into(),
+        OrderSide::Buy,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(10),
+        Quantity::from(10),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    )
+    .with_avg_px(Decimal::from(100));
+    let fill = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "venue-order-1".into(),
+        "trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("100"),
+        Money::from_decimal(Decimal::ZERO, Currency::from("RUB")).unwrap(),
+        LiquiditySide::NoLiquiditySide,
+        Some("client-order-1".into()),
+        None,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    );
+
+    assert!(super::publish_order_state_report_with_fills(&context, report, vec![fill]).is_none());
+    assert!(context.fill_projection.lock().unwrap().orders.is_empty());
+    assert!(context
+        .order_status_projection
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[test]
+fn partial_order_state_trades_use_cumulative_fill_without_mixing_prices() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let context = order_stream_context(
+        &client,
+        event_tx,
+        Arc::new(super::TbankLifecycleToken::new(true)),
+    );
+    let ts = current_unix_nanos();
+    let report = OrderStatusReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        Some("client-order-1".into()),
+        "venue-order-1".into(),
+        OrderSide::Buy,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(10),
+        Quantity::from(10),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    )
+    .with_avg_px(Decimal::from(105));
+    let raw_fill = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "venue-order-1".into(),
+        "trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(5),
+        Price::from("100"),
+        Money::from_decimal(Decimal::ZERO, Currency::from("RUB")).unwrap(),
+        LiquiditySide::NoLiquiditySide,
+        Some("client-order-1".into()),
+        None,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    );
+
+    assert!(matches!(
+        super::publish_order_state_report_with_fills(&context, report, vec![raw_fill]),
+        Some(Ok(()))
+    ));
+    let ExecutionEvent::Report(ExecutionReport::OrderWithFills(order, fills)) =
+        event_rx.try_recv().unwrap()
+    else {
+        panic!("expected bundled order status and cumulative fill");
+    };
+    assert_eq!(order.filled_qty.as_decimal(), Decimal::from(10));
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].last_qty.as_decimal(), Decimal::from(10));
+    assert_eq!(fills[0].last_px.as_decimal(), Decimal::from(105));
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[test]
+fn valid_order_state_trade_survives_status_mapping_error() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    seed_sber_metadata(&mut client);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let context = order_stream_context(
+        &client,
+        event_tx,
+        Arc::new(super::TbankLifecycleToken::new(true)),
+    );
+    let state = order_state_stream_response::OrderState {
+        order_request_id: Some("client-order-1".to_string()),
+        order_id: "venue-order-1".to_string(),
+        trade_order_id: "trade-order-1".to_string(),
+        account_id: "account-1".to_string(),
+        ticker: "SBER".to_string(),
+        class_code: "TQBR".to_string(),
+        instrument_uid: "sber-uid".to_string(),
+        lot_size: 1,
+        direction: OrderDirection::Buy as i32,
+        order_type: crate::grpc::generated::OrderType::Market as i32,
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusPartiallyfill
+            as i32,
+        lots_requested: 10,
+        lots_executed: 1,
+        completion_time: Some(prost_types::Timestamp {
+            seconds: -1,
+            nanos: 0,
+        }),
+        trades: vec![OrderTrade {
+            price: Some(Quotation { units: 100, nano: 0 }),
+            quantity: 5,
+            trade_id: "trade-1".to_string(),
+            ..OrderTrade::default()
+        }],
+        ..order_state_stream_response::OrderState::default()
+    };
+    let ts = current_unix_nanos();
+    let raw_fill = super::fill_reports_from_order_state_stream(
+        &state,
+        "venue-order-1",
+        None,
+        ts,
+        &context.instruments,
+    )
+    .into_iter()
+    .next()
+    .unwrap()
+    .unwrap();
+    let status_error = super::stream_order_status_report_from_state_with_instruments(
+        state,
+        "venue-order-1",
+        ts,
+        Some("client-order-1"),
+        None,
+        Some(&context.instruments),
+    )
+    .unwrap_err();
+    assert!(status_error.to_string().contains("timestamp"));
+
+    assert!(matches!(
+        super::publish_order_state_report_or_fills(&context, None, vec![raw_fill]),
+        Some(Ok(()))
+    ));
+    let ExecutionEvent::Report(ExecutionReport::Fill(fill)) = event_rx.try_recv().unwrap() else {
+        panic!("expected the valid trade fill to be published");
+    };
+    assert_eq!(fill.last_qty.as_decimal(), Decimal::from(5));
+    assert_eq!(fill.last_px.as_decimal(), Decimal::from(100));
     assert!(event_rx.try_recv().is_err());
 }
 
@@ -2199,13 +2406,15 @@ fn activated_stop_child_report_keeps_stop_identity_and_uses_child_state() {
         ..OrderState::default()
     };
 
-    let report = activated_stop_child_status_report(
+    let report = activated_stop_child_status_report_with_context(
         "TBANK-001".into(),
         &stop,
         &state,
         current_unix_nanos(),
         10,
         Some(client_order_id),
+        None,
+        None,
     )
     .unwrap();
 

@@ -4,8 +4,7 @@ use nautilus_core::UnixNanos;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-const STREAM_EVENT_CAPACITY: usize = 2_048;
-const READINESS_EVENT_CAPACITY: usize = 8_192;
+const MARKET_DATA_EVENT_CAPACITY: usize = 10_240;
 
 /// Operational lifecycle state of one T-Bank market-data stream group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,11 +12,11 @@ const READINESS_EVENT_CAPACITY: usize = 8_192;
 pub enum TbankMarketDataStreamState {
     /// The stream controller has started and is opening the subscription.
     Connecting,
-    /// The broker acknowledged the subscription and the stream is usable.
+    /// The broker acknowledged the subscription and required continuity recovery completed.
     Connected,
-    /// The controller is recovering from a retryable stream failure.
+    /// The controller is recovering from a stream interruption or validating continuity after subscription.
     Reconnecting,
-    /// The controller exhausted retries or encountered a permanent rejection.
+    /// The controller reached a terminal failure and will not recover.
     Dead,
 }
 
@@ -25,45 +24,78 @@ impl TbankMarketDataStreamState {
     pub(crate) fn from_stage(stage: &str) -> Option<Self> {
         match stage {
             "stream_supervisor_started" => Some(Self::Connecting),
+            "stream_subscription_acked" => Some(Self::Reconnecting),
             "stream_ready" => Some(Self::Connected),
             "stream_task_panicked"
             | "stream_closed_by_server"
             | "stream_closed_error"
             | "stream_idle_timeout"
             | "open_failed"
+            | "stream_recovery_failed"
+            | "stream_worker_normal_exit"
             | "pre_ack_buffer_overflow"
             | "reconnect_scheduled"
             | "stream_supervisor_reconnect_failed"
-            | "subscription_rejection_partitioned" => Some(Self::Reconnecting),
-            "stream_supervisor_exhausted"
+            | "subscription_rejection_partitioned"
+            | "stream_subscriptions_stopped"
             | "stream_reconnect_exhausted"
-            | "subscription_permanently_rejected" => Some(Self::Dead),
+            | "stream_supervisor_reconnect_exhausted" => Some(Self::Reconnecting),
+            "stream_supervisor_exhausted"
+            | "subscription_permanently_rejected"
+            | "stream_subscriptions_disabled" => Some(Self::Dead),
             _ => None,
         }
     }
 }
 
-/// A typed market-data transport transition emitted by the T-Bank adapter.
+/// A typed market-data lifecycle event emitted by the T-Bank adapter.
 ///
-/// Consumers can project these events into operational health without parsing tracing text. The
-/// tracing record remains the durable operator-facing representation.
+/// Generation ownership, task cancellation, and stale-worker fencing stay inside the adapter.
+/// Consumers receive stable logical IDs and never need to parse adapter task keys or lifecycle
+/// stage strings.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TbankMarketDataStreamEvent {
-    /// Typed lifecycle state for this transition.
-    pub state: TbankMarketDataStreamState,
-    /// Stable lifecycle stage identifier.
-    pub stage: String,
-    /// Stable adapter task key for the stream group.
-    pub task_key: String,
-    /// Human-readable transition reason.
-    pub reason: String,
+pub enum TbankMarketDataEvent {
+    /// The current logical stream changed state.
+    StreamState {
+        /// Stable logical stream identity, independent of reconnect generation.
+        stream_id: String,
+        /// Current operational state of the logical stream.
+        state: TbankMarketDataStreamState,
+        /// Stable readiness identities currently owned by this stream.
+        readiness_ids: Vec<String>,
+        /// Human-readable explanation for the state transition.
+        reason: String,
+    },
+    /// The logical stream is no longer part of the desired subscription snapshot.
+    StreamRetired {
+        /// Stable logical stream identity, independent of reconnect generation.
+        stream_id: String,
+        /// Stable readiness identities retired together with this stream.
+        readiness_ids: Vec<String>,
+        /// Human-readable explanation for the retirement.
+        reason: String,
+    },
+    /// The current logical candle source changed readiness state.
+    CandleReadiness {
+        /// Stable logical readiness identity, independent of reconnect generation.
+        readiness_id: String,
+        /// Broker instrument UID associated with the readiness source.
+        instrument_uid: String,
+        /// Current readiness state of the candle source.
+        state: TbankCandleReadinessState,
+        /// Latest closed-minute boundary authoritatively accepted for this source, when ready.
+        ready_through: Option<UnixNanos>,
+        /// Human-readable explanation for the readiness transition.
+        reason: String,
+    },
 }
 
-/// Candle-source readiness established by lifecycle recovery or an explicit poll.
+/// Candle-source readiness established by lifecycle recovery, an acknowledged initial live
+/// candle, or an explicit poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TbankCandleReadinessState {
-    /// Previously established readiness is no longer authoritative.
+    /// Previously established readiness is no longer authoritative while the current source recovers.
     Recovering,
     /// The broker was checked successfully through the supplied closed minute.
     Ready,
@@ -71,54 +103,18 @@ pub enum TbankCandleReadinessState {
     Failed,
 }
 
-/// Per-instrument candle readiness event emitted independently of bar arrival.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TbankCandleReadinessEvent {
-    /// Readiness transition.
-    pub state: TbankCandleReadinessState,
-    /// Stable instrument-scoped continuity key.
-    pub task_key: String,
-    /// Broker instrument UID.
-    pub instrument_uid: String,
-    /// Latest closed minute authoritatively checked with the broker.
-    pub ready_through: Option<UnixNanos>,
-    /// Human-readable transition reason.
-    pub reason: String,
+static MARKET_DATA_EVENTS: OnceLock<broadcast::Sender<TbankMarketDataEvent>> = OnceLock::new();
+
+fn market_data_event_sender() -> &'static broadcast::Sender<TbankMarketDataEvent> {
+    MARKET_DATA_EVENTS.get_or_init(|| broadcast::channel(MARKET_DATA_EVENT_CAPACITY).0)
 }
 
-static STREAM_EVENTS: OnceLock<broadcast::Sender<TbankMarketDataStreamEvent>> = OnceLock::new();
-static READINESS_EVENTS: OnceLock<broadcast::Sender<TbankCandleReadinessEvent>> = OnceLock::new();
-
-fn stream_event_sender() -> &'static broadcast::Sender<TbankMarketDataStreamEvent> {
-    STREAM_EVENTS.get_or_init(|| {
-        let (sender, _) = broadcast::channel(STREAM_EVENT_CAPACITY);
-        sender
-    })
-}
-
-/// Subscribes to typed T-Bank market-data stream lifecycle events for this process.
+/// Subscribes to the ordered typed T-Bank market-data lifecycle stream for this process.
 #[must_use]
-pub fn subscribe_market_data_stream_events() -> broadcast::Receiver<TbankMarketDataStreamEvent> {
-    stream_event_sender().subscribe()
+pub fn subscribe_market_data_events() -> broadcast::Receiver<TbankMarketDataEvent> {
+    market_data_event_sender().subscribe()
 }
 
-pub(crate) fn publish_market_data_stream_event(event: TbankMarketDataStreamEvent) {
-    let _ = stream_event_sender().send(event);
-}
-
-fn readiness_event_sender() -> &'static broadcast::Sender<TbankCandleReadinessEvent> {
-    READINESS_EVENTS.get_or_init(|| {
-        let (sender, _) = broadcast::channel(READINESS_EVENT_CAPACITY);
-        sender
-    })
-}
-
-/// Subscribes to per-instrument candle readiness events for this process.
-#[must_use]
-pub fn subscribe_candle_readiness_events() -> broadcast::Receiver<TbankCandleReadinessEvent> {
-    readiness_event_sender().subscribe()
-}
-
-pub(crate) fn publish_candle_readiness_event(event: TbankCandleReadinessEvent) {
-    let _ = readiness_event_sender().send(event);
+pub(crate) fn publish_market_data_event(event: TbankMarketDataEvent) {
+    let _ = market_data_event_sender().send(event);
 }

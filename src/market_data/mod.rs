@@ -22,9 +22,8 @@ pub use book::{SyntheticBookDelta, TbankBookSide, TbankOrderBookLevel, TbankOrde
 pub use client::TbankDataClient;
 pub use converters::{candle_to_bar, last_price_to_quote, orderbook_to_snapshot, trade_to_tick};
 pub use events::{
-    TbankCandleReadinessEvent, TbankCandleReadinessState, TbankMarketDataStreamEvent,
-    TbankMarketDataStreamState, subscribe_candle_readiness_events,
-    subscribe_market_data_stream_events,
+    TbankCandleReadinessState, TbankMarketDataEvent, TbankMarketDataStreamState,
+    subscribe_market_data_events,
 };
 pub use subscriptions::TbankSubscriptionRegistry;
 pub use trades::{TbankQuoteTick, TbankTradeTick};

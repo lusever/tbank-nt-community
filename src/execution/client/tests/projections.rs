@@ -102,12 +102,26 @@ fn order_status_projection_blocks_triggered_to_accepted_regression() {
     let ts_init = current_unix_nanos();
     let mut accepted_stop = active_sber_stop_order("stop-order-1");
     accepted_stop.status = StopOrderStatusOption::StopOrderStatusActive as i32;
-    let accepted =
-        super::stop_order_status_report("TBANK-001".into(), accepted_stop, ts_init, 10).unwrap();
+    let accepted = super::stop_order_status_report_with_context(
+        "TBANK-001".into(),
+        accepted_stop,
+        ts_init,
+        10,
+        None,
+        None,
+    )
+    .unwrap();
     let mut triggered_stop = active_sber_stop_order("stop-order-1");
     triggered_stop.status = StopOrderStatusOption::StopOrderStatusExecuted as i32;
-    let triggered =
-        super::stop_order_status_report("TBANK-001".into(), triggered_stop, ts_init, 10).unwrap();
+    let triggered = super::stop_order_status_report_with_context(
+        "TBANK-001".into(),
+        triggered_stop,
+        ts_init,
+        10,
+        None,
+        None,
+    )
+    .unwrap();
 
     assert!(project_order_status_report(&projection, accepted.clone()).is_some());
     assert!(project_order_status_report(&projection, triggered).is_some());

@@ -7,7 +7,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
@@ -26,23 +26,24 @@ use crate::{
             GetLastPricesResponse, GetOrderBookRequest, GetOrderBookResponse, LastPriceType,
             MarketDataRequest, MarketDataResponse, MarketDataServerSideStreamRequest, OrderBook,
             OrderBookInstrument, OrderBookType, SubscribeCandlesRequest, SubscribeOrderBookRequest,
-            SubscriptionAction, SubscriptionInterval, SubscriptionStatus, Trade,
-            get_candles_request, market_data_request, market_data_response,
+            SubscribeTradesRequest, SubscriptionAction, SubscriptionInterval, SubscriptionStatus,
+            Trade, TradeInstrument, TradeSourceType, get_candles_request, market_data_request,
+            market_data_response,
         },
         with_timeout,
     },
     instruments::{TbankInstrumentMetadata, TbankInstrumentProvider},
     market_data::{
-        MarketDataInstrumentMetadata, TbankBar, TbankCandleReadinessEvent,
-        TbankCandleReadinessState, TbankMarketDataStreamEvent, TbankMarketDataStreamState,
-        TbankOrderBookSnapshot, TbankQuoteTick, TbankSubscriptionRegistry,
+        MarketDataInstrumentMetadata, TbankBar, TbankCandleReadinessState, TbankMarketDataEvent,
+        TbankMarketDataStreamState, TbankOrderBookSnapshot, TbankQuoteTick,
+        TbankSubscriptionRegistry,
         candles::{ONE_MINUTE_NANOS, one_minute_candle_query_chunks},
         continuity::{BarContinuityDecision, BarContinuityTracker},
         converters::{candle_to_bar, last_price_to_quote, orderbook_to_snapshot, trade_to_tick},
-        events::{publish_candle_readiness_event, publish_market_data_stream_event},
+        events::publish_market_data_event,
         supervisor::{
-            BackfillCoordinator, HistoricalRequestLimiter, MarketDataClient,
-            retryable_stream_error_text, retryable_stream_status,
+            BackfillCoordinator, HistoricalRequestLimiter, MarketDataClient, RecoveryPublication,
+            RecoveryRangeResult, retryable_stream_status,
         },
     },
 };
@@ -84,11 +85,361 @@ type MarketDataStreamClient =
         tonic::codegen::InterceptedService<tonic::transport::Channel, TbankAuthInterceptor>,
     >;
 
-const RECONNECT_CATCH_UP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_QUOTES_PER_STREAM: usize = 300;
 const MAX_PRE_ACK_MESSAGES: usize = 2_048;
-
 type SharedInstrumentMetadata = Arc<RwLock<HashMap<String, MarketDataInstrumentMetadata>>>;
+type SharedInstrumentStreamIds = Arc<RwLock<HashMap<String, String>>>;
+/// The continuity cursor belongs to the stable Nautilus subscription, not to a broker route.
+/// Broker instrument UIDs can change after catalogue refresh while `BarType` retains the
+/// InstrumentId that owns the subscription.
+type SharedBarWatermarks = Arc<std::sync::Mutex<HashMap<BarType, i128>>>;
+
+fn snapshot_bar_watermarks(watermarks: &SharedBarWatermarks) -> HashMap<BarType, i128> {
+    watermarks
+        .lock()
+        .expect("market-data watermark lock")
+        .clone()
+}
+
+fn record_bar_watermark(
+    watermarks: &SharedBarWatermarks,
+    bar_type: BarType,
+    ts_event: i128,
+) -> bool {
+    let mut watermarks = watermarks.lock().expect("market-data watermark lock");
+    let had_baseline = watermarks.contains_key(&bar_type);
+    if watermarks
+        .get(&bar_type)
+        .is_none_or(|latest| ts_event > *latest)
+    {
+        watermarks.insert(bar_type, ts_event);
+    }
+    !had_baseline
+}
+
+fn has_bar_watermark(watermarks: &SharedBarWatermarks, bar_type: BarType) -> bool {
+    watermarks
+        .lock()
+        .expect("market-data watermark lock")
+        .contains_key(&bar_type)
+}
+
+fn commit_live_bar(
+    bar_watermarks: &SharedBarWatermarks,
+    continuity: &mut HashMap<String, BarContinuityTracker>,
+    instrument_uid: &str,
+    bar_type: BarType,
+    ts_event: i128,
+) {
+    continuity
+        .entry(instrument_uid.to_string())
+        .or_default()
+        .record_live_bar(ts_event);
+    record_bar_watermark(bar_watermarks, bar_type, ts_event);
+}
+
+#[derive(Debug, Default)]
+struct MarketDataStreamHealthState {
+    /// Every task/readiness key owned by the current subscription snapshot.
+    current_task_keys: HashSet<String>,
+    /// Keys whose lifecycle contributes to client operational health.
+    expected_groups: HashSet<String>,
+    non_operational_groups: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct MarketDataStreamHealth {
+    state: std::sync::Mutex<MarketDataStreamHealthState>,
+}
+
+impl MarketDataStreamHealth {
+    fn register(&self, task_key: &str) {
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        Self::register_task_key(&mut state, task_key);
+    }
+
+    fn register_task_key(state: &mut MarketDataStreamHealthState, task_key: &str) {
+        state.current_task_keys.insert(task_key.to_string());
+        state.expected_groups.insert(task_key.to_string());
+        state.non_operational_groups.insert(task_key.to_string());
+    }
+
+    fn register_current(&self, task_key: &str) {
+        self.state
+            .lock()
+            .expect("market-data lifecycle lock")
+            .current_task_keys
+            .insert(task_key.to_string());
+    }
+
+    fn mark_reconnecting(&self, task_key: &str) {
+        self.mark_non_operational(task_key);
+    }
+
+    fn mark_terminal(&self, task_key: &str) {
+        self.mark_non_operational(task_key);
+    }
+
+    fn mark_non_operational(&self, task_key: &str) {
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        if !state.expected_groups.contains(task_key) {
+            return;
+        }
+        state.non_operational_groups.insert(task_key.to_string());
+    }
+
+    fn mark_operational(&self, task_key: &str) {
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        if !state.expected_groups.contains(task_key) {
+            return;
+        }
+        state.non_operational_groups.remove(task_key);
+    }
+
+    fn retire_task_key(&self, task_key: &str, reason: &str) {
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        Self::retire_task_key_locked(&mut state, task_key, None, reason);
+    }
+
+    fn retire_task_key_locked(
+        state: &mut MarketDataStreamHealthState,
+        task_key: &str,
+        stage: Option<&str>,
+        reason: &str,
+    ) -> bool {
+        if !state.expected_groups.contains(task_key) {
+            return false;
+        }
+
+        let readiness_ids = Self::readiness_ids_for_task_key_locked(state, task_key);
+        if let Some(stage) = stage {
+            trace_market_data_stream_event(
+                MarketDataStreamEventInput {
+                    stage,
+                    task_key,
+                    stream_kind: stream_kind_from_task_key(task_key),
+                    instrument_count: 0,
+                    status: None,
+                    reason: reason.to_string(),
+                    delay_ms: None,
+                    attempt: 0,
+                },
+                readiness_ids.clone(),
+            );
+        }
+        trace_market_data_stream_event(
+            MarketDataStreamEventInput {
+                stage: "stream_snapshot_replaced",
+                task_key,
+                stream_kind: stream_kind_from_task_key(task_key),
+                instrument_count: 0,
+                status: None,
+                reason: reason.to_string(),
+                delay_ms: None,
+                attempt: 0,
+            },
+            readiness_ids,
+        );
+        state.current_task_keys.remove(task_key);
+        state.expected_groups.remove(task_key);
+        state.non_operational_groups.remove(task_key);
+        true
+    }
+
+    fn retire_prefix(&self, prefix: &str, stage: Option<&str>, reason: &str) {
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        let task_keys = state
+            .expected_groups
+            .iter()
+            .filter(|task_key| task_key.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for task_key in task_keys {
+            Self::retire_task_key_locked(&mut state, &task_key, stage, reason);
+        }
+        state
+            .current_task_keys
+            .retain(|task_key| !task_key.starts_with(prefix));
+    }
+
+    fn replace_expected<'a>(&self, prefix: &str, task_keys: impl IntoIterator<Item = &'a str>) {
+        let task_keys = task_keys
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        let old_task_keys = state
+            .expected_groups
+            .iter()
+            .filter(|task_key| task_key.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for old_task_key in old_task_keys {
+            Self::retire_task_key_locked(
+                &mut state,
+                &old_task_key,
+                None,
+                "stream subscription snapshot was replaced",
+            );
+        }
+        state
+            .current_task_keys
+            .retain(|task_key| !task_key.starts_with(prefix));
+        for task_key in task_keys {
+            Self::register_task_key(&mut state, &task_key);
+        }
+    }
+
+    #[cfg(test)]
+    fn advance_bar_generation(&self, generation: u64) {
+        self.advance_bar_generation_with_stage(
+            generation,
+            None,
+            "bar stream snapshot was replaced",
+        );
+    }
+
+    fn advance_bar_generation_with_stage(
+        &self,
+        generation: u64,
+        stage: Option<&str>,
+        reason: &str,
+    ) {
+        let reason = format!("{reason} (bar generation {generation})");
+        self.retire_prefix("bars:", stage, &reason);
+    }
+
+    fn retire_all(&self, stage: &str, reason: &str) {
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        let task_keys = state.expected_groups.iter().cloned().collect::<Vec<_>>();
+        for task_key in task_keys {
+            Self::retire_task_key_locked(&mut state, &task_key, Some(stage), reason);
+        }
+        state.current_task_keys.clear();
+        state.expected_groups.clear();
+        state.non_operational_groups.clear();
+    }
+
+    /// Registers and starts an isolated child while holding the same lifecycle lock that checks
+    /// the parent lease. Snapshot replacement therefore cannot remove the parent between the
+    /// ownership check, child registration, and `spawn`.
+    fn spawn_child_if_current<F>(
+        &self,
+        parent_task_key: &str,
+        child_task_key: &str,
+        spawn: F,
+    ) -> Option<JoinHandle<()>>
+    where
+        F: FnOnce() -> JoinHandle<()>,
+    {
+        let mut state = self.state.lock().expect("market-data lifecycle lock");
+        if !task_key_is_current(&state, parent_task_key) {
+            return None;
+        }
+        Self::register_task_key(&mut state, child_task_key);
+        if !task_key_is_current(&state, parent_task_key) {
+            state.current_task_keys.remove(child_task_key);
+            state.expected_groups.remove(child_task_key);
+            state.non_operational_groups.remove(child_task_key);
+            return None;
+        }
+        Some(spawn())
+    }
+
+    #[cfg(test)]
+    fn expected_task_keys(&self) -> Vec<String> {
+        let state = self.state.lock().expect("market-data lifecycle lock");
+        let mut task_keys = state.expected_groups.iter().cloned().collect::<Vec<_>>();
+        task_keys.sort();
+        task_keys
+    }
+
+    fn is_current_task_key(&self, task_key: &str) -> bool {
+        let state = self.state.lock().expect("market-data lifecycle lock");
+        task_key_is_current(&state, task_key)
+    }
+
+    fn with_current_task_key(&self, task_key: &str, operation: impl FnOnce()) -> bool {
+        let state = self.state.lock().expect("market-data lifecycle lock");
+        if task_key_is_current(&state, task_key) {
+            operation();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn with_current_task_key_and_readiness(
+        &self,
+        task_key: &str,
+        operation: impl FnOnce(Vec<String>),
+    ) -> bool {
+        let state = self.state.lock().expect("market-data lifecycle lock");
+        if !task_key_is_current(&state, task_key) {
+            return false;
+        }
+        operation(Self::readiness_ids_for_task_key_locked(&state, task_key));
+        true
+    }
+
+    fn readiness_ids_for_task_key_locked(
+        state: &MarketDataStreamHealthState,
+        task_key: &str,
+    ) -> Vec<String> {
+        let prefix = format!("{task_key}:instrument:");
+        let mut readiness_ids = state
+            .current_task_keys
+            .iter()
+            .filter(|key| key.starts_with(&prefix))
+            .map(|key| logical_readiness_id(key))
+            .collect::<Vec<_>>();
+        if task_key.contains(":poll:") {
+            readiness_ids.push(logical_readiness_id(task_key));
+        }
+        readiness_ids.sort();
+        readiness_ids.dedup();
+        readiness_ids
+    }
+
+    /// Runs publication and its cursor commit while holding the lifecycle ownership lock.
+    ///
+    /// A snapshot replacement must not be able to observe a published event before its
+    /// continuity cursor is committed. The commit is therefore invoked only after publication
+    /// succeeds and before the current task key can be replaced.
+    fn with_current_task_key_after_publish<P, C>(
+        &self,
+        task_key: &str,
+        publish: P,
+        commit: C,
+    ) -> anyhow::Result<bool>
+    where
+        P: FnOnce() -> anyhow::Result<()>,
+        C: FnOnce(),
+    {
+        let mut publication_error = None;
+        let published = self.with_current_task_key(task_key, || match publish() {
+            Ok(()) => commit(),
+            Err(error) => publication_error = Some(error),
+        });
+        if let Some(error) = publication_error {
+            Err(error)
+        } else {
+            Ok(published)
+        }
+    }
+
+    fn is_operational(&self) -> bool {
+        self.state
+            .lock()
+            .expect("market-data lifecycle lock")
+            .non_operational_groups
+            .is_empty()
+    }
+}
+
+fn task_key_is_current(state: &MarketDataStreamHealthState, task_key: &str) -> bool {
+    state.current_task_keys.contains(task_key)
+}
 
 fn instrument_metadata_snapshot(
     metadata: &SharedInstrumentMetadata,
@@ -96,39 +447,78 @@ fn instrument_metadata_snapshot(
     metadata.read().expect("market-data metadata lock").clone()
 }
 
+fn merge_resolved_instrument_stream_ids(
+    stream_ids: &SharedInstrumentStreamIds,
+    refreshed_stream_ids: HashMap<String, String>,
+) {
+    stream_ids
+        .write()
+        .expect("market-data stream IDs lock")
+        .extend(refreshed_stream_ids);
+}
+
+#[cfg(test)]
 fn bar_watermarks_for_subscriptions(
     subscriptions: &[(String, BarType)],
     cached: &HashMap<BarType, i128>,
-) -> HashMap<String, i128> {
-    // `subscribe_bars` accepts only 1-minute bars and `bar_subscriptions` is keyed by stream ID,
-    // so each stream has exactly one active BarType. The full BarType is retained until this
-    // selection to prevent unrelated cached intervals from replacing its recovery watermark.
+) -> HashMap<BarType, i128> {
     subscriptions
         .iter()
-        .filter_map(|(stream_id, bar_type)| {
+        .filter_map(|(_, bar_type)| {
             cached
                 .get(bar_type)
                 .copied()
-                .map(|watermark| (stream_id.clone(), watermark))
+                .map(|watermark| (*bar_type, watermark))
         })
         .collect()
 }
 
+fn bar_watermarks_for_streams(
+    subscriptions: &[(String, BarType)],
+    watermarks: &HashMap<BarType, i128>,
+) -> HashMap<BarType, i128> {
+    subscriptions
+        .iter()
+        .filter_map(|(_, bar_type)| {
+            watermarks
+                .get(bar_type)
+                .copied()
+                .map(|watermark| (*bar_type, watermark))
+        })
+        .collect()
+}
+
+fn partition_bar_stream_subscriptions(
+    subscriptions: Vec<(String, BarType)>,
+    periodic_instrument_ids: &HashSet<String>,
+) -> (Vec<(String, BarType)>, Vec<(String, BarType)>) {
+    subscriptions
+        .into_iter()
+        .partition(|(stream_id, _)| periodic_instrument_ids.contains(stream_id))
+}
+
+fn should_restore_market_data_streams(
+    replacing_clients: bool,
+    subscriptions_on_reconnect: bool,
+) -> bool {
+    !replacing_clients || subscriptions_on_reconnect
+}
+
 fn quote_subscription_groups(
-    subscriptions: &HashMap<String, InstrumentId>,
+    subscriptions: &[(String, InstrumentId)],
 ) -> Vec<(Vec<String>, HashMap<String, InstrumentId>)> {
-    let mut entries = subscriptions.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|(stream_id, _)| *stream_id);
+    let mut entries = subscriptions.to_vec();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
     entries
         .chunks(MAX_QUOTES_PER_STREAM)
         .map(|chunk| {
             let stream_ids = chunk
                 .iter()
-                .map(|(stream_id, _)| (*stream_id).clone())
+                .map(|(stream_id, _)| stream_id.clone())
                 .collect::<Vec<_>>();
             let instrument_ids = chunk
                 .iter()
-                .map(|(stream_id, instrument_id)| ((*stream_id).clone(), **instrument_id))
+                .map(|(stream_id, instrument_id)| (stream_id.clone(), *instrument_id))
                 .collect();
             (stream_ids, instrument_ids)
         })
@@ -149,14 +539,16 @@ fn publish_instrument_definitions(instrument_provider: &TbankInstrumentProvider)
 async fn refresh_published_instrument_catalogue(
     config: &TbankDataClientConfig,
     configured_stream_ids: &HashMap<String, String>,
+    resolved_stream_ids: &SharedInstrumentStreamIds,
     instrument_metadata: &SharedInstrumentMetadata,
 ) -> Result<()> {
-    let (provider, _, resolved_metadata) =
+    let (provider, refreshed_stream_ids, resolved_metadata) =
         load_resolved_instrument_catalogue(config, configured_stream_ids).await?;
 
     // Merge successful refreshes so a transiently unresolved auto-discovered contract cannot
-    // remove decoder metadata from an already active subscription. Full connect remains the
-    // owner of routing-map replacement.
+    // remove either decoder metadata or its canonical stream route from an already active
+    // subscription. Full connect remains the owner of routing-map replacement.
+    merge_resolved_instrument_stream_ids(resolved_stream_ids, refreshed_stream_ids);
     instrument_metadata
         .write()
         .expect("market-data metadata lock")
@@ -231,8 +623,8 @@ fn resolve_instrument_metadata<'a>(
 pub struct TbankDataClient {
     client_id: ClientId,
     config: TbankDataClientConfig,
-    /// The user-selected stream map, kept separate from broker-catalog discovery.
-    configured_instrument_stream_ids: HashMap<String, String>,
+    /// The runtime map includes canonical broker UIDs discovered by the catalogue refresh.
+    resolved_instrument_stream_ids: SharedInstrumentStreamIds,
     subscriptions: TbankSubscriptionRegistry,
     cache: Option<CacheView>,
     instrument_metadata: SharedInstrumentMetadata,
@@ -243,21 +635,36 @@ pub struct TbankDataClient {
     quote_stream_task: Option<JoinHandle<()>>,
     instrument_refresh_task: Option<JoinHandle<()>>,
     message_sequence: Arc<AtomicU64>,
-    bar_subscriptions: HashMap<String, nautilus_model::data::BarType>,
-    quote_subscriptions: HashMap<String, InstrumentId>,
+    /// Desired Nautilus subscriptions. Broker stream IDs are derived only while building a
+    /// concrete stream request, because catalogue discovery can change them between sessions.
+    bar_subscriptions: HashMap<InstrumentId, nautilus_model::data::BarType>,
+    /// Instrument-scoped readiness keys for the currently scheduled bar snapshot.
+    scheduled_bar_continuity_keys: HashMap<String, String>,
+    quote_subscriptions: HashSet<InstrumentId>,
+    trade_subscriptions: HashSet<InstrumentId>,
+    depth10_subscriptions: HashMap<InstrumentId, i32>,
     historical_request_limiter: HistoricalRequestLimiter,
+    stream_health: Arc<MarketDataStreamHealth>,
+    /// Watermarks belong to the client lifecycle, not to one replaceable stream supervisor.
+    bar_watermarks: SharedBarWatermarks,
+    /// Monotonic ownership generations for logical non-bar stream tasks.
+    stream_task_generations: HashMap<String, u64>,
+    /// Maps a logical non-bar stream to the currently owned generation-qualified task key.
+    active_stream_task_keys: HashMap<String, String>,
+    bar_stream_generation: u64,
 }
 
 impl TbankDataClient {
     /// Creates a new instance.
     pub fn new(config: TbankDataClientConfig) -> Self {
-        let configured_instrument_stream_ids = config.instrument_stream_ids.clone();
+        let resolved_instrument_stream_ids =
+            Arc::new(RwLock::new(config.instrument_stream_ids.clone()));
         let historical_request_limiter =
             HistoricalRequestLimiter::new(config.historical_candle_request_delay);
         Self {
             client_id: *TBANK_CLIENT_ID,
             config,
-            configured_instrument_stream_ids,
+            resolved_instrument_stream_ids,
             subscriptions: TbankSubscriptionRegistry::default(),
             cache: None,
             instrument_metadata: Arc::new(RwLock::new(HashMap::new())),
@@ -269,8 +676,16 @@ impl TbankDataClient {
             instrument_refresh_task: None,
             message_sequence: Arc::new(AtomicU64::new(0)),
             bar_subscriptions: HashMap::new(),
-            quote_subscriptions: HashMap::new(),
+            scheduled_bar_continuity_keys: HashMap::new(),
+            quote_subscriptions: HashSet::new(),
+            trade_subscriptions: HashSet::new(),
+            depth10_subscriptions: HashMap::new(),
             historical_request_limiter,
+            stream_health: Arc::new(MarketDataStreamHealth::default()),
+            bar_watermarks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stream_task_generations: HashMap::new(),
+            active_stream_task_keys: HashMap::new(),
+            bar_stream_generation: 0,
         }
     }
 
@@ -358,18 +773,23 @@ impl TbankDataClient {
         if self.is_connected() {
             return Ok(());
         }
+        let replacing_clients = self.clients.is_some();
         self.config.validate()?;
         let (instrument_provider, instrument_stream_ids, instrument_metadata) =
-            load_resolved_instrument_catalogue(
-                &self.config,
-                &self.configured_instrument_stream_ids,
-            )
-            .await?;
+            load_resolved_instrument_catalogue(&self.config, &self.config.instrument_stream_ids)
+                .await?;
         let token = self.config.resolve_token_secret()?;
         let endpoint = self.config.endpoint_uri()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(&token)?;
-        self.config.instrument_stream_ids = instrument_stream_ids;
+        self.stop_market_data_streams(
+            "market data clients are being replaced",
+            replacing_clients && !self.config.subscriptions_on_reconnect,
+        );
+        *self
+            .resolved_instrument_stream_ids
+            .write()
+            .expect("market-data stream IDs lock") = instrument_stream_ids;
         *self
             .instrument_metadata
             .write()
@@ -378,6 +798,18 @@ impl TbankDataClient {
         self.subscribe_instrument_updates();
         publish_instrument_definitions(&instrument_provider);
         self.schedule_instrument_refresh();
+        if should_restore_market_data_streams(
+            replacing_clients,
+            self.config.subscriptions_on_reconnect,
+        ) {
+            self.restore_market_data_streams()
+                .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
+        } else if replacing_clients {
+            // `subscriptions_on_reconnect = false` is an explicit opt-out, not merely a
+            // request to delay the old streams. Drop the desired state as well, otherwise the
+            // next unrelated subscribe command would reschedule every pre-reconnect stream.
+            self.clear_market_data_subscription_state();
+        }
         tracing::info!(
             environment = ?self.config.environment,
             endpoint = endpoint.as_str(),
@@ -389,21 +821,90 @@ impl TbankDataClient {
 
     /// Disconnects the client and stops its background tasks.
     pub fn disconnect(&mut self) {
+        self.stop_market_data_streams("market data client disconnected", false);
+        if let Some(task) = self.instrument_refresh_task.take() {
+            task.abort();
+        }
+        self.unsubscribe_instrument_updates();
+        self.clients = None;
+        *self
+            .resolved_instrument_stream_ids
+            .write()
+            .expect("market-data stream IDs lock") = self.config.instrument_stream_ids.clone();
+        tracing::info!("disconnected T-Bank data client");
+    }
+
+    fn stop_market_data_streams(&mut self, reason: &str, terminal: bool) {
+        let stage = if terminal {
+            "stream_subscriptions_disabled"
+        } else {
+            "stream_subscriptions_stopped"
+        };
+        self.advance_bar_stream_generation_with_stage(Some(stage), reason);
+        self.stream_health.retire_all(stage, reason);
         for (_, task) in self.stream_tasks.drain() {
             task.abort();
         }
+        self.active_stream_task_keys.clear();
         if let Some(task) = self.bar_stream_task.take() {
             task.abort();
         }
         if let Some(task) = self.quote_stream_task.take() {
             task.abort();
         }
-        if let Some(task) = self.instrument_refresh_task.take() {
-            task.abort();
+    }
+
+    fn advance_bar_stream_generation_with_stage(
+        &mut self,
+        stage: Option<&str>,
+        reason: &str,
+    ) -> u64 {
+        self.bar_stream_generation = self.bar_stream_generation.saturating_add(1);
+        self.stream_health.advance_bar_generation_with_stage(
+            self.bar_stream_generation,
+            stage,
+            reason,
+        );
+        self.bar_stream_generation
+    }
+
+    fn invalidate_bar_snapshot(&mut self, stream_reason: &str) -> u64 {
+        self.advance_bar_stream_generation_with_stage(None, stream_reason)
+    }
+
+    fn clear_market_data_subscription_state(&mut self) {
+        self.subscriptions = TbankSubscriptionRegistry::default();
+        self.bar_subscriptions.clear();
+        self.scheduled_bar_continuity_keys.clear();
+        self.quote_subscriptions.clear();
+        self.trade_subscriptions.clear();
+        self.depth10_subscriptions.clear();
+        self.active_stream_task_keys.clear();
+        self.bar_watermarks
+            .lock()
+            .expect("market-data watermark lock")
+            .clear();
+    }
+
+    fn restore_market_data_streams(&mut self) -> anyhow::Result<()> {
+        self.schedule_bar_streams()?;
+        self.schedule_quote_stream()?;
+
+        let trade_subscriptions = self.trade_subscriptions.iter().copied().collect::<Vec<_>>();
+        for instrument_id in trade_subscriptions {
+            self.schedule_trade_stream(instrument_id)?;
         }
-        self.unsubscribe_instrument_updates();
-        self.clients = None;
-        tracing::info!("disconnected T-Bank data client");
+
+        let depth10_subscriptions = self
+            .depth10_subscriptions
+            .iter()
+            .map(|(instrument_id, depth)| (*instrument_id, *depth))
+            .collect::<Vec<_>>();
+        for (instrument_id, depth) in depth10_subscriptions {
+            self.schedule_depth10_stream(instrument_id, depth)?;
+        }
+
+        Ok(())
     }
 
     fn schedule_instrument_refresh(&mut self) {
@@ -415,7 +916,8 @@ impl TbankDataClient {
             return;
         }
         let config = self.config.clone();
-        let configured_stream_ids = self.configured_instrument_stream_ids.clone();
+        let configured_stream_ids = config.instrument_stream_ids.clone();
+        let resolved_stream_ids = Arc::clone(&self.resolved_instrument_stream_ids);
         let instrument_metadata = Arc::clone(&self.instrument_metadata);
         self.instrument_refresh_task = Some(get_runtime().spawn(async move {
             let mut interval = tokio::time::interval(refresh_interval);
@@ -427,6 +929,7 @@ impl TbankDataClient {
                 if let Err(error) = refresh_published_instrument_catalogue(
                     &config,
                     &configured_stream_ids,
+                    &resolved_stream_ids,
                     &instrument_metadata,
                 )
                 .await
@@ -443,7 +946,7 @@ impl TbankDataClient {
 
     /// Returns whether the client is connected.
     pub fn is_connected(&self) -> bool {
-        self.clients.is_some()
+        self.clients.is_some() && self.stream_health.is_operational()
     }
 
     /// Loads one-minute bars for an instrument and time range.
@@ -722,13 +1225,15 @@ impl TbankDataClient {
 
     /// Builds requests that restore current subscriptions after reconnect.
     pub fn restore_subscription_requests(&self) -> Vec<crate::grpc::generated::MarketDataRequest> {
-        self.subscriptions.restore_requests()
+        self.subscriptions
+            .restore_requests_with_stream_ids(|instrument_id| self.stream_id(instrument_id))
     }
 
     fn stream_id(&self, instrument_id: InstrumentId) -> String {
         let instrument_id_string = instrument_id.to_string();
-        self.config
-            .instrument_stream_ids
+        self.resolved_instrument_stream_ids
+            .read()
+            .expect("market-data stream IDs lock")
             .get(&instrument_id_string)
             .cloned()
             .unwrap_or_else(|| instrument_stream_id(instrument_id))
@@ -790,11 +1295,39 @@ impl TbankDataClient {
             .collect()
     }
 
-    fn schedule_bar_streams(&mut self) -> anyhow::Result<()> {
-        if let Some(existing) = self.bar_stream_task.take() {
-            existing.abort();
+    fn seed_bar_watermarks_from_cache(&self, subscriptions: &[(String, BarType)]) {
+        let cached = self.cached_bar_watermarks();
+        for (_, bar_type) in subscriptions {
+            if let Some(watermark) = cached.get(bar_type).copied() {
+                // Cache is only a fallback baseline. A live or previously recovered watermark
+                // from this client lifecycle is authoritative and must never move backwards.
+                record_bar_watermark(&self.bar_watermarks, *bar_type, watermark);
+            }
         }
+    }
+
+    fn next_stream_generation(&mut self, logical_task_key: &str) -> u64 {
+        let generation = self
+            .stream_task_generations
+            .entry(logical_task_key.to_string())
+            .or_default();
+        *generation = generation.saturating_add(1);
+        *generation
+    }
+
+    fn generation_task_key(logical_task_key: &str, generation: u64) -> String {
+        format!("{logical_task_key}:generation:{generation}")
+    }
+
+    fn schedule_bar_streams(&mut self) -> anyhow::Result<()> {
+        let generation = self.invalidate_bar_snapshot("bar stream snapshot was replaced");
         if self.bar_subscriptions.is_empty() {
+            self.scheduled_bar_continuity_keys.clear();
+            self.stream_health
+                .replace_expected("bars:", std::iter::empty());
+            if let Some(existing) = self.bar_stream_task.take() {
+                existing.abort();
+            }
             return Ok(());
         }
 
@@ -815,22 +1348,26 @@ impl TbankDataClient {
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
-        let initial_bar_watermarks = self.cached_bar_watermarks();
         let batch_size = self.config.max_candle_instruments_per_stream.max(1);
 
         let mut subscriptions = self
             .bar_subscriptions
             .iter()
-            .map(|(stream_id, bar_type)| (stream_id.clone(), *bar_type))
+            .map(|(instrument_id, bar_type)| (self.stream_id(*instrument_id), *bar_type))
             .collect::<Vec<_>>();
-        subscriptions.sort_by(|left, right| left.0.cmp(&right.0));
+        subscriptions.sort_by(|left, right| {
+            left.0
+                .to_string()
+                .cmp(&right.0.to_string())
+                .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
+        });
+        self.seed_bar_watermarks_from_cache(&subscriptions);
+        let initial_bar_watermarks = snapshot_bar_watermarks(&self.bar_watermarks);
 
-        let (poll_subscriptions, stream_subscriptions): (Vec<_>, Vec<_>) =
-            subscriptions.into_iter().partition(|(stream_id, _)| {
-                config
-                    .periodic_candle_poll_instrument_ids
-                    .contains(stream_id)
-            });
+        let (poll_subscriptions, stream_subscriptions) = partition_bar_stream_subscriptions(
+            subscriptions,
+            &config.periodic_candle_poll_instrument_ids,
+        );
 
         let groups = stream_subscriptions
             .chunks(batch_size)
@@ -864,13 +1401,60 @@ impl TbankDataClient {
                     ..MarketDataServerSideStreamRequest::default()
                 };
                 (
-                    format!("bars:group:{group_index}:1m"),
+                    format!("bars:generation:{generation}:group:{group_index}:1m"),
                     request,
                     TbankStreamKind::Bars { bar_types },
-                    bar_watermarks_for_subscriptions(chunk, &initial_bar_watermarks),
                 )
             })
             .collect::<Vec<_>>();
+
+        let mut next_continuity_keys = HashMap::new();
+        for (task_key, _, kind) in &groups {
+            let TbankStreamKind::Bars { bar_types } = kind else {
+                unreachable!("bar scheduler only creates bar stream groups");
+            };
+            next_continuity_keys.extend(bar_types.keys().map(|instrument_uid| {
+                (
+                    instrument_uid.clone(),
+                    bar_continuity_key(task_key, instrument_uid),
+                )
+            }));
+        }
+        next_continuity_keys.extend(poll_subscriptions.iter().map(|(instrument_uid, _)| {
+            (
+                instrument_uid.clone(),
+                periodic_candle_stream_key(generation, instrument_uid),
+            )
+        }));
+
+        // Replace the desired lifecycle snapshot synchronously. `invalidate_bar_snapshot` has
+        // already fenced the old generation and invalidated its readiness before this new set is
+        // registered or the old task is aborted.
+        let mut health_task_keys = groups
+            .iter()
+            .map(|(task_key, _, _)| task_key.clone())
+            .collect::<Vec<_>>();
+        health_task_keys.extend(
+            poll_subscriptions
+                .iter()
+                .map(|(instrument_uid, _)| periodic_candle_stream_key(generation, instrument_uid)),
+        );
+        self.stream_health
+            .replace_expected("bars:", health_task_keys.iter().map(String::as_str));
+        for (instrument_uid, continuity_key) in &next_continuity_keys {
+            if !poll_subscriptions
+                .iter()
+                .any(|(poll_uid, _)| poll_uid == instrument_uid)
+            {
+                // Live-bar readiness is fenced by the current snapshot but is not itself a
+                // separate health group; the parent stream group carries the operational gate.
+                self.stream_health.register_current(continuity_key);
+            }
+        }
+        self.scheduled_bar_continuity_keys = next_continuity_keys;
+        if let Some(existing) = self.bar_stream_task.take() {
+            existing.abort();
+        }
 
         if !groups.is_empty() || !poll_subscriptions.is_empty() {
             let stream_market_data_client = market_data_client.clone();
@@ -879,8 +1463,10 @@ impl TbankDataClient {
             let stream_instrument_metadata = instrument_metadata.clone();
             let stream_historical_request_limiter = historical_request_limiter.clone();
             let stream_message_sequence = self.message_sequence.clone();
+            let stream_health = self.stream_health.clone();
+            let stream_bar_watermarks = self.bar_watermarks.clone();
             let poll_watermarks =
-                bar_watermarks_for_subscriptions(&poll_subscriptions, &initial_bar_watermarks);
+                bar_watermarks_for_streams(&poll_subscriptions, &initial_bar_watermarks);
             let task = get_runtime().spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 tracing::info!(
@@ -893,7 +1479,7 @@ impl TbankDataClient {
                 let stream_future = async {
                     let futures = groups
                         .into_iter()
-                        .map(|(task_key, request, kind, initial_bar_watermarks)| {
+                        .map(|(task_key, request, kind)| {
                             run_market_data_stream(MarketDataStreamContext {
                                 market_data_stream: market_data_stream.clone(),
                                 market_data_client: stream_market_data_client.clone(),
@@ -905,10 +1491,11 @@ impl TbankDataClient {
                                     .clone(),
                                 instrument_metadata: stream_instrument_metadata.clone(),
                                 task_key,
-                                initial_bar_watermarks,
+                                bar_watermarks: stream_bar_watermarks.clone(),
                                 bar_continuity_key_overrides: HashMap::new(),
                                 reconnect_attempt: Arc::new(AtomicU32::new(0)),
                                 message_sequence: stream_message_sequence.clone(),
+                                stream_health: stream_health.clone(),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -917,6 +1504,8 @@ impl TbankDataClient {
                 if poll_subscriptions.is_empty() {
                     stream_future.await;
                 } else {
+                    let poll_stream_health = stream_health.clone();
+                    let poll_bar_watermarks = stream_bar_watermarks.clone();
                     tokio::join!(
                         stream_future,
                         run_periodic_candle_poll(
@@ -928,7 +1517,10 @@ impl TbankDataClient {
                             instrument_metadata,
                             poll_subscriptions,
                             poll_watermarks,
+                            poll_bar_watermarks,
                             HashMap::new(),
+                            generation,
+                            poll_stream_health,
                         )
                     );
                 }
@@ -939,9 +1531,15 @@ impl TbankDataClient {
     }
 
     fn schedule_quote_stream(&mut self) -> anyhow::Result<()> {
+        self.stream_health.retire_prefix(
+            "quotes:",
+            None,
+            "quote stream subscription snapshot was replaced",
+        );
         if let Some(existing) = self.quote_stream_task.take() {
             existing.abort();
         }
+        let generation = self.next_stream_generation("quotes:snapshot");
         if self.quote_subscriptions.is_empty() {
             return Ok(());
         }
@@ -958,12 +1556,27 @@ impl TbankDataClient {
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .market_data
             .clone();
-        let groups = quote_subscription_groups(&self.quote_subscriptions);
+        let subscriptions = self
+            .quote_subscriptions
+            .iter()
+            .map(|instrument_id| (self.stream_id(*instrument_id), *instrument_id))
+            .collect::<Vec<_>>();
+        let groups = quote_subscription_groups(&subscriptions);
+        let expected_task_keys = (0..groups.len())
+            .map(|group_index| format!("quotes:generation:{generation}:group:{group_index}:depth1"))
+            .collect::<Vec<_>>();
+        // Register the complete desired snapshot synchronously. `run_market_data_stream` must
+        // not own this transition because the parent task intentionally waits before opening the
+        // broker stream.
+        self.stream_health
+            .replace_expected("quotes:", expected_task_keys.iter().map(String::as_str));
         let sender = get_data_event_sender();
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
         let message_sequence = self.message_sequence.clone();
+        let stream_health = self.stream_health.clone();
+        let bar_watermarks = self.bar_watermarks.clone();
         self.quote_stream_task = Some(get_runtime().spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let futures = groups.into_iter().enumerate().map(
@@ -992,11 +1605,14 @@ impl TbankDataClient {
                         config: config.clone(),
                         historical_request_limiter: historical_request_limiter.clone(),
                         instrument_metadata: instrument_metadata.clone(),
-                        task_key: format!("quotes:group:{group_index}:depth1"),
-                        initial_bar_watermarks: HashMap::new(),
+                        task_key: format!(
+                            "quotes:generation:{generation}:group:{group_index}:depth1"
+                        ),
+                        bar_watermarks: bar_watermarks.clone(),
                         bar_continuity_key_overrides: HashMap::new(),
                         reconnect_attempt: Arc::new(AtomicU32::new(0)),
                         message_sequence: message_sequence.clone(),
+                        stream_health: stream_health.clone(),
                     })
                 },
             );
@@ -1005,14 +1621,72 @@ impl TbankDataClient {
         Ok(())
     }
 
+    fn schedule_trade_stream(&mut self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let instrument_uid = self.stream_id(instrument_id);
+        let request = MarketDataServerSideStreamRequest {
+            subscribe_trades_request: Some(SubscribeTradesRequest {
+                subscription_action: SubscriptionAction::Subscribe as i32,
+                instruments: vec![TradeInstrument {
+                    instrument_id: instrument_uid.clone(),
+                    ..TradeInstrument::default()
+                }],
+                trade_source: TradeSourceType::TradeSourceExchange as i32,
+                with_open_interest: false,
+            }),
+            ..MarketDataServerSideStreamRequest::default()
+        };
+        self.spawn_stream(
+            stream_task_key("trades", &instrument_id.to_string(), "all"),
+            request,
+            TbankStreamKind::Trades {
+                instrument_id,
+                instrument_uid,
+            },
+        )
+    }
+
+    fn schedule_depth10_stream(
+        &mut self,
+        instrument_id: InstrumentId,
+        depth: i32,
+    ) -> anyhow::Result<()> {
+        let instrument_uid = self.stream_id(instrument_id);
+        let request = MarketDataServerSideStreamRequest {
+            subscribe_order_book_request: Some(SubscribeOrderBookRequest {
+                subscription_action: SubscriptionAction::Subscribe as i32,
+                instruments: vec![OrderBookInstrument {
+                    instrument_id: instrument_uid.clone(),
+                    depth,
+                    order_book_type: OrderBookType::OrderbookTypeExchange as i32,
+                    ..OrderBookInstrument::default()
+                }],
+            }),
+            ..MarketDataServerSideStreamRequest::default()
+        };
+        self.spawn_stream(
+            stream_task_key("depth10", &instrument_id.to_string(), "book"),
+            request,
+            TbankStreamKind::Depth10 {
+                instrument_id,
+                instrument_uid,
+            },
+        )
+    }
+
     fn spawn_stream(
         &mut self,
-        task_key: String,
+        logical_task_key: String,
         request: MarketDataServerSideStreamRequest,
         kind: TbankStreamKind,
     ) -> anyhow::Result<()> {
-        if let Some(existing) = self.stream_tasks.remove(&task_key) {
-            existing.abort();
+        if let Some(previous_task_key) = self.active_stream_task_keys.remove(&logical_task_key) {
+            self.stream_health.retire_task_key(
+                &previous_task_key,
+                "logical market-data stream generation was replaced",
+            );
+            if let Some(existing) = self.stream_tasks.remove(&previous_task_key) {
+                existing.abort();
+            }
         }
         let market_data_stream = self
             .clients
@@ -1026,6 +1700,11 @@ impl TbankDataClient {
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .market_data
             .clone();
+        let generation = self.next_stream_generation(&logical_task_key);
+        let task_key = Self::generation_task_key(&logical_task_key, generation);
+        // Ownership is established before the task is spawned. A stale supervisor can therefore
+        // only observe an old key after a replacement and cannot change the new task's health.
+        self.stream_health.register(&task_key);
         let sender = get_data_event_sender();
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
@@ -1041,17 +1720,25 @@ impl TbankDataClient {
             historical_request_limiter,
             instrument_metadata,
             task_key: task_key.clone(),
-            initial_bar_watermarks: HashMap::new(),
+            bar_watermarks: self.bar_watermarks.clone(),
             bar_continuity_key_overrides: HashMap::new(),
             reconnect_attempt: Arc::new(AtomicU32::new(0)),
             message_sequence,
+            stream_health: self.stream_health.clone(),
         }));
-        self.stream_tasks.insert(task_key, task);
+        self.stream_tasks.insert(task_key.clone(), task);
+        self.active_stream_task_keys
+            .insert(logical_task_key, task_key);
         Ok(())
     }
 
-    fn abort_stream(&mut self, task_key: &str) {
-        if let Some(task) = self.stream_tasks.remove(task_key) {
+    fn abort_stream(&mut self, logical_task_key: &str) {
+        let Some(task_key) = self.active_stream_task_keys.remove(logical_task_key) else {
+            return;
+        };
+        self.stream_health
+            .retire_task_key(&task_key, "market-data stream subscription was removed");
+        if let Some(task) = self.stream_tasks.remove(&task_key) {
             task.abort();
         }
     }
@@ -1107,44 +1794,104 @@ fn market_data_stream_idle_timeout_reason(timeout: Duration) -> String {
     )
 }
 
+struct AbortableTask {
+    task: JoinHandle<()>,
+    health_cleanup: Option<(Arc<MarketDataStreamHealth>, String)>,
+}
+
+impl AbortableTask {
+    fn retire_health_key(&mut self, reason: &str) {
+        if let Some((health, task_key)) = self.health_cleanup.take() {
+            health.retire_task_key(&task_key, reason);
+        }
+    }
+}
+
 #[derive(Default)]
-struct AbortTasksOnDrop(Vec<JoinHandle<()>>);
+struct AbortTasksOnDrop(Vec<AbortableTask>);
 
 impl Drop for AbortTasksOnDrop {
     fn drop(&mut self) {
-        for task in self.0.drain(..) {
-            task.abort();
+        for mut task in self.0.drain(..) {
+            task.retire_health_key("isolated stream task owner exited");
+            task.task.abort();
         }
     }
 }
 
 impl AbortTasksOnDrop {
+    #[cfg(test)]
     fn push(&mut self, task: JoinHandle<()>) {
-        self.0.push(task);
+        self.0.push(AbortableTask {
+            task,
+            health_cleanup: None,
+        });
+    }
+
+    fn push_with_health_cleanup(
+        &mut self,
+        task: JoinHandle<()>,
+        health: Arc<MarketDataStreamHealth>,
+        task_key: String,
+    ) {
+        self.0.push(AbortableTask {
+            task,
+            health_cleanup: Some((health, task_key)),
+        });
     }
 
     async fn wait_for_completion(&mut self) {
         // Keep handles owned by the guard while awaiting so aborting the parent subscription
         // still aborts every isolated child instead of detaching the currently awaited task.
         for task in &mut self.0 {
-            let _ = task.await;
+            let _ = (&mut task.task).await;
+        }
+        for task in &mut self.0 {
+            task.retire_health_key("isolated stream task completed");
         }
         self.0.clear();
     }
 }
 
-fn periodic_candle_stream_key(instrument_uid: &str) -> String {
-    format!("bars:poll:indicative:1m:instrument:{instrument_uid}")
+fn periodic_candle_stream_key(generation: u64, instrument_uid: &str) -> String {
+    format!("bars:generation:{generation}:poll:indicative:1m:instrument:{instrument_uid}")
 }
 
 fn periodic_candle_poll_from(
-    next_from: &mut HashMap<String, i128>,
-    instrument_uid: &str,
+    next_from: &mut HashMap<BarType, i128>,
+    bar_type: BarType,
     to_ts_event: i128,
 ) -> i128 {
-    *next_from
-        .entry(instrument_uid.to_string())
-        .or_insert(to_ts_event)
+    *next_from.entry(bar_type).or_insert(to_ts_event)
+}
+
+fn publish_recovery_batch_if_current<C>(
+    stream_health: &MarketDataStreamHealth,
+    task_key: &str,
+    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    bars: &[Bar],
+    commit: C,
+) -> anyhow::Result<RecoveryPublication>
+where
+    C: FnOnce(&[Bar]),
+{
+    let published = stream_health.with_current_task_key_after_publish(
+        task_key,
+        || {
+            for bar in bars {
+                sender
+                    .send(DataEvent::Data(Data::from(*bar)))
+                    .map_err(|error| anyhow::anyhow!("data event receiver dropped: {error}"))?;
+            }
+            Ok(())
+        },
+        || commit(bars),
+    )?;
+    Ok(if published {
+        RecoveryPublication::Published
+    } else {
+        RecoveryPublication::Superseded
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1156,12 +1903,15 @@ async fn run_periodic_candle_poll(
     historical_request_limiter: HistoricalRequestLimiter,
     instrument_metadata: SharedInstrumentMetadata,
     subscriptions: Vec<(String, BarType)>,
-    initial_bar_watermarks: HashMap<String, i128>,
+    initial_bar_watermarks: HashMap<BarType, i128>,
+    bar_watermarks: SharedBarWatermarks,
     continuity_key_overrides: HashMap<String, String>,
+    generation: u64,
+    stream_health: Arc<MarketDataStreamHealth>,
 ) {
     let mut next_from = initial_bar_watermarks
         .into_iter()
-        .map(|(instrument_uid, latest)| (instrument_uid, latest.saturating_add(ONE_MINUTE_NANOS)))
+        .map(|(bar_type, latest)| (bar_type, latest.saturating_add(ONE_MINUTE_NANOS)))
         .collect::<HashMap<_, _>>();
 
     loop {
@@ -1178,31 +1928,61 @@ async fn run_periodic_candle_poll(
         };
 
         for (instrument_uid, bar_type) in &subscriptions {
-            let from_ts_event =
-                periodic_candle_poll_from(&mut next_from, instrument_uid, to_ts_event);
-            if from_ts_event > to_ts_event {
-                continue;
-            }
+            let from_ts_event = periodic_candle_poll_from(&mut next_from, *bar_type, to_ts_event);
             let continuity_key = continuity_key_overrides
                 .get(instrument_uid)
                 .cloned()
-                .unwrap_or_else(|| periodic_candle_stream_key(instrument_uid));
-            match backfill
+                .unwrap_or_else(|| periodic_candle_stream_key(generation, instrument_uid));
+            if !stream_health.is_current_task_key(&continuity_key) {
+                return;
+            }
+            if from_ts_event > to_ts_event {
+                stream_health.mark_operational(&continuity_key);
+                publish_candle_readiness_if_current(
+                    &stream_health,
+                    TbankCandleReadinessState::Ready,
+                    &continuity_key,
+                    instrument_uid,
+                    Some(to_ts_event),
+                    "periodic candle watermark already covers the latest closed minute".to_string(),
+                );
+                continue;
+            }
+            let recovery = backfill
                 .recover_range(
                     instrument_uid,
                     *bar_type,
                     from_ts_event,
                     to_ts_event,
-                    &sender,
+                    |bars| {
+                        publish_recovery_batch_if_current(
+                            &stream_health,
+                            &continuity_key,
+                            &sender,
+                            bars,
+                            |bars| {
+                                for bar in bars {
+                                    record_bar_watermark(
+                                        &bar_watermarks,
+                                        *bar_type,
+                                        i128::from(bar.ts_event.as_u64()),
+                                    );
+                                }
+                                record_bar_watermark(&bar_watermarks, *bar_type, to_ts_event);
+                            },
+                        )
+                    },
                 )
-                .await
-            {
-                Ok(published_ts) => {
-                    next_from.insert(
-                        instrument_uid.clone(),
-                        to_ts_event.saturating_add(ONE_MINUTE_NANOS),
-                    );
-                    publish_candle_readiness(
+                .await;
+            if !stream_health.is_current_task_key(&continuity_key) {
+                return;
+            }
+            match recovery {
+                Ok(RecoveryRangeResult::Published(published_ts)) => {
+                    next_from.insert(*bar_type, to_ts_event.saturating_add(ONE_MINUTE_NANOS));
+                    stream_health.mark_operational(&continuity_key);
+                    publish_candle_readiness_if_current(
+                        &stream_health,
                         TbankCandleReadinessState::Ready,
                         &continuity_key,
                         instrument_uid,
@@ -1220,25 +2000,33 @@ async fn run_periodic_candle_poll(
                         );
                     }
                 }
+                Ok(RecoveryRangeResult::Superseded) => return,
                 Err(error) => {
+                    stream_health.mark_non_operational(&continuity_key);
                     let reason = format!("periodic GetCandles failed: {error}");
-                    publish_candle_readiness(
+                    publish_candle_readiness_if_current(
+                        &stream_health,
                         TbankCandleReadinessState::Failed,
                         &continuity_key,
                         instrument_uid,
                         None,
                         reason.clone(),
                     );
-                    trace_market_data_stream_event(MarketDataStreamEventInput {
-                        stage: "periodic_get_candles_failed",
-                        task_key: &continuity_key,
-                        stream_kind: "bars_poll",
-                        instrument_count: 1,
-                        status: None,
-                        reason,
-                        delay_ms: Some(config.periodic_candle_poll_interval.as_millis()),
-                        attempt: 0,
-                    });
+                    if stream_health.is_current_task_key(&continuity_key) {
+                        trace_market_data_stream_event(
+                            MarketDataStreamEventInput {
+                                stage: "periodic_get_candles_failed",
+                                task_key: &continuity_key,
+                                stream_kind: "bars_poll",
+                                instrument_count: 1,
+                                status: None,
+                                reason,
+                                delay_ms: Some(config.periodic_candle_poll_interval.as_millis()),
+                                attempt: 0,
+                            },
+                            Vec::new(),
+                        );
+                    }
                 }
             }
         }
@@ -1258,10 +2046,11 @@ struct MarketDataStreamContext {
     historical_request_limiter: HistoricalRequestLimiter,
     instrument_metadata: SharedInstrumentMetadata,
     task_key: String,
-    initial_bar_watermarks: HashMap<String, i128>,
+    bar_watermarks: SharedBarWatermarks,
     bar_continuity_key_overrides: HashMap<String, String>,
     reconnect_attempt: Arc<AtomicU32>,
     message_sequence: Arc<AtomicU64>,
+    stream_health: Arc<MarketDataStreamHealth>,
 }
 
 fn run_market_data_stream(
@@ -1269,58 +2058,131 @@ fn run_market_data_stream(
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {
         let instrument_count = context.kind.instrument_count();
-        trace_market_data_stream_event(MarketDataStreamEventInput {
-            stage: "stream_supervisor_started",
-            task_key: &context.task_key,
-            stream_kind: context.kind.name(),
-            instrument_count,
-            status: None,
-            reason: "market data stream supervisor started".to_string(),
-            delay_ms: None,
-            attempt: 0,
-        });
-        let mut resume_after_panic = false;
+        trace_market_data_stream_event_if_current(
+            &context.stream_health,
+            MarketDataStreamEventInput {
+                stage: "stream_supervisor_started",
+                task_key: &context.task_key,
+                stream_kind: context.kind.name(),
+                instrument_count,
+                status: None,
+                reason: "market data stream supervisor started".to_string(),
+                delay_ms: None,
+                attempt: 0,
+            },
+        );
+        let mut restart_after_worker_exit = false;
         loop {
             let mut workers = JoinSet::new();
             workers.spawn(run_market_data_stream_worker(
                 context.clone(),
-                resume_after_panic,
+                restart_after_worker_exit,
             ));
             match workers
                 .join_next()
                 .await
                 .expect("stream worker is registered")
             {
-                Ok(()) => return,
+                Ok(Ok(())) => {
+                    context.stream_health.mark_reconnecting(&context.task_key);
+                    tracing::error!(
+                        task_key = context.task_key.as_str(),
+                        "T-Bank market data stream worker exited normally"
+                    );
+                    trace_market_data_stream_event_if_current(
+                        &context.stream_health,
+                        MarketDataStreamEventInput {
+                            stage: "stream_worker_normal_exit",
+                            task_key: &context.task_key,
+                            stream_kind: context.kind.name(),
+                            instrument_count,
+                            status: None,
+                            reason: "unexpected normal worker completion".to_string(),
+                            delay_ms: None,
+                            attempt: context.reconnect_attempt.load(Ordering::Relaxed),
+                        },
+                    );
+                    restart_after_worker_exit = true;
+                }
+                Ok(Err(StreamWorkerExit::RetryBudgetExhausted)) => {
+                    context.stream_health.mark_reconnecting(&context.task_key);
+                    tokio::time::sleep(crate::grpc::retry::backoff_duration(
+                        &context.config.reconnect_policy,
+                        context.config.max_market_data_reconnect_attempts,
+                    ))
+                    .await;
+                    context.reconnect_attempt.store(0, Ordering::Release);
+                    restart_after_worker_exit = false;
+                }
+                Ok(Err(StreamWorkerExit::Permanent(reason))) => {
+                    context.stream_health.mark_terminal(&context.task_key);
+                    trace_market_data_stream_event_if_current(
+                        &context.stream_health,
+                        MarketDataStreamEventInput {
+                            stage: "stream_supervisor_exhausted",
+                            task_key: &context.task_key,
+                            stream_kind: context.kind.name(),
+                            instrument_count,
+                            status: None,
+                            reason,
+                            delay_ms: None,
+                            attempt: context.reconnect_attempt.load(Ordering::Relaxed),
+                        },
+                    );
+                    return;
+                }
                 Err(error) if error.is_panic() => {
+                    context.stream_health.mark_reconnecting(&context.task_key);
                     let reason = error.to_string();
                     tracing::error!(
                         task_key = context.task_key.as_str(),
                         %reason,
                         "T-Bank market data stream task panicked"
                     );
-                    trace_market_data_stream_event(MarketDataStreamEventInput {
-                        stage: "stream_task_panicked",
-                        task_key: &context.task_key,
-                        stream_kind: context.kind.name(),
-                        instrument_count,
-                        status: Some("panic".to_string()),
-                        reason,
-                        delay_ms: None,
-                        attempt: context.reconnect_attempt.load(Ordering::Relaxed),
-                    });
-                    resume_after_panic = true;
+                    trace_market_data_stream_event_if_current(
+                        &context.stream_health,
+                        MarketDataStreamEventInput {
+                            stage: "stream_task_panicked",
+                            task_key: &context.task_key,
+                            stream_kind: context.kind.name(),
+                            instrument_count,
+                            status: Some("panic".to_string()),
+                            reason,
+                            delay_ms: None,
+                            attempt: context.reconnect_attempt.load(Ordering::Relaxed),
+                        },
+                    );
+                    restart_after_worker_exit = true;
                 }
-                Err(_) => return,
+                Err(error) => {
+                    context.stream_health.mark_terminal(&context.task_key);
+                    tracing::error!(
+                        task_key = context.task_key.as_str(),
+                        error = %error,
+                        "T-Bank market data stream worker failed"
+                    );
+                    return;
+                }
             }
         }
     })
 }
 
+#[derive(Debug)]
+enum StreamWorkerExit {
+    RetryBudgetExhausted,
+    Permanent(String),
+}
+
+fn permanent_stream_status(status: &tonic::Status) -> Option<StreamWorkerExit> {
+    (!retryable_stream_status(status))
+        .then(|| StreamWorkerExit::Permanent(format!("non-retryable stream status: {status}")))
+}
+
 fn run_market_data_stream_worker(
     context: MarketDataStreamContext,
-    resume_after_panic: bool,
-) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    restart_after_worker_exit: bool,
+) -> Pin<Box<dyn Future<Output = std::result::Result<(), StreamWorkerExit>> + Send>> {
     Box::pin(async move {
         let MarketDataStreamContext {
             mut market_data_stream,
@@ -1332,27 +2194,29 @@ fn run_market_data_stream_worker(
             historical_request_limiter,
             instrument_metadata,
             task_key,
-            initial_bar_watermarks,
             bar_continuity_key_overrides,
             reconnect_attempt,
             message_sequence: message_sequence_counter,
+            stream_health,
+            bar_watermarks,
         } = context;
         let timestamp_mode = config.candle_timestamp_mode;
         let mut instrument_count = kind.instrument_count();
 
-        if resume_after_panic {
+        if restart_after_worker_exit {
             if !wait_for_market_data_reconnect(
                 &task_key,
                 &kind,
                 instrument_count,
                 &config,
                 &reconnect_attempt,
-                "restarting market data stream after task panic",
-                "stream_supervisor_exhausted",
+                &stream_health,
+                "restarting market data stream after worker exit",
+                "stream_supervisor_reconnect_exhausted",
             )
             .await
             {
-                return;
+                return Err(StreamWorkerExit::RetryBudgetExhausted);
             }
             match reconnect_market_data_clients(&config).await {
                 Ok((next_stream, next_data)) => {
@@ -1360,35 +2224,31 @@ fn run_market_data_stream_worker(
                     market_data_client = next_data;
                 }
                 Err(error) => {
-                    trace_market_data_stream_event(MarketDataStreamEventInput {
-                        stage: "stream_supervisor_reconnect_failed",
-                        task_key: &task_key,
-                        stream_kind: kind.name(),
-                        instrument_count,
-                        status: None,
-                        reason: error.to_string(),
-                        delay_ms: None,
-                        attempt: reconnect_attempt.load(Ordering::Relaxed),
-                    });
+                    trace_market_data_stream_event_if_current(
+                        &stream_health,
+                        MarketDataStreamEventInput {
+                            stage: "stream_supervisor_reconnect_failed",
+                            task_key: &task_key,
+                            stream_kind: kind.name(),
+                            instrument_count,
+                            status: None,
+                            reason: error.to_string(),
+                            delay_ms: None,
+                            attempt: reconnect_attempt.load(Ordering::Relaxed),
+                        },
+                    );
                 }
             }
         }
         let mut attempt = reconnect_attempt.load(Ordering::Relaxed);
         let mut isolated_subscription_tasks = AbortTasksOnDrop::default();
-        let mut continuity = initial_bar_watermarks
-            .into_iter()
-            .map(|(instrument_uid, watermark)| {
-                (
-                    instrument_uid,
-                    BarContinuityTracker::from_seeded_bar(watermark),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let initial_bar_watermarks = snapshot_bar_watermarks(&bar_watermarks);
+        let mut continuity = continuity_from_bar_watermarks(&kind, &initial_bar_watermarks);
         // Never let historical recovery prevent the real-time stream from opening. The broker
         // subscription acknowledgement establishes transport readiness first; recovery then runs
         // under the shared request limiter while the open HTTP/2 stream buffers live messages.
         let mut pending_recovery = Some(RecoveryCause::Startup);
-        let mut last_reconnect_catch_up = None;
+        let mut has_permanent_bar_rejection = false;
         loop {
             let _reconnect_trigger = match market_data_stream
                 .market_data_server_side_stream(request.clone())
@@ -1406,6 +2266,12 @@ fn run_market_data_stream_worker(
                         .await
                         {
                             StreamMessageOutcome::Message(response) => {
+                                if !stream_health.is_current_task_key(&task_key) {
+                                    // The supervisor may have completed a receive concurrently
+                                    // with unsubscribe/replacement. Its ownership lease is gone,
+                                    // so it must not process the response or spawn retry children.
+                                    continue;
+                                }
                                 let received_at = now_unix_nanos();
                                 let message_sequence =
                                     message_sequence_counter.fetch_add(1, Ordering::Relaxed);
@@ -1418,6 +2284,14 @@ fn run_market_data_stream_worker(
                                         && rejection.has_mixed_retryability()
                                         && matches!(kind, TbankStreamKind::Bars { .. })
                                     {
+                                        has_permanent_bar_rejection |=
+                                            mark_permanent_bar_rejections(
+                                                &task_key,
+                                                &kind,
+                                                &rejection,
+                                                &bar_continuity_key_overrides,
+                                                &stream_health,
+                                            );
                                         if let Some(candles_request) =
                                             request.subscribe_candles_request.as_mut()
                                         {
@@ -1439,7 +2313,8 @@ fn run_market_data_stream_worker(
                                             }
                                         }
                                         instrument_count = kind.instrument_count();
-                                        trace_market_data_stream_event(
+                                        trace_market_data_stream_event_if_current(
+                                            &stream_health,
                                             MarketDataStreamEventInput {
                                                 stage: "subscription_rejection_partitioned",
                                                 task_key: &task_key,
@@ -1456,20 +2331,29 @@ fn run_market_data_stream_worker(
                                     if rejection.is_partial()
                                         && matches!(kind, TbankStreamKind::Bars { .. })
                                     {
+                                        has_permanent_bar_rejection |=
+                                            mark_permanent_bar_rejections(
+                                                &task_key,
+                                                &kind,
+                                                &rejection,
+                                                &bar_continuity_key_overrides,
+                                                &stream_health,
+                                            );
                                         let reason = rejection.reason.clone();
                                         tracing::warn!(
                                             task_key = task_key.as_str(),
                                             %reason,
                                             "T-Bank partially rejected a batched candle subscription; preserving accepted instruments"
                                         );
-                                        trace_market_data_stream_event(
+                                        trace_market_data_stream_event_if_current(
+                                            &stream_health,
                                             MarketDataStreamEventInput {
                                                 stage: "subscription_partially_rejected",
                                                 task_key: &task_key,
                                                 stream_kind: kind.name(),
                                                 instrument_count,
                                                 status: None,
-                                                reason,
+                                                reason: reason.clone(),
                                                 delay_ms: None,
                                                 attempt,
                                             },
@@ -1510,65 +2394,85 @@ fn run_market_data_stream_worker(
                                                 continue;
                                             }
 
-                                            let watermark = continuity
-                                                .get(&failure.instrument_uid)
-                                                .and_then(BarContinuityTracker::latest_seen);
                                             let (
                                                 isolated_task_key,
                                                 isolated_request,
                                                 isolated_kind,
-                                                isolated_watermarks,
                                                 isolated_continuity_keys,
                                             ) = isolated_retryable_bar_stream(
                                                 &task_key,
                                                 &failure.instrument_uid,
                                                 bar_type,
-                                                watermark,
                                             );
-                                            trace_market_data_stream_event(
-                                                MarketDataStreamEventInput {
-                                                    stage: "subscription_retry_isolated",
-                                                    task_key: &isolated_task_key,
-                                                    stream_kind: isolated_kind.name(),
-                                                    instrument_count: 1,
-                                                    status: None,
-                                                    reason: failure.reason,
-                                                    delay_ms: None,
-                                                    attempt,
-                                                },
+                                            let isolated_stream_kind = isolated_kind.name();
+                                            let Some(isolated_task) = stream_health
+                                                .spawn_child_if_current(
+                                                    &task_key,
+                                                    &isolated_task_key,
+                                                    || {
+                                                        trace_market_data_stream_event(
+                                                            MarketDataStreamEventInput {
+                                                                stage: "subscription_retry_isolated",
+                                                                task_key: &isolated_task_key,
+                                                                stream_kind: isolated_stream_kind,
+                                                                instrument_count: 1,
+                                                                status: None,
+                                                                reason: failure.reason,
+                                                                delay_ms: None,
+                                                                attempt,
+                                                            },
+                                                            Vec::new(),
+                                                        );
+                                                        get_runtime().spawn(run_market_data_stream(
+                                                            MarketDataStreamContext {
+                                                                market_data_stream:
+                                                                    market_data_stream.clone(),
+                                                                market_data_client:
+                                                                    market_data_client.clone(),
+                                                                sender: sender.clone(),
+                                                                request: isolated_request,
+                                                                kind: isolated_kind,
+                                                                config: config.clone(),
+                                                                historical_request_limiter:
+                                                                    historical_request_limiter.clone(),
+                                                                instrument_metadata:
+                                                                    instrument_metadata.clone(),
+                                                                task_key: isolated_task_key.clone(),
+                                                                bar_watermarks: bar_watermarks.clone(),
+                                                                bar_continuity_key_overrides:
+                                                                    isolated_continuity_keys,
+                                                                reconnect_attempt:
+                                                                    Arc::new(AtomicU32::new(0)),
+                                                                message_sequence:
+                                                                    message_sequence_counter.clone(),
+                                                                stream_health: stream_health.clone(),
+                                                            },
+                                                        ))
+                                                    },
+                                                )
+                                            else {
+                                                continue;
+                                            };
+                                            isolated_subscription_tasks.push_with_health_cleanup(
+                                                isolated_task,
+                                                stream_health.clone(),
+                                                isolated_task_key,
                                             );
-                                            isolated_subscription_tasks.push(get_runtime().spawn(
-                                                run_market_data_stream(MarketDataStreamContext {
-                                                    market_data_stream: market_data_stream.clone(),
-                                                    market_data_client: market_data_client.clone(),
-                                                    sender: sender.clone(),
-                                                    request: isolated_request,
-                                                    kind: isolated_kind,
-                                                    config: config.clone(),
-                                                    historical_request_limiter:
-                                                        historical_request_limiter.clone(),
-                                                    instrument_metadata:
-                                                        instrument_metadata.clone(),
-                                                    task_key: isolated_task_key,
-                                                    initial_bar_watermarks: isolated_watermarks,
-                                                    bar_continuity_key_overrides:
-                                                        isolated_continuity_keys,
-                                                    reconnect_attempt: Arc::new(AtomicU32::new(0)),
-                                                    message_sequence:
-                                                        message_sequence_counter.clone(),
-                                                }),
-                                            ));
                                         }
                                         if instrument_count == 0 {
+                                            stream_health.mark_terminal(&task_key);
                                             isolated_subscription_tasks.wait_for_completion().await;
-                                            return;
+                                            return Err(StreamWorkerExit::Permanent(
+                                                "all instruments in the stream group were rejected"
+                                                    .to_string(),
+                                            ));
                                         }
-                                        recover_pending_bars_after_stream_ack(
+                                        let recovery_ready = recover_pending_bars_after_stream_ack(
                                             &mut pending_recovery,
-                                            &mut last_reconnect_catch_up,
                                             &task_key,
                                             &kind,
                                             &mut market_data_client,
+                                            &bar_watermarks,
                                             &bar_continuity_key_overrides,
                                             timestamp_mode,
                                             &sender,
@@ -1577,17 +2481,28 @@ fn run_market_data_stream_worker(
                                             &config,
                                             &historical_request_limiter,
                                             &instrument_metadata,
+                                            &stream_health,
                                             attempt,
+                                            !has_permanent_bar_rejection,
                                         )
                                         .await;
+                                        if !recovery_ready {
+                                            stream_health.mark_reconnecting(&task_key);
+                                            break ReconnectTrigger::RecoveryFailed;
+                                        }
+                                        if !has_permanent_bar_rejection {
+                                            stream_health.mark_operational(&task_key);
+                                        }
                                         subscription_ready = true;
                                         drain_pre_ack_messages(
                                             &mut pre_ack_messages,
                                             &sender,
                                             &kind,
                                             &instrument_metadata,
+                                            &bar_watermarks,
                                             timestamp_mode,
                                             &task_key,
+                                            &stream_health,
                                             &bar_continuity_key_overrides,
                                             &mut continuity,
                                             &mut attempt,
@@ -1595,52 +2510,64 @@ fn run_market_data_stream_worker(
                                         reconnect_attempt.store(attempt, Ordering::Relaxed);
                                         continue;
                                     }
-                                    let reason = rejection.reason;
+                                    let reason = rejection.reason.clone();
                                     tracing::error!(
                                         task_key = task_key.as_str(),
                                         %reason,
                                         "T-Bank rejected market data subscription"
                                     );
-                                    trace_market_data_stream_event(MarketDataStreamEventInput {
-                                        stage: "subscription_rejected",
-                                        task_key: &task_key,
-                                        stream_kind: kind.name(),
-                                        instrument_count,
-                                        status: None,
-                                        reason: reason.clone(),
-                                        delay_ms: None,
-                                        attempt,
-                                    });
+                                    trace_market_data_stream_event_if_current(
+                                        &stream_health,
+                                        MarketDataStreamEventInput {
+                                            stage: "subscription_rejected",
+                                            task_key: &task_key,
+                                            stream_kind: kind.name(),
+                                            instrument_count,
+                                            status: None,
+                                            reason: reason.clone(),
+                                            delay_ms: None,
+                                            attempt,
+                                        },
+                                    );
                                     if !rejection.retryable {
+                                        mark_permanent_bar_rejections(
+                                            &task_key,
+                                            &kind,
+                                            &rejection,
+                                            &bar_continuity_key_overrides,
+                                            &stream_health,
+                                        );
                                         tracing::error!(
                                             task_key = task_key.as_str(),
                                             %reason,
                                             "T-Bank market data subscription was permanently rejected"
                                         );
-                                        trace_market_data_stream_event(
+                                        trace_market_data_stream_event_if_current(
+                                            &stream_health,
                                             MarketDataStreamEventInput {
                                                 stage: "subscription_permanently_rejected",
                                                 task_key: &task_key,
                                                 stream_kind: kind.name(),
                                                 instrument_count,
                                                 status: None,
-                                                reason,
+                                                reason: reason.clone(),
                                                 delay_ms: None,
                                                 attempt,
                                             },
                                         );
                                         isolated_subscription_tasks.wait_for_completion().await;
-                                        return;
+                                        stream_health.mark_terminal(&task_key);
+                                        return Err(StreamWorkerExit::Permanent(reason));
                                     }
                                     break ReconnectTrigger::SubscriptionRejected;
                                 }
                                 if subscription_ack {
-                                    recover_pending_bars_after_stream_ack(
+                                    let recovery_ready = recover_pending_bars_after_stream_ack(
                                         &mut pending_recovery,
-                                        &mut last_reconnect_catch_up,
                                         &task_key,
                                         &kind,
                                         &mut market_data_client,
+                                        &bar_watermarks,
                                         &bar_continuity_key_overrides,
                                         timestamp_mode,
                                         &sender,
@@ -1649,17 +2576,28 @@ fn run_market_data_stream_worker(
                                         &config,
                                         &historical_request_limiter,
                                         &instrument_metadata,
+                                        &stream_health,
                                         attempt,
+                                        !has_permanent_bar_rejection,
                                     )
                                     .await;
+                                    if !recovery_ready {
+                                        stream_health.mark_reconnecting(&task_key);
+                                        break ReconnectTrigger::RecoveryFailed;
+                                    }
+                                    if !has_permanent_bar_rejection {
+                                        stream_health.mark_operational(&task_key);
+                                    }
                                     subscription_ready = true;
                                     drain_pre_ack_messages(
                                         &mut pre_ack_messages,
                                         &sender,
                                         &kind,
                                         &instrument_metadata,
+                                        &bar_watermarks,
                                         timestamp_mode,
                                         &task_key,
+                                        &stream_health,
                                         &bar_continuity_key_overrides,
                                         &mut continuity,
                                         &mut attempt,
@@ -1677,7 +2615,8 @@ fn run_market_data_stream_worker(
                                                 buffered = pre_ack_messages.len(),
                                                 "T-Bank pre-ack market data buffer is full"
                                             );
-                                            trace_market_data_stream_event(
+                                            trace_market_data_stream_event_if_current(
+                                                &stream_health,
                                                 MarketDataStreamEventInput {
                                                     stage: "pre_ack_buffer_overflow",
                                                     task_key: &task_key,
@@ -1692,7 +2631,8 @@ fn run_market_data_stream_worker(
                                             break ReconnectTrigger::PreAckBufferOverflow;
                                         }
                                         if pre_ack_messages.is_empty() {
-                                            trace_market_data_stream_event(
+                                            trace_market_data_stream_event_if_current(
+                                                &stream_health,
                                                 MarketDataStreamEventInput {
                                                     stage: "message_buffered_before_subscription_ack",
                                                     task_key: &task_key,
@@ -1719,9 +2659,11 @@ fn run_market_data_stream_worker(
                                     response,
                                     &kind,
                                     &instrument_metadata,
+                                    &bar_watermarks,
                                     timestamp_mode,
                                     received_at,
                                     &task_key,
+                                    &stream_health,
                                     &bar_continuity_key_overrides,
                                     &mut continuity,
                                     &mut attempt,
@@ -1730,55 +2672,64 @@ fn run_market_data_stream_worker(
                                 reconnect_attempt.store(attempt, Ordering::Relaxed);
                             }
                             StreamMessageOutcome::Closed => {
+                                stream_health.mark_reconnecting(&task_key);
                                 tracing::warn!(
                                     task_key = task_key.as_str(),
                                     "T-Bank market data stream closed by server"
                                 );
-                                trace_market_data_stream_event(MarketDataStreamEventInput {
-                                    stage: "stream_closed_by_server",
-                                    task_key: &task_key,
-                                    stream_kind: kind.name(),
-                                    instrument_count,
-                                    status: None,
-                                    reason: "server closed stream".to_string(),
-                                    delay_ms: None,
-                                    attempt,
-                                });
+                                trace_market_data_stream_event_if_current(
+                                    &stream_health,
+                                    MarketDataStreamEventInput {
+                                        stage: "stream_closed_by_server",
+                                        task_key: &task_key,
+                                        stream_kind: kind.name(),
+                                        instrument_count,
+                                        status: None,
+                                        reason: "server closed stream".to_string(),
+                                        delay_ms: None,
+                                        attempt,
+                                    },
+                                );
                                 break ReconnectTrigger::StreamClosed;
                             }
                             StreamMessageOutcome::Error(error) => {
-                                let retryable = retryable_stream_status(&error);
+                                stream_health.mark_reconnecting(&task_key);
                                 tracing::warn!(
                                     %error,
                                     task_key = task_key.as_str(),
                                     "T-Bank market data stream closed with error"
                                 );
-                                trace_market_data_stream_event(MarketDataStreamEventInput {
-                                    stage: "stream_closed_error",
-                                    task_key: &task_key,
-                                    stream_kind: kind.name(),
-                                    instrument_count,
-                                    status: Some(format!("{:?}", error.code())),
-                                    reason: error.to_string(),
-                                    delay_ms: None,
-                                    attempt,
-                                });
-                                if retryable {
-                                    match reconnect_market_data_clients(&config).await {
-                                        Ok((next_stream, next_data)) => {
-                                            market_data_stream = next_stream;
-                                            market_data_client = next_data;
-                                        }
-                                        Err(reconnect_error) => tracing::warn!(
-                                            %reconnect_error,
-                                            task_key = task_key.as_str(),
-                                            "failed to recreate T-Bank market data clients"
-                                        ),
+                                trace_market_data_stream_event_if_current(
+                                    &stream_health,
+                                    MarketDataStreamEventInput {
+                                        stage: "stream_closed_error",
+                                        task_key: &task_key,
+                                        stream_kind: kind.name(),
+                                        instrument_count,
+                                        status: Some(format!("{:?}", error.code())),
+                                        reason: error.to_string(),
+                                        delay_ms: None,
+                                        attempt,
+                                    },
+                                );
+                                if let Some(exit) = permanent_stream_status(&error) {
+                                    return Err(exit);
+                                }
+                                match reconnect_market_data_clients(&config).await {
+                                    Ok((next_stream, next_data)) => {
+                                        market_data_stream = next_stream;
+                                        market_data_client = next_data;
                                     }
+                                    Err(reconnect_error) => tracing::warn!(
+                                        %reconnect_error,
+                                        task_key = task_key.as_str(),
+                                        "failed to recreate T-Bank market data clients"
+                                    ),
                                 }
                                 break ReconnectTrigger::StreamError;
                             }
                             StreamMessageOutcome::IdleTimeout => {
+                                stream_health.mark_reconnecting(&task_key);
                                 let reason = market_data_stream_idle_timeout_reason(
                                     config.market_data_stream_idle_timeout,
                                 );
@@ -1787,16 +2738,19 @@ fn run_market_data_stream_worker(
                                     timeout_ms = config.market_data_stream_idle_timeout.as_millis(),
                                     "T-Bank market data stream idle timeout"
                                 );
-                                trace_market_data_stream_event(MarketDataStreamEventInput {
-                                    stage: "stream_idle_timeout",
-                                    task_key: &task_key,
-                                    stream_kind: kind.name(),
-                                    instrument_count,
-                                    status: None,
-                                    reason: reason.clone(),
-                                    delay_ms: None,
-                                    attempt,
-                                });
+                                trace_market_data_stream_event_if_current(
+                                    &stream_health,
+                                    MarketDataStreamEventInput {
+                                        stage: "stream_idle_timeout",
+                                        task_key: &task_key,
+                                        stream_kind: kind.name(),
+                                        instrument_count,
+                                        status: None,
+                                        reason: reason.clone(),
+                                        delay_ms: None,
+                                        attempt,
+                                    },
+                                );
                                 let trigger = match reconnect_market_data_clients(&config).await {
                                     Ok((next_stream, next_data)) => {
                                         market_data_stream = next_stream;
@@ -1818,42 +2772,47 @@ fn run_market_data_stream_worker(
                     }
                 }
                 Err(error) => {
-                    let retryable = retryable_stream_status(&error);
-                    let error_text = error.to_string();
+                    stream_health.mark_reconnecting(&task_key);
                     tracing::warn!(
                         %error,
                         task_key = task_key.as_str(),
                         "failed to open T-Bank market data stream"
                     );
-                    trace_market_data_stream_event(MarketDataStreamEventInput {
-                        stage: "open_failed",
-                        task_key: &task_key,
-                        stream_kind: kind.name(),
-                        instrument_count,
-                        status: Some(format!("{:?}", error.code())),
-                        reason: error.to_string(),
-                        delay_ms: None,
-                        attempt,
-                    });
-                    if retryable || retryable_stream_error_text(&error_text) {
-                        match reconnect_market_data_clients(&config).await {
-                            Ok((next_stream, next_data)) => {
-                                market_data_stream = next_stream;
-                                market_data_client = next_data;
-                            }
-                            Err(reconnect_error) => tracing::warn!(
-                                %reconnect_error,
-                                task_key = task_key.as_str(),
-                                "failed to recreate T-Bank market data clients after open failure"
-                            ),
+                    trace_market_data_stream_event_if_current(
+                        &stream_health,
+                        MarketDataStreamEventInput {
+                            stage: "open_failed",
+                            task_key: &task_key,
+                            stream_kind: kind.name(),
+                            instrument_count,
+                            status: Some(format!("{:?}", error.code())),
+                            reason: error.to_string(),
+                            delay_ms: None,
+                            attempt,
+                        },
+                    );
+                    if let Some(exit) = permanent_stream_status(&error) {
+                        return Err(exit);
+                    }
+                    match reconnect_market_data_clients(&config).await {
+                        Ok((next_stream, next_data)) => {
+                            market_data_stream = next_stream;
+                            market_data_client = next_data;
                         }
+                        Err(reconnect_error) => tracing::warn!(
+                            %reconnect_error,
+                            task_key = task_key.as_str(),
+                            "failed to recreate T-Bank market data clients after open failure"
+                        ),
                     }
                     ReconnectTrigger::OpenFailed
                 }
             };
-            if reconnect_catch_up_due(last_reconnect_catch_up, Instant::now()) {
-                pending_recovery = Some(RecoveryCause::Reconnect);
-            }
+            // Every new broker acknowledgement must cross the continuity barrier. The previous
+            // interval gate allowed a fast disconnect/reconnect to publish live bars without
+            // checking the gap; the shared recovery coordinator already bounds duplicate work.
+            stream_health.mark_reconnecting(&task_key);
+            pending_recovery = Some(RecoveryCause::Reconnect);
             reconnect_attempt.store(attempt, Ordering::Relaxed);
             if !wait_for_market_data_reconnect(
                 &task_key,
@@ -1861,13 +2820,54 @@ fn run_market_data_stream_worker(
                 instrument_count,
                 &config,
                 &reconnect_attempt,
+                &stream_health,
                 "reopening T-Bank market data stream after disconnect",
                 "stream_reconnect_exhausted",
             )
             .await
             {
-                isolated_subscription_tasks.wait_for_completion().await;
-                return;
+                // Retryable instruments removed from `request` and `kind` are owned by the
+                // isolated supervisors. Reconnect-budget exhaustion is recoverable for the
+                // parent, so keep those supervisors alive while this owner re-arms its probe.
+                // `AbortTasksOnDrop` still cancels them when the owner is actually torn down.
+                let catch_up = reconnect_catch_up_bars(
+                    RecoveryCause::Reconnect,
+                    &task_key,
+                    &kind,
+                    &mut market_data_client,
+                    &bar_watermarks,
+                    &bar_continuity_key_overrides,
+                    timestamp_mode,
+                    &sender,
+                    &mut continuity,
+                    instrument_count,
+                    &config,
+                    &historical_request_limiter,
+                    &instrument_metadata,
+                    &stream_health,
+                    false,
+                )
+                .await;
+                tracing::warn!(
+                    task_key = task_key.as_str(),
+                    checked = catch_up.checked,
+                    backfilled = catch_up.backfilled,
+                    failed = catch_up.failed,
+                    "T-Bank reconnect budget exhausted; bounded historical recovery completed before probe"
+                );
+                tokio::time::sleep(crate::grpc::retry::backoff_duration(
+                    &config.reconnect_policy,
+                    config.max_market_data_reconnect_attempts,
+                ))
+                .await;
+                if let Ok((next_stream, next_data)) = reconnect_market_data_clients(&config).await {
+                    market_data_stream = next_stream;
+                    market_data_client = next_data;
+                }
+                reconnect_attempt.store(0, Ordering::Release);
+                attempt = 0;
+                pending_recovery = Some(RecoveryCause::Reconnect);
+                continue;
             }
             attempt = reconnect_attempt.load(Ordering::Relaxed);
         }
@@ -1880,6 +2880,7 @@ async fn wait_for_market_data_reconnect(
     instrument_count: usize,
     config: &TbankDataClientConfig,
     attempt: &AtomicU32,
+    stream_health: &MarketDataStreamHealth,
     reason: &str,
     exhausted_stage: &str,
 ) -> bool {
@@ -1895,29 +2896,35 @@ async fn wait_for_market_data_reconnect(
             attempt = next_attempt,
             "T-Bank market data reconnect retry budget exhausted"
         );
-        trace_market_data_stream_event(MarketDataStreamEventInput {
-            stage: exhausted_stage,
+        trace_market_data_stream_event_if_current(
+            stream_health,
+            MarketDataStreamEventInput {
+                stage: exhausted_stage,
+                task_key,
+                stream_kind: kind.name(),
+                instrument_count,
+                status: None,
+                reason: "market data reconnect retry budget exhausted".to_string(),
+                delay_ms: None,
+                attempt: next_attempt,
+            },
+        );
+        return false;
+    };
+    attempt.store(next_attempt, Ordering::Relaxed);
+    trace_market_data_stream_event_if_current(
+        stream_health,
+        MarketDataStreamEventInput {
+            stage: "reconnect_scheduled",
             task_key,
             stream_kind: kind.name(),
             instrument_count,
             status: None,
-            reason: "market data reconnect retry budget exhausted".to_string(),
-            delay_ms: None,
-            attempt: next_attempt,
-        });
-        return false;
-    };
-    attempt.store(next_attempt, Ordering::Relaxed);
-    trace_market_data_stream_event(MarketDataStreamEventInput {
-        stage: "reconnect_scheduled",
-        task_key,
-        stream_kind: kind.name(),
-        instrument_count,
-        status: None,
-        reason: reason.to_string(),
-        delay_ms: Some(schedule.delay.as_millis()),
-        attempt: schedule.attempt,
-    });
+            reason: reason.to_string(),
+            delay_ms: Some(schedule.delay.as_millis()),
+            attempt: schedule.attempt,
+        },
+    );
     tracing::warn!(
         task_key,
         delay_ms = schedule.delay.as_millis(),
@@ -1929,19 +2936,8 @@ async fn wait_for_market_data_reconnect(
     true
 }
 
-fn reconnect_catch_up_due(last_attempt: Option<Instant>, now: Instant) -> bool {
-    match last_attempt {
-        Some(last_attempt) => now.duration_since(last_attempt) >= RECONNECT_CATCH_UP_INTERVAL,
-        None => true,
-    }
-}
-
-fn reset_reconnect_attempt_after_usable_stream_message(
-    response: &MarketDataResponse,
-    kind: &TbankStreamKind,
-    attempt: &mut u32,
-) -> bool {
-    if !is_usable_market_data_response(response, kind) {
+fn reset_reconnect_attempt_if_usable(usable: bool, attempt: &mut u32) -> bool {
+    if !usable {
         return false;
     }
     *attempt = 0;
@@ -1954,11 +2950,18 @@ fn is_usable_market_data_response(response: &MarketDataResponse, kind: &TbankStr
             Some(market_data_response::Payload::Candle(candle)),
             TbankStreamKind::Bars { bar_types },
         ) => bar_types.contains_key(&candle.instrument_uid),
-        (Some(market_data_response::Payload::Trade(_)), TbankStreamKind::Trades { .. }) => true,
         (
-            Some(market_data_response::Payload::Orderbook(_)),
-            TbankStreamKind::Quotes { .. } | TbankStreamKind::Depth10 { .. },
-        ) => true,
+            Some(market_data_response::Payload::Trade(trade)),
+            TbankStreamKind::Trades { instrument_uid, .. },
+        ) => trade.instrument_uid == *instrument_uid,
+        (
+            Some(market_data_response::Payload::Orderbook(orderbook)),
+            TbankStreamKind::Quotes { instrument_ids },
+        ) => instrument_ids.contains_key(&orderbook.instrument_uid),
+        (
+            Some(market_data_response::Payload::Orderbook(orderbook)),
+            TbankStreamKind::Depth10 { instrument_uid, .. },
+        ) => orderbook.instrument_uid == *instrument_uid,
         _ => false,
     }
 }
@@ -1982,10 +2985,10 @@ fn is_market_data_subscription_ack(response: &MarketDataResponse, kind: &TbankSt
 #[allow(clippy::too_many_arguments)]
 async fn recover_pending_bars_after_stream_ack(
     pending_recovery: &mut Option<RecoveryCause>,
-    last_reconnect_catch_up: &mut Option<Instant>,
     task_key: &str,
     kind: &TbankStreamKind,
     market_data_client: &mut MarketDataClient,
+    bar_watermarks: &SharedBarWatermarks,
     bar_continuity_key_overrides: &HashMap<String, String>,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
@@ -1994,27 +2997,52 @@ async fn recover_pending_bars_after_stream_ack(
     config: &TbankDataClientConfig,
     historical_request_limiter: &HistoricalRequestLimiter,
     instrument_metadata: &SharedInstrumentMetadata,
+    stream_health: &MarketDataStreamHealth,
     attempt: u32,
-) {
-    trace_market_data_stream_event(MarketDataStreamEventInput {
-        stage: "stream_ready",
-        task_key,
-        stream_kind: kind.name(),
-        instrument_count,
-        status: None,
-        reason: "broker acknowledged the active market data subscription".to_string(),
-        delay_ms: None,
-        attempt,
-    });
+    publish_stream_ready: bool,
+) -> bool {
+    if !stream_health.is_current_task_key(task_key) {
+        return true;
+    }
+    trace_market_data_stream_event_if_current(
+        stream_health,
+        MarketDataStreamEventInput {
+            stage: "stream_subscription_acked",
+            task_key,
+            stream_kind: kind.name(),
+            instrument_count,
+            status: None,
+            reason: "broker acknowledged the active market data subscription".to_string(),
+            delay_ms: None,
+            attempt,
+        },
+    );
 
     let Some(cause) = pending_recovery.take() else {
-        return;
+        if publish_stream_ready {
+            trace_market_data_stream_event_if_current(
+                stream_health,
+                MarketDataStreamEventInput {
+                    stage: "stream_ready",
+                    task_key,
+                    stream_kind: kind.name(),
+                    instrument_count,
+                    status: None,
+                    reason: "broker acknowledgement did not require historical recovery"
+                        .to_string(),
+                    delay_ms: None,
+                    attempt,
+                },
+            );
+        }
+        return true;
     };
     let catch_up = reconnect_catch_up_bars(
         cause,
         task_key,
         kind,
         market_data_client,
+        bar_watermarks,
         bar_continuity_key_overrides,
         timestamp_mode,
         sender,
@@ -2023,10 +3051,13 @@ async fn recover_pending_bars_after_stream_ack(
         config,
         historical_request_limiter,
         instrument_metadata,
+        stream_health,
+        true,
     )
     .await;
-    *last_reconnect_catch_up = Some(Instant::now());
-
+    if !stream_health.is_current_task_key(task_key) {
+        return true;
+    }
     if catch_up.backfilled > 0 {
         tracing::info!(
             task_key,
@@ -2036,13 +3067,44 @@ async fn recover_pending_bars_after_stream_ack(
         );
     }
     if catch_up.failed > 0 {
+        trace_market_data_stream_event_if_current(
+            stream_health,
+            MarketDataStreamEventInput {
+                stage: "stream_recovery_failed",
+                task_key,
+                stream_kind: kind.name(),
+                instrument_count,
+                status: None,
+                reason: format!("{} instruments failed historical recovery", catch_up.failed),
+                delay_ms: None,
+                attempt,
+            },
+        );
         tracing::warn!(
             task_key,
             recovery_cause = cause.as_str(),
             failed = catch_up.failed,
             "T-Bank stream remains active while incomplete candle recovery waits for a future reconnect"
         );
+        return false;
     }
+    if publish_stream_ready {
+        trace_market_data_stream_event_if_current(
+            stream_health,
+            MarketDataStreamEventInput {
+                stage: "stream_ready",
+                task_key,
+                stream_kind: kind.name(),
+                instrument_count,
+                status: None,
+                reason: "subscription gap recovery completed after broker acknowledgement"
+                    .to_string(),
+                delay_ms: None,
+                attempt,
+            },
+        );
+    }
+    true
 }
 
 fn bar_continuity_key(group: &str, instrument_uid: &str) -> String {
@@ -2058,6 +3120,48 @@ fn bar_continuity_key_with_overrides(
         .get(instrument_uid)
         .cloned()
         .unwrap_or_else(|| bar_continuity_key(group, instrument_uid))
+}
+
+fn mark_permanent_bar_rejections(
+    group: &str,
+    kind: &TbankStreamKind,
+    rejection: &SubscriptionAckRejection,
+    bar_continuity_key_overrides: &HashMap<String, String>,
+    stream_health: &MarketDataStreamHealth,
+) -> bool {
+    let TbankStreamKind::Bars { bar_types } = kind else {
+        return false;
+    };
+
+    let mut found = false;
+    for failure in rejection
+        .failures
+        .iter()
+        .filter(|failure| !failure.retryable)
+    {
+        if !bar_types.contains_key(&failure.instrument_uid) {
+            continue;
+        }
+        found = true;
+        stream_health.mark_non_operational(group);
+        let continuity_key = bar_continuity_key_with_overrides(
+            group,
+            &failure.instrument_uid,
+            bar_continuity_key_overrides,
+        );
+        publish_candle_readiness_if_current(
+            stream_health,
+            TbankCandleReadinessState::Failed,
+            &continuity_key,
+            &failure.instrument_uid,
+            None,
+            format!(
+                "T-Bank candle subscription permanently rejected: {}",
+                failure.reason
+            ),
+        );
+    }
+    found
 }
 
 fn latest_closed_minute_bar_ts_event(now: chrono::DateTime<Utc>) -> i128 {
@@ -2082,6 +3186,7 @@ enum ReconnectTrigger {
     IdleTimeout,
     IdleTimeoutReconnectFailed,
     PreAckBufferOverflow,
+    RecoveryFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2228,12 +3333,10 @@ fn isolated_retryable_bar_stream(
     parent_task_key: &str,
     instrument_uid: &str,
     bar_type: nautilus_model::data::BarType,
-    watermark: Option<i128>,
 ) -> (
     String,
     MarketDataServerSideStreamRequest,
     TbankStreamKind,
-    HashMap<String, i128>,
     HashMap<String, String>,
 ) {
     let task_key = format!("{parent_task_key}:retry:{instrument_uid}");
@@ -2253,14 +3356,11 @@ fn isolated_retryable_bar_stream(
     let kind = TbankStreamKind::Bars {
         bar_types: HashMap::from([(instrument_uid.to_string(), bar_type)]),
     };
-    let watermarks = watermark
-        .map(|watermark| HashMap::from([(instrument_uid.to_string(), watermark)]))
-        .unwrap_or_default();
     let continuity_keys = HashMap::from([(
         instrument_uid.to_string(),
         bar_continuity_key(parent_task_key, instrument_uid),
     )]);
-    (task_key, request, kind, watermarks, continuity_keys)
+    (task_key, request, kind, continuity_keys)
 }
 
 fn subscription_failure(instrument_uid: &str, status: i32) -> Option<SubscriptionFailure> {
@@ -2309,6 +3409,7 @@ async fn reconnect_catch_up_bars(
     group: &str,
     kind: &TbankStreamKind,
     market_data_client: &mut MarketDataClient,
+    bar_watermarks: &SharedBarWatermarks,
     bar_continuity_key_overrides: &HashMap<String, String>,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
@@ -2317,7 +3418,13 @@ async fn reconnect_catch_up_bars(
     config: &TbankDataClientConfig,
     request_limiter: &HistoricalRequestLimiter,
     instrument_metadata: &SharedInstrumentMetadata,
+    stream_health: &MarketDataStreamHealth,
+    publish_ready: bool,
 ) -> ReconnectCatchUpOutcome {
+    if !stream_health.is_current_task_key(group) {
+        return ReconnectCatchUpOutcome::default();
+    }
+
     let TbankStreamKind::Bars { bar_types } = kind else {
         return ReconnectCatchUpOutcome::default();
     };
@@ -2350,39 +3457,48 @@ async fn reconnect_catch_up_bars(
     jobs.sort_by(|left, right| left.0.cmp(&right.0));
     already_current.sort_by(|left, right| left.0.cmp(&right.0));
     if jobs.is_empty() && already_current.is_empty() {
+        // A missing baseline means there is no bounded gap to recover. Keep the transport
+        // lifecycle independent from the first observation; the initial live candle or the
+        // periodic candle poll establishes the baseline for a later reconnect recovery.
         return ReconnectCatchUpOutcome::default();
     }
 
-    trace_market_data_stream_event(MarketDataStreamEventInput {
-        stage: cause.started_stage(),
-        task_key: group,
-        stream_kind: kind.name(),
-        instrument_count,
-        status: None,
-        reason: format!(
-            "recovering {} instruments via GetCandles after {}",
-            jobs.len(),
-            cause.as_str()
-        ),
-        delay_ms: None,
-        attempt: 0,
-    });
+    trace_market_data_stream_event_if_current(
+        stream_health,
+        MarketDataStreamEventInput {
+            stage: cause.started_stage(),
+            task_key: group,
+            stream_kind: kind.name(),
+            instrument_count,
+            status: None,
+            reason: format!(
+                "recovering {} instruments via GetCandles after {}",
+                jobs.len(),
+                cause.as_str()
+            ),
+            delay_ms: None,
+            attempt: 0,
+        },
+    );
 
     let mut outcome = ReconnectCatchUpOutcome {
         ..ReconnectCatchUpOutcome::default()
     };
     for (instrument_uid, continuity_key) in already_current {
         outcome.checked += 1;
-        publish_candle_readiness(
-            TbankCandleReadinessState::Ready,
-            &continuity_key,
-            &instrument_uid,
-            Some(to_ts_event),
-            format!(
-                "{} candle continuity already covers the latest closed minute",
-                cause.as_str()
-            ),
-        );
+        if publish_ready {
+            publish_candle_readiness_if_current(
+                stream_health,
+                TbankCandleReadinessState::Ready,
+                &continuity_key,
+                &instrument_uid,
+                Some(to_ts_event),
+                format!(
+                    "{} candle continuity already covers the latest closed minute",
+                    cause.as_str()
+                ),
+            );
+        }
     }
     let mut backfill = BackfillCoordinator {
         market_data_client: market_data_client.clone(),
@@ -2396,47 +3512,61 @@ async fn reconnect_catch_up_bars(
     };
 
     for (instrument_uid, continuity_key, bar_type, from_ts_event, to_ts_event) in jobs {
-        publish_candle_readiness(
+        publish_candle_readiness_if_current(
+            stream_health,
             TbankCandleReadinessState::Recovering,
             &continuity_key,
             &instrument_uid,
             None,
             format!("{} GetCandles recovery started", cause.as_str()),
         );
-        match backfill
+        let recovery = backfill
             .recover_range(
                 &instrument_uid,
                 bar_type,
                 from_ts_event,
                 to_ts_event,
-                sender,
+                |bars| {
+                    publish_recovery_batch_if_current(stream_health, group, sender, bars, |bars| {
+                        let tracker = continuity.entry(instrument_uid.clone()).or_default();
+                        for bar in bars {
+                            let ts_event = i128::from(bar.ts_event.as_u64());
+                            tracker.record_backfilled_bar(ts_event);
+                            record_bar_watermark(bar_watermarks, bar_type, ts_event);
+                        }
+                        tracker.record_recovered_through(to_ts_event);
+                        record_bar_watermark(bar_watermarks, bar_type, to_ts_event);
+                    })
+                },
             )
-            .await
-        {
-            Ok(backfilled_ts) => {
+            .await;
+        if !stream_health.is_current_task_key(group) {
+            return outcome;
+        }
+        match recovery {
+            Ok(RecoveryRangeResult::Published(backfilled_ts)) => {
                 outcome.checked += 1;
-                if let Some(tracker) = continuity.get_mut(&instrument_uid) {
-                    for ts_event in &backfilled_ts {
-                        tracker.record_backfilled_bar(*ts_event);
-                    }
-                    tracker.record_recovered_through(to_ts_event);
-                }
-                publish_candle_readiness(
-                    TbankCandleReadinessState::Ready,
-                    &continuity_key,
-                    &instrument_uid,
-                    Some(to_ts_event),
-                    format!(
-                        "{} GetCandles recovery checked through the latest closed minute and published {} bars",
-                        cause.as_str(),
-                        backfilled_ts.len()
-                    ),
-                );
                 outcome.backfilled += backfilled_ts.len();
+                if publish_ready {
+                    publish_candle_readiness_if_current(
+                        stream_health,
+                        TbankCandleReadinessState::Ready,
+                        &continuity_key,
+                        &instrument_uid,
+                        Some(to_ts_event),
+                        format!(
+                            "{} GetCandles recovery checked through the latest closed minute and published {} bars",
+                            cause.as_str(),
+                            backfilled_ts.len()
+                        ),
+                    );
+                }
             }
+            Ok(RecoveryRangeResult::Superseded) => return outcome,
             Err(error) => {
                 outcome.failed += 1;
-                publish_candle_readiness(
+                publish_candle_readiness_if_current(
+                    stream_health,
                     TbankCandleReadinessState::Failed,
                     &continuity_key,
                     &instrument_uid,
@@ -2456,19 +3586,22 @@ async fn reconnect_catch_up_bars(
     }
     *market_data_client = backfill.market_data_client;
 
-    trace_market_data_stream_event(MarketDataStreamEventInput {
-        stage: cause.finished_stage(),
-        task_key: group,
-        stream_kind: kind.name(),
-        instrument_count,
-        status: None,
-        reason: format!(
-            "checked {} instruments and backfilled {} bars via GetCandles",
-            outcome.checked, outcome.backfilled
-        ),
-        delay_ms: None,
-        attempt: 0,
-    });
+    trace_market_data_stream_event_if_current(
+        stream_health,
+        MarketDataStreamEventInput {
+            stage: cause.finished_stage(),
+            task_key: group,
+            stream_kind: kind.name(),
+            instrument_count,
+            status: None,
+            reason: format!(
+                "checked {} instruments and backfilled {} bars via GetCandles",
+                outcome.checked, outcome.backfilled
+            ),
+            delay_ms: None,
+            attempt: 0,
+        },
+    );
 
     outcome
 }
@@ -2513,7 +3646,10 @@ struct MarketDataStreamEventInput<'a> {
     attempt: u32,
 }
 
-fn trace_market_data_stream_event(input: MarketDataStreamEventInput<'_>) {
+fn trace_market_data_stream_event(
+    input: MarketDataStreamEventInput<'_>,
+    readiness_ids: Vec<String>,
+) {
     tracing::info!(
         stage = input.stage,
         task_key = input.task_key,
@@ -2525,14 +3661,33 @@ fn trace_market_data_stream_event(input: MarketDataStreamEventInput<'_>) {
         attempt = input.attempt,
         "T-Bank market data stream transition"
     );
+    let stream_id = logical_stream_id(input.task_key);
+    if input.stage == "stream_snapshot_replaced" {
+        publish_market_data_event(TbankMarketDataEvent::StreamRetired {
+            stream_id,
+            readiness_ids,
+            reason: input.reason,
+        });
+        return;
+    }
     if let Some(state) = TbankMarketDataStreamState::from_stage(input.stage) {
-        publish_market_data_stream_event(TbankMarketDataStreamEvent {
+        publish_market_data_event(TbankMarketDataEvent::StreamState {
+            stream_id,
             state,
-            stage: input.stage.to_string(),
-            task_key: input.task_key.to_string(),
+            readiness_ids,
             reason: input.reason,
         });
     }
+}
+
+fn trace_market_data_stream_event_if_current(
+    stream_health: &MarketDataStreamHealth,
+    input: MarketDataStreamEventInput<'_>,
+) {
+    let task_key = input.task_key.to_string();
+    stream_health.with_current_task_key_and_readiness(&task_key, |readiness_ids| {
+        trace_market_data_stream_event(input, readiness_ids);
+    });
 }
 
 fn publish_candle_readiness(
@@ -2542,15 +3697,65 @@ fn publish_candle_readiness(
     ready_through: Option<i128>,
     reason: String,
 ) {
-    publish_candle_readiness_event(TbankCandleReadinessEvent {
-        state,
-        task_key: task_key.to_string(),
+    publish_market_data_event(TbankMarketDataEvent::CandleReadiness {
+        readiness_id: logical_readiness_id(task_key),
         instrument_uid: instrument_uid.to_string(),
+        state,
         ready_through: ready_through
             .and_then(|value| u64::try_from(value).ok())
             .map(UnixNanos::from),
         reason,
     });
+}
+
+fn publish_candle_readiness_if_current(
+    stream_health: &MarketDataStreamHealth,
+    state: TbankCandleReadinessState,
+    task_key: &str,
+    instrument_uid: &str,
+    ready_through: Option<i128>,
+    reason: String,
+) {
+    let task_key_copy = task_key.to_string();
+    stream_health.with_current_task_key(&task_key_copy, || {
+        publish_candle_readiness(state, task_key, instrument_uid, ready_through, reason);
+    });
+}
+
+fn logical_readiness_id(task_key: &str) -> String {
+    logical_stream_id(task_key)
+}
+
+fn logical_stream_id(task_key: &str) -> String {
+    for prefix in ["bars:generation:", "quotes:generation:"] {
+        if let Some(rest) = task_key.strip_prefix(prefix) {
+            let Some((_, logical_suffix)) = rest.split_once(':') else {
+                break;
+            };
+            let logical_prefix = prefix
+                .strip_suffix("generation:")
+                .expect("generation-qualified stream prefix");
+            return format!("{logical_prefix}{logical_suffix}");
+        }
+    }
+    if let Some((logical_key, generation)) = task_key.rsplit_once(":generation:")
+        && !logical_key.is_empty()
+        && !generation.is_empty()
+        && generation
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return logical_key.to_string();
+    }
+    task_key.to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingLiveBar {
+    instrument_uid: String,
+    bar_type: BarType,
+    ts_event: i128,
+    establishes_initial_baseline: bool,
 }
 
 fn filter_market_data_response_for_continuity(
@@ -2559,16 +3764,17 @@ fn filter_market_data_response_for_continuity(
     group: &str,
     bar_continuity_key_overrides: &HashMap<String, String>,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
-    continuity: &mut HashMap<String, BarContinuityTracker>,
-) -> Option<MarketDataResponse> {
+    bar_watermarks: &SharedBarWatermarks,
+    continuity: &HashMap<String, BarContinuityTracker>,
+) -> Option<(MarketDataResponse, Option<PendingLiveBar>)> {
     let Some(market_data_response::Payload::Candle(candle)) = response.payload.as_ref() else {
-        return Some(response);
+        return Some((response, None));
     };
-    if !matches!(kind, TbankStreamKind::Bars { .. }) {
-        return Some(response);
-    }
-
+    let TbankStreamKind::Bars { bar_types } = kind else {
+        return Some((response, None));
+    };
     let instrument_uid = candle.instrument_uid.clone();
+    let bar_type = bar_types.get(&instrument_uid).copied()?;
     let continuity_key =
         bar_continuity_key_with_overrides(group, &instrument_uid, bar_continuity_key_overrides);
     let bar = match candle_to_bar(
@@ -2582,9 +3788,21 @@ fn filter_market_data_response_for_continuity(
             return None;
         }
     };
-    let tracker = continuity.entry(instrument_uid.clone()).or_default();
-    match tracker.observe_live_bar(bar.ts_event) {
-        BarContinuityDecision::Accepted => Some(response),
+    let decision = continuity
+        .get(&instrument_uid)
+        .map_or(BarContinuityDecision::Accepted, |tracker| {
+            tracker.classify_live_bar(bar.ts_event)
+        });
+    match decision {
+        BarContinuityDecision::Accepted => Some((
+            response,
+            Some(PendingLiveBar {
+                establishes_initial_baseline: !has_bar_watermark(bar_watermarks, bar_type),
+                instrument_uid,
+                bar_type,
+                ts_event: bar.ts_event,
+            }),
+        )),
         BarContinuityDecision::Duplicate => None,
     }
 }
@@ -2637,18 +3855,44 @@ impl TbankStreamKind {
     }
 }
 
+fn continuity_from_bar_watermarks(
+    kind: &TbankStreamKind,
+    watermarks: &HashMap<BarType, i128>,
+) -> HashMap<String, BarContinuityTracker> {
+    let TbankStreamKind::Bars { bar_types } = kind else {
+        return HashMap::new();
+    };
+    bar_types
+        .iter()
+        .filter_map(|(instrument_uid, bar_type)| {
+            watermarks.get(bar_type).copied().map(|watermark| {
+                (
+                    instrument_uid.clone(),
+                    BarContinuityTracker::from_seeded_bar(watermark),
+                )
+            })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_pre_ack_messages(
     messages: &mut VecDeque<(MarketDataResponse, UnixNanos, u64)>,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     kind: &TbankStreamKind,
     instrument_metadata: &SharedInstrumentMetadata,
+    bar_watermarks: &SharedBarWatermarks,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     task_key: &str,
+    stream_health: &MarketDataStreamHealth,
     bar_continuity_key_overrides: &HashMap<String, String>,
     continuity: &mut HashMap<String, BarContinuityTracker>,
     attempt: &mut u32,
 ) {
+    if !stream_health.is_current_task_key(task_key) {
+        messages.clear();
+        return;
+    }
     let buffered = messages.len();
     while let Some((response, received_at, message_sequence)) = messages.pop_front() {
         publish_ready_market_data_response(
@@ -2656,9 +3900,11 @@ fn drain_pre_ack_messages(
             response,
             kind,
             instrument_metadata,
+            bar_watermarks,
             timestamp_mode,
             received_at,
             task_key,
+            stream_health,
             bar_continuity_key_overrides,
             continuity,
             attempt,
@@ -2666,18 +3912,21 @@ fn drain_pre_ack_messages(
         );
     }
     if buffered > 0 {
-        trace_market_data_stream_event(MarketDataStreamEventInput {
-            stage: "pre_ack_buffer_drained",
-            task_key,
-            stream_kind: kind.name(),
-            instrument_count: kind.instrument_count(),
-            status: None,
-            reason: format!(
-                "published {buffered} buffered market data messages after acknowledgement"
-            ),
-            delay_ms: None,
-            attempt: *attempt,
-        });
+        trace_market_data_stream_event_if_current(
+            stream_health,
+            MarketDataStreamEventInput {
+                stage: "pre_ack_buffer_drained",
+                task_key,
+                stream_kind: kind.name(),
+                instrument_count: kind.instrument_count(),
+                status: None,
+                reason: format!(
+                    "published {buffered} buffered market data messages after acknowledgement"
+                ),
+                delay_ms: None,
+                attempt: *attempt,
+            },
+        );
     }
 }
 
@@ -2687,36 +3936,86 @@ fn publish_ready_market_data_response(
     response: MarketDataResponse,
     kind: &TbankStreamKind,
     instrument_metadata: &SharedInstrumentMetadata,
+    bar_watermarks: &SharedBarWatermarks,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     received_at: UnixNanos,
     task_key: &str,
+    stream_health: &MarketDataStreamHealth,
     bar_continuity_key_overrides: &HashMap<String, String>,
     continuity: &mut HashMap<String, BarContinuityTracker>,
     attempt: &mut u32,
     message_sequence: u64,
 ) {
-    let Some(response) = filter_market_data_response_for_continuity(
+    if !stream_health.is_current_task_key(task_key) {
+        return;
+    }
+    let Some((response, pending_live_bar)) = filter_market_data_response_for_continuity(
         response,
         kind,
         task_key,
         bar_continuity_key_overrides,
         timestamp_mode,
+        bar_watermarks,
         continuity,
     ) else {
         return;
     };
-    reset_reconnect_attempt_after_usable_stream_message(&response, kind, attempt);
-    if let Err(error) = publish_market_data_response(
-        sender,
-        response,
-        kind,
-        instrument_metadata,
-        timestamp_mode,
-        received_at,
-        message_sequence,
-    ) {
-        tracing::warn!(%error, task_key, "failed to publish T-Bank market data event");
+    let usable_stream_message = is_usable_market_data_response(&response, kind);
+    let published = stream_health.with_current_task_key_after_publish(
+        task_key,
+        || {
+            publish_market_data_response(
+                sender,
+                response,
+                kind,
+                instrument_metadata,
+                timestamp_mode,
+                received_at,
+                message_sequence,
+            )
+        },
+        || {
+            reset_reconnect_attempt_if_usable(usable_stream_message, attempt);
+            if let Some(pending_live_bar) = pending_live_bar.as_ref() {
+                commit_live_bar(
+                    bar_watermarks,
+                    continuity,
+                    &pending_live_bar.instrument_uid,
+                    pending_live_bar.bar_type,
+                    pending_live_bar.ts_event,
+                );
+            }
+        },
+    );
+    let published = match published {
+        Ok(published) => published,
+        Err(error) => {
+            tracing::warn!(%error, task_key, "failed to publish T-Bank market data event");
+            return;
+        }
+    };
+    if !published {
+        return;
     }
+    let Some(pending_live_bar) = pending_live_bar else {
+        return;
+    };
+    if !pending_live_bar.establishes_initial_baseline {
+        return;
+    }
+    let continuity_key = bar_continuity_key_with_overrides(
+        task_key,
+        &pending_live_bar.instrument_uid,
+        bar_continuity_key_overrides,
+    );
+    publish_candle_readiness_if_current(
+        stream_health,
+        TbankCandleReadinessState::Ready,
+        &continuity_key,
+        &pending_live_bar.instrument_uid,
+        Some(pending_live_bar.ts_event),
+        "first acknowledged live candle established the initial continuity baseline".to_string(),
+    );
 }
 
 fn publish_market_data_response(
@@ -2757,8 +4056,18 @@ fn publish_market_data_response(
         }
         (
             market_data_response::Payload::Trade(trade),
-            TbankStreamKind::Trades { instrument_id, .. },
+            TbankStreamKind::Trades {
+                instrument_id,
+                instrument_uid,
+            },
         ) => {
+            if trade.instrument_uid != *instrument_uid {
+                anyhow::bail!(
+                    "received trade for unexpected T-Bank stream instrument {}; expected {}",
+                    trade.instrument_uid,
+                    instrument_uid
+                );
+            }
             let metadata = market_data_metadata_for(
                 instrument_metadata,
                 &trade.instrument_uid,
@@ -2794,8 +4103,18 @@ fn publish_market_data_response(
         }
         (
             market_data_response::Payload::Orderbook(orderbook),
-            TbankStreamKind::Depth10 { instrument_id, .. },
+            TbankStreamKind::Depth10 {
+                instrument_id,
+                instrument_uid,
+            },
         ) => {
+            if orderbook.instrument_uid != *instrument_uid {
+                anyhow::bail!(
+                    "received order book for unexpected T-Bank stream instrument {}; expected {}",
+                    orderbook.instrument_uid,
+                    instrument_uid
+                );
+            }
             let metadata = market_data_metadata_for(
                 instrument_metadata,
                 &orderbook.instrument_uid,
@@ -2843,6 +4162,20 @@ fn instrument_stream_id(instrument_id: InstrumentId) -> String {
 
 fn stream_task_key(kind: &str, stream_id: &str, detail: impl std::fmt::Display) -> String {
     format!("{kind}:{stream_id}:{detail}")
+}
+
+fn stream_kind_from_task_key(task_key: &str) -> &'static str {
+    if task_key.starts_with("bars:") {
+        "bars"
+    } else if task_key.starts_with("quotes:") {
+        "quotes"
+    } else if task_key.starts_with("trades:") {
+        "trades"
+    } else if task_key.starts_with("depth10:") {
+        "depth10"
+    } else {
+        "unknown"
+    }
 }
 
 fn instrument_id_from_stream_parts(
@@ -3133,18 +4466,446 @@ mod tests {
         let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
         client.clients = Some(TbankGrpcClients::new(channel, interceptor));
-        client
-            .bar_subscriptions
-            .insert("sber-uid".to_string(), sber_bar_type());
-        client
-            .quote_subscriptions
-            .insert("sber-uid".to_string(), sber_id());
+        client.bar_subscriptions.insert(sber_id(), sber_bar_type());
+        client.quote_subscriptions.insert(sber_id());
+        client.trade_subscriptions.insert(sber_id());
+        client.depth10_subscriptions.insert(sber_id(), 10);
 
         DataClient::reset(&mut client).unwrap();
 
         assert!(DataClient::is_disconnected(&client));
         assert!(client.bar_subscriptions.is_empty());
         assert!(client.quote_subscriptions.is_empty());
+        assert!(client.trade_subscriptions.is_empty());
+        assert!(client.depth10_subscriptions.is_empty());
+    }
+
+    #[test]
+    fn disconnect_resets_routes_but_keeps_stable_subscription_state() {
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client
+            .resolved_instrument_stream_ids
+            .write()
+            .unwrap()
+            .insert(
+                "SBER_TQBR.MOEX".to_string(),
+                "sber-canonical-uid".to_string(),
+            );
+        client.bar_subscriptions.insert(sber_id(), sber_bar_type());
+        client.quote_subscriptions.insert(sber_id());
+
+        client.disconnect();
+
+        assert_eq!(client.stream_id(sber_id()), "SBER_TQBR");
+        assert!(client.bar_subscriptions.contains_key(&sber_id()));
+        assert!(client.quote_subscriptions.contains(&sber_id()));
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_health_is_not_reported_as_connected() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+
+        assert!(client.is_connected());
+        client.stream_health.register("bars:group:0:1m");
+        assert!(!client.is_connected());
+        client.stream_health.mark_operational("bars:group:0:1m");
+        assert!(client.is_connected());
+        client.stream_health.register("test:terminal");
+        client.stream_health.mark_terminal("test:terminal");
+        assert!(!client.is_connected());
+    }
+
+    #[test]
+    fn reconnecting_stream_health_is_visible_before_retry_budget_exhaustion() {
+        let health = MarketDataStreamHealth::default();
+        let task_key = "bars:generation:1:group:0:1m";
+
+        health.register(task_key);
+        health.mark_operational(task_key);
+        assert!(health.is_operational());
+
+        health.mark_reconnecting(task_key);
+
+        assert!(!health.is_operational());
+    }
+
+    #[test]
+    fn stale_bar_generation_cannot_restore_current_stream_health() {
+        let health = MarketDataStreamHealth::default();
+        let old_key = "bars:generation:1:group:0:1m";
+        let current_key = "bars:generation:2:group:0:1m";
+
+        health.advance_bar_generation(1);
+        health.register(old_key);
+        health.mark_operational(old_key);
+        assert!(health.is_operational());
+
+        health.advance_bar_generation(2);
+        health.register(current_key);
+        health.mark_operational(old_key);
+
+        assert!(!health.is_operational());
+    }
+
+    #[test]
+    fn retry_child_registration_and_spawn_share_parent_lifecycle_lock() {
+        let health = Arc::new(MarketDataStreamHealth::default());
+        let parent_key = "bars:generation:1:group:0:1m";
+        let child_key = "bars:generation:1:group:0:1m:retry:uid";
+        health.register(parent_key);
+
+        let (spawn_started_tx, spawn_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (spawn_release_tx, spawn_release_rx) = std::sync::mpsc::sync_channel(0);
+        let spawning_health = health.clone();
+        let spawn_thread = std::thread::spawn(move || {
+            spawning_health.spawn_child_if_current(parent_key, child_key, || {
+                spawn_started_tx.send(()).unwrap();
+                spawn_release_rx.recv().unwrap();
+                get_runtime().spawn(async {})
+            })
+        });
+        spawn_started_rx.recv().unwrap();
+
+        let (replacement_started_tx, replacement_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (replacement_finished_tx, replacement_finished_rx) = std::sync::mpsc::channel();
+        let replacement_health = health.clone();
+        let replacement_thread = std::thread::spawn(move || {
+            replacement_started_tx.send(()).unwrap();
+            replacement_health.advance_bar_generation(2);
+            replacement_finished_tx.send(()).unwrap();
+        });
+        replacement_started_rx.recv().unwrap();
+        assert!(
+            replacement_finished_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+
+        spawn_release_tx.send(()).unwrap();
+        let child = spawn_thread
+            .join()
+            .unwrap()
+            .expect("child should be spawned");
+        replacement_thread.join().unwrap();
+        child.abort();
+
+        assert!(!health.is_current_task_key(parent_key));
+        assert!(!health.is_current_task_key(child_key));
+    }
+
+    #[test]
+    fn stale_non_bar_generation_cannot_change_current_stream_health() {
+        let health = MarketDataStreamHealth::default();
+        let logical_key = "trades:SBER_TQBR.MOEX:all";
+        let old_key = TbankDataClient::generation_task_key(logical_key, 1);
+        let current_key = TbankDataClient::generation_task_key(logical_key, 2);
+
+        health.register(&old_key);
+        health.mark_operational(&old_key);
+        health.retire_task_key(&old_key, "test generation replacement");
+        health.register(&current_key);
+
+        health.mark_operational(&old_key);
+        health.mark_non_operational(&old_key);
+        assert!(!health.is_operational());
+
+        health.mark_operational(&current_key);
+        assert!(health.is_operational());
+    }
+
+    #[test]
+    fn lifecycle_replacement_cannot_split_publication_and_cursor_commit() {
+        let task_key = "bars:generation:1:group:0:1m";
+        let health = Arc::new(MarketDataStreamHealth::default());
+        health.register(task_key);
+        let (replacement_started_tx, replacement_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (replacement_finished_tx, replacement_finished_rx) = std::sync::mpsc::channel();
+        let replacement_health = health.clone();
+        let replacement = std::thread::spawn(move || {
+            replacement_started_tx.send(()).unwrap();
+            replacement_health.replace_expected("bars:", std::iter::empty::<&str>());
+            replacement_finished_tx.send(()).unwrap();
+        });
+        let mut committed = false;
+
+        let published = health
+            .with_current_task_key_after_publish(
+                task_key,
+                || {
+                    replacement_started_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap();
+                    Ok(())
+                },
+                || {
+                    assert!(
+                        replacement_finished_rx
+                            .recv_timeout(Duration::from_millis(50))
+                            .is_err()
+                    );
+                    committed = true;
+                },
+            )
+            .unwrap();
+
+        replacement.join().unwrap();
+        assert!(published);
+        assert!(committed);
+        assert!(!health.is_current_task_key(task_key));
+    }
+
+    #[tokio::test]
+    async fn non_bar_snapshots_register_expected_groups_before_spawn() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        nautilus_common::live::runner::replace_data_event_sender(sender);
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+
+        client.quote_subscriptions.insert(sber_id());
+        client.schedule_quote_stream().unwrap();
+        client.schedule_trade_stream(sber_id()).unwrap();
+        client.schedule_depth10_stream(sber_id(), 10).unwrap();
+
+        let expected = client.stream_health.expected_task_keys();
+        assert_eq!(expected.len(), 3);
+        assert!(
+            expected
+                .iter()
+                .any(|key| key.starts_with("quotes:generation:"))
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|key| key.starts_with("trades:SBER_TQBR.MOEX:all:generation:"))
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|key| key.starts_with("depth10:SBER_TQBR.MOEX:book:generation:"))
+        );
+        assert!(!client.is_connected());
+
+        client.stop_market_data_streams("test cleanup", false);
+    }
+
+    #[test]
+    fn bar_watermark_survives_broker_route_change_without_cache() {
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client.bar_subscriptions.insert(sber_id(), sber_bar_type());
+        client
+            .resolved_instrument_stream_ids
+            .write()
+            .unwrap()
+            .insert("SBER_TQBR.MOEX".to_string(), "old-route".to_string());
+        record_bar_watermark(
+            &client.bar_watermarks,
+            sber_bar_type(),
+            1_700_000_000_000_000_000,
+        );
+
+        assert_eq!(client.stream_id(sber_id()), "old-route");
+        client
+            .resolved_instrument_stream_ids
+            .write()
+            .unwrap()
+            .insert("SBER_TQBR.MOEX".to_string(), "new-route".to_string());
+        assert_eq!(client.stream_id(sber_id()), "new-route");
+
+        let watermarks = snapshot_bar_watermarks(&client.bar_watermarks);
+        assert_eq!(watermarks[&sber_bar_type()], 1_700_000_000_000_000_000);
+        let new_route_kind = TbankStreamKind::Bars {
+            bar_types: HashMap::from([("new-route".to_string(), sber_bar_type())]),
+        };
+        assert_eq!(
+            continuity_from_bar_watermarks(&new_route_kind, &watermarks)
+                .get("new-route")
+                .and_then(BarContinuityTracker::latest_seen),
+            Some(1_700_000_000_000_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_reconnect_invalidates_readiness_and_publishes_terminal_group_state() {
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let group_key = "bars:generation:0:group:opt_out:1m";
+        let readiness_key = format!("{group_key}:instrument:SBER_TQBR");
+        client.stream_health.register(group_key);
+        client.stream_health.register_current(&readiness_key);
+        let mut events = crate::market_data::subscribe_market_data_events();
+
+        client.stop_market_data_streams("subscriptions disabled for reconnect", true);
+
+        let stream = loop {
+            match events.try_recv() {
+                Ok(TbankMarketDataEvent::StreamState {
+                    stream_id, state, ..
+                }) if stream_id == "bars:group:opt_out:1m" => break state,
+                Ok(_) => continue,
+                Err(error) => panic!("terminal reconnect stream event missing: {error:?}"),
+            }
+        };
+        assert_eq!(stream, TbankMarketDataStreamState::Dead);
+
+        let retirement = loop {
+            match events.try_recv() {
+                Ok(TbankMarketDataEvent::StreamRetired {
+                    stream_id,
+                    readiness_ids,
+                    ..
+                }) if stream_id == "bars:group:opt_out:1m" => {
+                    break readiness_ids;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("stream retirement event missing: {error:?}"),
+            }
+        };
+        assert_eq!(
+            retirement,
+            vec!["bars:group:opt_out:1m:instrument:SBER_TQBR".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuilding_bar_snapshot_invalidates_readiness_and_registers_expected_groups() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        nautilus_common::live::runner::replace_data_event_sender(sender);
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        client.bar_subscriptions.insert(sber_id(), sber_bar_type());
+
+        client.schedule_bar_streams().unwrap();
+
+        assert!(!client.is_connected());
+        assert_eq!(
+            client.scheduled_bar_continuity_keys.get("SBER_TQBR"),
+            Some(&"bars:generation:1:group:0:1m:instrument:SBER_TQBR".to_string())
+        );
+
+        client
+            .stream_health
+            .mark_operational("bars:generation:1:group:0:1m");
+        assert!(client.is_connected());
+        let mut events = crate::market_data::subscribe_market_data_events();
+
+        client.bar_subscriptions.clear();
+        client.schedule_bar_streams().unwrap();
+
+        assert!(client.is_connected());
+        let (stream_id, readiness_ids) = loop {
+            match events.try_recv() {
+                Ok(TbankMarketDataEvent::StreamRetired {
+                    stream_id,
+                    readiness_ids,
+                    ..
+                }) => break (stream_id, readiness_ids),
+                Ok(_) => continue,
+                Err(error) => panic!("stream retirement event missing: {error:?}"),
+            }
+        };
+        assert_eq!(stream_id, "bars:group:0:1m");
+        assert_eq!(
+            readiness_ids,
+            vec!["bars:group:0:1m:instrument:SBER_TQBR".to_string()]
+        );
+        assert!(client.scheduled_bar_continuity_keys.is_empty());
+    }
+
+    #[test]
+    fn recoverable_stream_failures_are_typed_reconnect_states() {
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_worker_normal_exit"),
+            Some(TbankMarketDataStreamState::Reconnecting)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_recovery_failed"),
+            Some(TbankMarketDataStreamState::Reconnecting)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_subscription_acked"),
+            Some(TbankMarketDataStreamState::Reconnecting)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_reconnect_exhausted"),
+            Some(TbankMarketDataStreamState::Reconnecting)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_supervisor_reconnect_exhausted"),
+            Some(TbankMarketDataStreamState::Reconnecting)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_supervisor_exhausted"),
+            Some(TbankMarketDataStreamState::Dead)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("subscription_permanently_rejected"),
+            Some(TbankMarketDataStreamState::Dead)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_subscriptions_stopped"),
+            Some(TbankMarketDataStreamState::Reconnecting)
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_snapshot_replaced"),
+            None
+        );
+        assert_eq!(
+            TbankMarketDataStreamState::from_stage("stream_subscriptions_disabled"),
+            Some(TbankMarketDataStreamState::Dead)
+        );
+    }
+
+    #[test]
+    fn public_market_data_ids_hide_stream_generations() {
+        assert_eq!(
+            logical_stream_id("bars:generation:3:group:0:1m"),
+            "bars:group:0:1m"
+        );
+        assert_eq!(
+            logical_readiness_id("bars:generation:3:group:0:1m:instrument:uid"),
+            "bars:group:0:1m:instrument:uid"
+        );
+        assert_eq!(
+            logical_stream_id("bars:generation:3:poll:indicative:1m:instrument:uid"),
+            "bars:poll:indicative:1m:instrument:uid"
+        );
+        assert_eq!(
+            logical_stream_id("quotes:generation:2:group:0:depth1"),
+            "quotes:group:0:depth1"
+        );
+        assert_eq!(
+            logical_stream_id("trades:SBER_TQBR.MOEX:all:generation:4"),
+            "trades:SBER_TQBR.MOEX:all"
+        );
+    }
+
+    #[test]
+    fn non_retryable_stream_status_terminates_the_worker() {
+        let exit = permanent_stream_status(&tonic::Status::unauthenticated("expired token"));
+
+        assert!(matches!(
+            exit,
+            Some(StreamWorkerExit::Permanent(reason))
+                if reason.contains("non-retryable stream status")
+        ));
+        assert!(permanent_stream_status(&tonic::Status::unavailable("temporary outage")).is_none());
+    }
+
+    #[test]
+    fn stream_restart_reuses_the_latest_shared_bar_watermark() {
+        let bar_type = sber_bar_type();
+        let watermarks = Arc::new(std::sync::Mutex::new(HashMap::from([(bar_type, 100_i128)])));
+
+        record_bar_watermark(&watermarks, bar_type, 90);
+        record_bar_watermark(&watermarks, bar_type, 120);
+
+        assert_eq!(snapshot_bar_watermarks(&watermarks)[&bar_type], 120);
     }
 
     #[test]
@@ -3155,12 +4916,334 @@ mod tests {
 
         assert_eq!(
             bar_watermarks_for_subscriptions(&[("sber-uid".to_string(), minute)], &cached),
-            HashMap::from([("sber-uid".to_string(), 60)])
+            HashMap::from([(minute, 60)])
         );
         assert_eq!(
             bar_watermarks_for_subscriptions(&[("sber-uid".to_string(), hour)], &cached),
-            HashMap::from([("sber-uid".to_string(), 3_600)])
+            HashMap::from([(hour, 3_600)])
         );
+    }
+
+    #[test]
+    fn periodic_poll_partition_matches_materialized_broker_stream_id() {
+        let client = TbankDataClient::new(TbankDataClientConfig {
+            instrument_stream_ids: HashMap::from([(
+                "SBER_TQBR.MOEX".to_string(),
+                "index-uid".to_string(),
+            )]),
+            periodic_candle_poll_instrument_ids: HashSet::from(["index-uid".to_string()]),
+            ..TbankDataClientConfig::default()
+        });
+        let subscriptions = vec![(client.stream_id(sber_id()), sber_bar_type())];
+
+        let (poll, live) = partition_bar_stream_subscriptions(
+            subscriptions,
+            &client.config.periodic_candle_poll_instrument_ids,
+        );
+
+        assert_eq!(poll.len(), 1);
+        assert!(live.is_empty());
+        assert_eq!(poll[0].0, "index-uid");
+    }
+
+    #[test]
+    fn reconnect_subscription_restore_honors_opt_out() {
+        assert!(should_restore_market_data_streams(false, false));
+        assert!(should_restore_market_data_streams(false, true));
+        assert!(!should_restore_market_data_streams(true, false));
+        assert!(should_restore_market_data_streams(true, true));
+    }
+
+    #[test]
+    fn reconnect_opt_out_clears_desired_and_legacy_subscription_state() {
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client.bar_subscriptions.insert(sber_id(), sber_bar_type());
+        client.quote_subscriptions.insert(sber_id());
+        client.trade_subscriptions.insert(sber_id());
+        client.depth10_subscriptions.insert(sber_id(), 10);
+        client.subscriptions.subscribe_trades("sber-uid");
+
+        client.clear_market_data_subscription_state();
+
+        assert!(client.bar_subscriptions.is_empty());
+        assert!(client.quote_subscriptions.is_empty());
+        assert!(client.trade_subscriptions.is_empty());
+        assert!(client.depth10_subscriptions.is_empty());
+        assert!(client.restore_subscription_requests().is_empty());
+    }
+
+    #[test]
+    fn nautilus_trade_command_updates_restore_subscription_registry() {
+        use nautilus_common::{clients::DataClient, messages::data::SubscribeTrades};
+        use nautilus_core::{UUID4, UnixNanos};
+
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let command = SubscribeTrades::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        assert!(DataClient::subscribe_trades(&mut client, command).is_err());
+        assert_eq!(client.restore_subscription_requests().len(), 1);
+    }
+
+    #[test]
+    fn nautilus_restore_and_unsubscribe_use_the_current_route_for_stable_identity() {
+        use nautilus_common::{clients::DataClient, messages::data::UnsubscribeTrades};
+        use nautilus_core::{UUID4, UnixNanos};
+
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let subscribe = SubscribeTrades::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        assert!(DataClient::subscribe_trades(&mut client, subscribe).is_err());
+        let fallback_requests = client.restore_subscription_requests();
+        let Some(market_data_request::Payload::SubscribeTradesRequest(request)) =
+            &fallback_requests[0].payload
+        else {
+            panic!("expected trade restore request");
+        };
+        assert_eq!(request.instruments[0].instrument_id, "SBER_TQBR");
+
+        merge_resolved_instrument_stream_ids(
+            &client.resolved_instrument_stream_ids,
+            HashMap::from([(
+                "SBER_TQBR.MOEX".to_string(),
+                "sber-canonical-uid".to_string(),
+            )]),
+        );
+        let canonical_requests = client.restore_subscription_requests();
+        let Some(market_data_request::Payload::SubscribeTradesRequest(request)) =
+            &canonical_requests[0].payload
+        else {
+            panic!("expected trade restore request");
+        };
+        assert_eq!(request.instruments[0].instrument_id, "sber-canonical-uid");
+
+        let unsubscribe = UnsubscribeTrades::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        DataClient::unsubscribe_trades(&mut client, &unsubscribe).unwrap();
+        assert!(client.restore_subscription_requests().is_empty());
+    }
+
+    #[test]
+    fn nautilus_quote_restore_uses_the_depth_one_order_book_stream() {
+        use nautilus_core::UUID4;
+
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let command = SubscribeQuotes::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        assert!(DataClient::subscribe_quotes(&mut client, command).is_err());
+        let requests = client.restore_subscription_requests();
+        let Some(market_data_request::Payload::SubscribeOrderBookRequest(request)) =
+            &requests[0].payload
+        else {
+            panic!("expected order-book restore request");
+        };
+        assert_eq!(request.instruments[0].depth, 1);
+    }
+
+    #[test]
+    fn nautilus_depth_restore_replaces_and_removes_all_previous_depths() {
+        use std::num::NonZeroUsize;
+
+        use nautilus_core::UUID4;
+
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        for depth in [5, 10] {
+            let command = SubscribeBookDepth10::new(
+                sber_id(),
+                BookType::L2_MBP,
+                Some(*TBANK_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                NonZeroUsize::new(depth),
+                false,
+                None,
+                None,
+            );
+            assert!(DataClient::subscribe_book_depth10(&mut client, command).is_err());
+        }
+
+        let requests = client.restore_subscription_requests();
+        assert_eq!(requests.len(), 1);
+        let Some(market_data_request::Payload::SubscribeOrderBookRequest(request)) =
+            &requests[0].payload
+        else {
+            panic!("expected order-book restore request");
+        };
+        assert_eq!(request.instruments[0].depth, 10);
+
+        let command = UnsubscribeBookDepth10::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        DataClient::unsubscribe_book_depth10(&mut client, &command).unwrap();
+
+        assert!(client.restore_subscription_requests().is_empty());
+    }
+
+    #[test]
+    fn nautilus_quote_and_depth_one_share_restore_stream_until_both_unsubscribe() {
+        use std::num::NonZeroUsize;
+
+        use nautilus_core::UUID4;
+
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let quote = SubscribeQuotes::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        assert!(DataClient::subscribe_quotes(&mut client, quote).is_err());
+        let depth = SubscribeBookDepth10::new(
+            sber_id(),
+            BookType::L2_MBP,
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            NonZeroUsize::new(1),
+            false,
+            None,
+            None,
+        );
+        assert!(DataClient::subscribe_book_depth10(&mut client, depth).is_err());
+        assert_eq!(client.restore_subscription_requests().len(), 1);
+
+        let quote = UnsubscribeQuotes::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        DataClient::unsubscribe_quotes(&mut client, &quote).unwrap();
+        assert_eq!(client.restore_subscription_requests().len(), 1);
+
+        let depth = UnsubscribeBookDepth10::new(
+            sber_id(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        DataClient::unsubscribe_book_depth10(&mut client, &depth).unwrap();
+        assert!(client.restore_subscription_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_without_bar_watermark_does_not_fail_recovery() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let mut market_data_client = TbankGrpcClients::new(channel, interceptor).market_data;
+        let kind = TbankStreamKind::Bars {
+            bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let stream_health = MarketDataStreamHealth::default();
+        let outcome = reconnect_catch_up_bars(
+            RecoveryCause::Reconnect,
+            "bars:group:0:1m",
+            &kind,
+            &mut market_data_client,
+            &Arc::new(std::sync::Mutex::new(HashMap::new())),
+            &HashMap::new(),
+            TbankCandleTimestampMode::StartAsBarEnd,
+            &sender,
+            &mut HashMap::new(),
+            1,
+            &TbankDataClientConfig::default(),
+            &HistoricalRequestLimiter::new(Duration::ZERO),
+            &Arc::new(RwLock::new(HashMap::new())),
+            &stream_health,
+            true,
+        )
+        .await;
+
+        assert_eq!(outcome.checked, 0);
+        assert_eq!(outcome.backfilled, 0);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[test]
+    fn superseded_recovery_does_not_publish_prepared_bars() {
+        let bar = nautilus_bar_from_candle(
+            &Candle {
+                interval: SubscriptionInterval::OneMinute as i32,
+                open: q(250, 0),
+                high: q(252, 0),
+                low: q(249, 0),
+                close: q(251, 0),
+                volume: 42,
+                time: Some(ts(1_000)),
+                instrument_uid: "sber-uid".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                ..Candle::default()
+            },
+            sber_bar_type(),
+            sber_market_data_metadata(),
+            TbankCandleTimestampMode::StartAsBarEnd,
+            UnixNanos::from(1_070_000_000_000_u64),
+        )
+        .unwrap();
+        let stream_health = MarketDataStreamHealth::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        assert_eq!(
+            publish_recovery_batch_if_current(
+                &stream_health,
+                "bars:generation:old:group:0",
+                &sender,
+                &[bar],
+                |_| {},
+            )
+            .unwrap(),
+            RecoveryPublication::Superseded
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -3172,7 +5255,7 @@ mod tests {
                     InstrumentId::from(format!("S{index:03}.MOEX")),
                 )
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<Vec<_>>();
 
         let groups = quote_subscription_groups(&subscriptions);
 
@@ -3224,6 +5307,9 @@ mod tests {
             "sber-uid".to_string(),
             sber_market_data_metadata(),
         )])));
+        let watermarks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let stream_health = MarketDataStreamHealth::default();
+        stream_health.register("quotes:group:0:depth1");
         let mut attempt = 2;
 
         drain_pre_ack_messages(
@@ -3231,8 +5317,10 @@ mod tests {
             &sender,
             &kind,
             &metadata,
+            &watermarks,
             TbankCandleTimestampMode::StartAsBarEnd,
             "quotes:group:0:depth1",
+            &stream_health,
             &HashMap::new(),
             &mut HashMap::new(),
             &mut attempt,
@@ -3263,6 +5351,36 @@ mod tests {
         });
 
         assert_eq!(client.stream_id(sber_id()), "sber-real-uid");
+    }
+
+    #[test]
+    fn instrument_refresh_replaces_changed_and_adds_stream_routes() {
+        let client = TbankDataClient::new(TbankDataClientConfig::default());
+        client
+            .resolved_instrument_stream_ids
+            .write()
+            .unwrap()
+            .insert(
+                "SBER_TQBR.MOEX".to_string(),
+                "sber-existing-uid".to_string(),
+            );
+
+        merge_resolved_instrument_stream_ids(
+            &client.resolved_instrument_stream_ids,
+            HashMap::from([
+                (
+                    "SBER_TQBR.MOEX".to_string(),
+                    "sber-refreshed-uid".to_string(),
+                ),
+                ("GAZP_TQBR.MOEX".to_string(), "gazp-new-uid".to_string()),
+            ]),
+        );
+
+        assert_eq!(client.stream_id(sber_id()), "sber-refreshed-uid");
+        assert_eq!(
+            client.stream_id("GAZP_TQBR.MOEX".parse().unwrap()),
+            "gazp-new-uid"
+        );
     }
 
     #[tokio::test]
@@ -3307,7 +5425,7 @@ mod tests {
         };
 
         let (first_streams, _) = resolve_instrument_metadata(
-            &client.configured_instrument_stream_ids,
+            &client.config.instrument_stream_ids,
             &HashMap::new(),
             [&share, &future],
         )
@@ -3315,7 +5433,7 @@ mod tests {
         assert!(first_streams.contains_key("Si-9.26_SPBFUT.MOEX"));
 
         let (reconnected_streams, _) = resolve_instrument_metadata(
-            &client.configured_instrument_stream_ids,
+            &client.config.instrument_stream_ids,
             &HashMap::new(),
             [&share],
         )
@@ -3452,21 +5570,6 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_catch_up_waits_between_attempts() {
-        let now = Instant::now();
-
-        assert!(reconnect_catch_up_due(None, now));
-        assert!(!reconnect_catch_up_due(
-            Some(now - Duration::from_secs(59)),
-            now
-        ));
-        assert!(reconnect_catch_up_due(
-            Some(now - Duration::from_secs(60)),
-            now
-        ));
-    }
-
-    #[test]
     fn reconnect_schedule_advances_until_usable_stream_data_resets_attempt() {
         let reconnect_policy = crate::config::TbankReconnectPolicy {
             jitter: false,
@@ -3510,8 +5613,10 @@ mod tests {
             ..MarketDataResponse::default()
         };
 
-        let reset =
-            reset_reconnect_attempt_after_usable_stream_message(&response, &kind, &mut attempt);
+        let reset = reset_reconnect_attempt_if_usable(
+            is_usable_market_data_response(&response, &kind),
+            &mut attempt,
+        );
 
         assert!(reset);
         assert_eq!(attempt, 0);
@@ -3530,8 +5635,10 @@ mod tests {
             ..MarketDataResponse::default()
         };
 
-        let reset =
-            reset_reconnect_attempt_after_usable_stream_message(&response, &kind, &mut attempt);
+        let reset = reset_reconnect_attempt_if_usable(
+            is_usable_market_data_response(&response, &kind),
+            &mut attempt,
+        );
 
         assert!(is_market_data_subscription_ack(&response, &kind));
         assert!(!reset);
@@ -3617,15 +5724,61 @@ mod tests {
     }
 
     #[test]
+    fn permanent_partial_bar_rejection_keeps_group_degraded_and_fails_readiness() {
+        let task_key = "bars:generation:1:group:0:1m";
+        let readiness_key = format!("{task_key}:instrument:uid-dead");
+        let health = MarketDataStreamHealth::default();
+        health.register(task_key);
+        health.register_current(&readiness_key);
+        health.mark_operational(task_key);
+        let mut events = crate::market_data::subscribe_market_data_events();
+        let kind = TbankStreamKind::Bars {
+            bar_types: HashMap::from([("uid-dead".to_string(), sber_bar_type())]),
+        };
+        let rejection = SubscriptionAckRejection {
+            reason: "permanent rejection".to_string(),
+            retryable: false,
+            acknowledged_count: 2,
+            failures: vec![SubscriptionFailure {
+                instrument_uid: "uid-dead".to_string(),
+                reason: "source is invalid".to_string(),
+                retryable: false,
+            }],
+        };
+
+        assert!(mark_permanent_bar_rejections(
+            task_key,
+            &kind,
+            &rejection,
+            &HashMap::new(),
+            &health,
+        ));
+        assert!(!health.is_operational());
+
+        let event = loop {
+            match events.try_recv() {
+                Ok(TbankMarketDataEvent::CandleReadiness {
+                    readiness_id,
+                    state,
+                    instrument_uid,
+                    ..
+                }) if readiness_id == "bars:group:0:1m:instrument:uid-dead" => {
+                    break (state, instrument_uid);
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("permanent rejection readiness event missing: {error:?}"),
+            }
+        };
+        assert_eq!(event.0, TbankCandleReadinessState::Failed);
+        assert_eq!(event.1, "uid-dead");
+    }
+
+    #[test]
     fn retryable_partial_candle_failure_gets_an_isolated_stream_subscription() {
         let bar_type = sber_bar_type();
 
-        let (task_key, request, kind, watermarks, continuity_keys) = isolated_retryable_bar_stream(
-            "bars:group:0:1m",
-            "uid-retry",
-            bar_type,
-            Some(1_700_000_000_000_000_000),
-        );
+        let (task_key, request, kind, continuity_keys) =
+            isolated_retryable_bar_stream("bars:group:0:1m", "uid-retry", bar_type);
 
         assert_eq!(task_key, "bars:group:0:1m:retry:uid-retry");
         let candles = request.subscribe_candles_request.unwrap();
@@ -3639,10 +5792,6 @@ mod tests {
             panic!("expected isolated bars stream");
         };
         assert_eq!(bar_types.get("uid-retry"), Some(&bar_type));
-        assert_eq!(
-            watermarks.get("uid-retry"),
-            Some(&1_700_000_000_000_000_000)
-        );
         assert_eq!(
             continuity_keys.get("uid-retry").map(String::as_str),
             Some("bars:group:0:1m:instrument:uid-retry")
@@ -3662,6 +5811,47 @@ mod tests {
         tasks.wait_for_completion().await;
 
         assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn isolated_subscription_owner_wait_clears_health_key() {
+        let health = Arc::new(MarketDataStreamHealth::default());
+        let task_key = "bars:group:0:1m:retry:uid-completed".to_string();
+        health.register(&task_key);
+
+        let mut tasks = AbortTasksOnDrop::default();
+        tasks.push_with_health_cleanup(tokio::spawn(async {}), health.clone(), task_key);
+        tasks.wait_for_completion().await;
+
+        assert!(health.is_operational());
+    }
+
+    #[tokio::test]
+    async fn isolated_subscription_child_survives_parent_reconnect_budget_exhaustion() {
+        let health = Arc::new(MarketDataStreamHealth::default());
+        let parent_key = "bars:group:0:1m";
+        let child_key = "bars:group:0:1m:retry:uid-retry";
+        health.register(parent_key);
+        health.register(child_key);
+
+        let child_reconnected = Arc::new(tokio::sync::Notify::new());
+        let child_reconnected_task = child_reconnected.clone();
+        let child_health = health.clone();
+        let child = tokio::spawn(async move {
+            child_reconnected_task.notified().await;
+            child_health.mark_operational(child_key);
+        });
+        let mut isolated_tasks = AbortTasksOnDrop::default();
+        isolated_tasks.push(child);
+
+        // Parent budget exhaustion re-arms only the parent probe. The child supervisor must
+        // remain alive long enough to acknowledge its own subscription and clear its health key.
+        health.mark_reconnecting(parent_key);
+        child_reconnected.notify_one();
+        health.mark_operational(parent_key);
+        tokio::task::yield_now().await;
+
+        assert!(health.is_operational());
     }
 
     #[tokio::test]
@@ -3696,6 +5886,21 @@ mod tests {
             .await
             .expect("isolated child was not aborted with its owner")
             .expect("isolated child drop notification was lost");
+    }
+
+    #[tokio::test]
+    async fn aborting_isolated_subscription_child_clears_health_key() {
+        let health = Arc::new(MarketDataStreamHealth::default());
+        let task_key = "bars:group:0:1m:retry:uid-retry".to_string();
+        health.register(&task_key);
+
+        let child = tokio::spawn(std::future::pending::<()>());
+        let mut tasks = AbortTasksOnDrop::default();
+        tasks.push_with_health_cleanup(child, health.clone(), task_key);
+
+        drop(tasks);
+
+        assert!(health.is_operational());
     }
 
     #[test]
@@ -3794,23 +5999,18 @@ mod tests {
     #[test]
     fn indicative_poll_continuity_key_is_instrument_scoped() {
         assert_eq!(
-            periodic_candle_stream_key("imoex2-uid"),
-            "bars:poll:indicative:1m:instrument:imoex2-uid"
+            periodic_candle_stream_key(7, "imoex2-uid"),
+            "bars:generation:7:poll:indicative:1m:instrument:imoex2-uid"
         );
     }
 
     #[test]
     fn indicative_poll_initializes_cursor_once() {
         let mut next_from = HashMap::new();
+        let bar_type = sber_bar_type();
 
-        assert_eq!(
-            periodic_candle_poll_from(&mut next_from, "imoex2-uid", 60),
-            60
-        );
-        assert_eq!(
-            periodic_candle_poll_from(&mut next_from, "imoex2-uid", 120),
-            60
-        );
+        assert_eq!(periodic_candle_poll_from(&mut next_from, bar_type, 60), 60);
+        assert_eq!(periodic_candle_poll_from(&mut next_from, bar_type, 120), 60);
     }
 
     #[test]
@@ -3938,6 +6138,7 @@ mod tests {
             bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
         };
         let mut continuity = HashMap::new();
+        let watermarks = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let first = MarketDataResponse {
             payload: Some(market_data_response::Payload::Candle(Candle {
@@ -3972,31 +6173,185 @@ mod tests {
             ..MarketDataResponse::default()
         };
 
-        assert!(
-            filter_market_data_response_for_continuity(
-                first,
-                &kind,
-                "bars:group:0:1m",
-                &HashMap::new(),
-                TbankCandleTimestampMode::StartAsBarEnd,
-                &mut continuity,
-            )
-            .is_some()
+        let (_, first_pending) = filter_market_data_response_for_continuity(
+            first,
+            &kind,
+            "bars:group:0:1m",
+            &HashMap::new(),
+            TbankCandleTimestampMode::StartAsBarEnd,
+            &watermarks,
+            &continuity,
+        )
+        .expect("first live candle should be accepted");
+        let first_pending = first_pending.expect("first live candle should have a commit");
+        assert!(first_pending.establishes_initial_baseline);
+        commit_live_bar(
+            &watermarks,
+            &mut continuity,
+            &first_pending.instrument_uid,
+            first_pending.bar_type,
+            first_pending.ts_event,
         );
 
-        assert!(
-            filter_market_data_response_for_continuity(
-                after_gap,
-                &kind,
-                "bars:group:0:1m",
-                &HashMap::new(),
-                TbankCandleTimestampMode::StartAsBarEnd,
-                &mut continuity,
-            )
-            .is_some()
+        let (_, after_gap_pending) = filter_market_data_response_for_continuity(
+            after_gap,
+            &kind,
+            "bars:group:0:1m",
+            &HashMap::new(),
+            TbankCandleTimestampMode::StartAsBarEnd,
+            &watermarks,
+            &continuity,
+        )
+        .expect("sparse live candle should be accepted");
+        let after_gap_pending = after_gap_pending.expect("sparse live candle should have a commit");
+        assert!(!after_gap_pending.establishes_initial_baseline);
+        commit_live_bar(
+            &watermarks,
+            &mut continuity,
+            &after_gap_pending.instrument_uid,
+            after_gap_pending.bar_type,
+            after_gap_pending.ts_event,
         );
         let tracker = continuity.get("sber-uid").unwrap();
         assert_eq!(tracker.latest_seen(), Some(1_180_000_000_000));
+    }
+
+    #[test]
+    fn failed_live_bar_publication_does_not_advance_cursors() {
+        let task_key = "bars:test:failed-live:1m";
+        let kind = TbankStreamKind::Bars {
+            bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
+        };
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        let metadata = Arc::new(RwLock::new(HashMap::from([(
+            "sber-uid".to_string(),
+            sber_market_data_metadata(),
+        )])));
+        let stream_health = MarketDataStreamHealth::default();
+        stream_health.register(task_key);
+        let watermarks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut continuity = HashMap::new();
+        let response = MarketDataResponse {
+            payload: Some(market_data_response::Payload::Candle(Candle {
+                interval: SubscriptionInterval::OneMinute as i32,
+                open: q(250, 0),
+                high: q(252, 0),
+                low: q(249, 0),
+                close: q(251, 0),
+                volume: 42,
+                time: Some(ts(1_000)),
+                instrument_uid: "sber-uid".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                ..Candle::default()
+            })),
+            ..MarketDataResponse::default()
+        };
+
+        publish_ready_market_data_response(
+            &sender,
+            response,
+            &kind,
+            &metadata,
+            &watermarks,
+            TbankCandleTimestampMode::StartAsBarEnd,
+            UnixNanos::from(1_070_000_000_000_u64),
+            task_key,
+            &stream_health,
+            &HashMap::new(),
+            &mut continuity,
+            &mut 0,
+            0,
+        );
+
+        assert!(continuity.is_empty());
+        assert!(snapshot_bar_watermarks(&watermarks).is_empty());
+    }
+
+    #[test]
+    fn first_acknowledged_live_candle_establishes_readiness_without_watermark() {
+        let task_key = "bars:test:first-live:1m";
+        let readiness_key = format!("{task_key}:instrument:sber-uid");
+        let kind = TbankStreamKind::Bars {
+            bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let metadata = Arc::new(RwLock::new(HashMap::from([(
+            "sber-uid".to_string(),
+            sber_market_data_metadata(),
+        )])));
+        let stream_health = MarketDataStreamHealth::default();
+        stream_health.register(task_key);
+        stream_health.mark_operational(task_key);
+        stream_health.register_current(&readiness_key);
+        let mut events = crate::market_data::subscribe_market_data_events();
+        let mut continuity = HashMap::new();
+        let watermarks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let response = MarketDataResponse {
+            payload: Some(market_data_response::Payload::Candle(Candle {
+                interval: SubscriptionInterval::OneMinute as i32,
+                open: q(250, 0),
+                high: q(252, 0),
+                low: q(249, 0),
+                close: q(251, 0),
+                volume: 42,
+                time: Some(ts(1_000)),
+                instrument_uid: "sber-uid".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                ..Candle::default()
+            })),
+            ..MarketDataResponse::default()
+        };
+        publish_ready_market_data_response(
+            &sender,
+            response,
+            &kind,
+            &metadata,
+            &watermarks,
+            TbankCandleTimestampMode::StartAsBarEnd,
+            UnixNanos::from(1_070_000_000_000_u64),
+            task_key,
+            &stream_health,
+            &HashMap::new(),
+            &mut continuity,
+            &mut 0,
+            0,
+        );
+
+        assert_eq!(
+            snapshot_bar_watermarks(&watermarks)[&sber_bar_type()],
+            1_060_000_000_000
+        );
+
+        let event = loop {
+            match events.try_recv() {
+                Ok(TbankMarketDataEvent::CandleReadiness {
+                    readiness_id,
+                    state,
+                    ready_through,
+                    ..
+                }) if readiness_id == "bars:test:first-live:1m:instrument:sber-uid" => {
+                    break (state, ready_through);
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    panic!("initial live candle readiness event missing")
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    panic!("candle readiness event channel closed")
+                }
+            }
+        };
+
+        assert_eq!(event.0, TbankCandleReadinessState::Ready);
+        assert!(event.1.is_some());
+        assert_eq!(
+            snapshot_bar_watermarks(&watermarks)[&sber_bar_type()],
+            1_060_000_000_000
+        );
     }
 
     #[test]
@@ -4047,6 +6402,39 @@ mod tests {
         assert_eq!(tick.trade_id, replay.trade_id);
         assert_ne!(tick.trade_id, same_timestamp.trade_id);
         assert_eq!(tick.trade_id.as_str().len(), 36);
+    }
+
+    #[test]
+    fn single_instrument_trade_stream_rejects_mismatched_uid() {
+        let kind = TbankStreamKind::Trades {
+            instrument_id: sber_id(),
+            instrument_uid: "expected-uid".to_string(),
+        };
+        let response = MarketDataResponse {
+            payload: Some(market_data_response::Payload::Trade(Trade {
+                instrument_uid: "other-uid".to_string(),
+                ..Trade::default()
+            })),
+            ..MarketDataResponse::default()
+        };
+        assert!(!is_usable_market_data_response(&response, &kind));
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let error = publish_market_data_response(
+            &sender,
+            response,
+            &kind,
+            &Arc::new(RwLock::new(HashMap::new())),
+            TbankCandleTimestampMode::StartAsBarEnd,
+            UnixNanos::from(2_000_000_000_u64),
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected T-Bank stream instrument")
+        );
     }
 
     #[test]
@@ -4109,6 +6497,39 @@ mod tests {
         assert_eq!(depth.bid_counts[0], 1);
         assert_eq!(depth.ts_init, received_at);
         assert_eq!(depth.ask_counts[1], 1);
+    }
+
+    #[test]
+    fn single_instrument_depth10_stream_rejects_mismatched_uid() {
+        let kind = TbankStreamKind::Depth10 {
+            instrument_id: sber_id(),
+            instrument_uid: "expected-uid".to_string(),
+        };
+        let response = MarketDataResponse {
+            payload: Some(market_data_response::Payload::Orderbook(OrderBook {
+                instrument_uid: "other-uid".to_string(),
+                ..OrderBook::default()
+            })),
+            ..MarketDataResponse::default()
+        };
+        assert!(!is_usable_market_data_response(&response, &kind));
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let error = publish_market_data_response(
+            &sender,
+            response,
+            &kind,
+            &Arc::new(RwLock::new(HashMap::new())),
+            TbankCandleTimestampMode::StartAsBarEnd,
+            UnixNanos::from(2_000_000_000_u64),
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected T-Bank stream instrument")
+        );
     }
 
     #[test]
