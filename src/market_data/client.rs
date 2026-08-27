@@ -488,10 +488,12 @@ fn bar_watermarks_for_streams(
         .collect()
 }
 
+type BarStreamSubscriptions = Vec<(String, BarType)>;
+
 fn partition_bar_stream_subscriptions(
     subscriptions: Vec<(String, BarType)>,
     periodic_instrument_ids: &HashSet<String>,
-) -> (Vec<(String, BarType)>, Vec<(String, BarType)>) {
+) -> (BarStreamSubscriptions, BarStreamSubscriptions) {
     subscriptions
         .into_iter()
         .partition(|(stream_id, _)| periodic_instrument_ids.contains(stream_id))
@@ -2204,16 +2206,16 @@ fn run_market_data_stream_worker(
         let mut instrument_count = kind.instrument_count();
 
         if restart_after_worker_exit {
-            if !wait_for_market_data_reconnect(
-                &task_key,
-                &kind,
+            if !wait_for_market_data_reconnect(MarketDataReconnectContext {
+                task_key: &task_key,
+                kind: &kind,
                 instrument_count,
-                &config,
-                &reconnect_attempt,
-                &stream_health,
-                "restarting market data stream after worker exit",
-                "stream_supervisor_reconnect_exhausted",
-            )
+                config: &config,
+                attempt: &reconnect_attempt,
+                stream_health: &stream_health,
+                reason: "restarting market data stream after worker exit",
+                exhausted_stage: "stream_supervisor_reconnect_exhausted",
+            })
             .await
             {
                 return Err(StreamWorkerExit::RetryBudgetExhausted);
@@ -2814,16 +2816,16 @@ fn run_market_data_stream_worker(
             stream_health.mark_reconnecting(&task_key);
             pending_recovery = Some(RecoveryCause::Reconnect);
             reconnect_attempt.store(attempt, Ordering::Relaxed);
-            if !wait_for_market_data_reconnect(
-                &task_key,
-                &kind,
+            if !wait_for_market_data_reconnect(MarketDataReconnectContext {
+                task_key: &task_key,
+                kind: &kind,
                 instrument_count,
-                &config,
-                &reconnect_attempt,
-                &stream_health,
-                "reopening T-Bank market data stream after disconnect",
-                "stream_reconnect_exhausted",
-            )
+                config: &config,
+                attempt: &reconnect_attempt,
+                stream_health: &stream_health,
+                reason: "reopening T-Bank market data stream after disconnect",
+                exhausted_stage: "stream_reconnect_exhausted",
+            })
             .await
             {
                 // Retryable instruments removed from `request` and `kind` are owned by the
@@ -2874,16 +2876,28 @@ fn run_market_data_stream_worker(
     })
 }
 
-async fn wait_for_market_data_reconnect(
-    task_key: &str,
-    kind: &TbankStreamKind,
+struct MarketDataReconnectContext<'a> {
+    task_key: &'a str,
+    kind: &'a TbankStreamKind,
     instrument_count: usize,
-    config: &TbankDataClientConfig,
-    attempt: &AtomicU32,
-    stream_health: &MarketDataStreamHealth,
-    reason: &str,
-    exhausted_stage: &str,
-) -> bool {
+    config: &'a TbankDataClientConfig,
+    attempt: &'a AtomicU32,
+    stream_health: &'a MarketDataStreamHealth,
+    reason: &'a str,
+    exhausted_stage: &'a str,
+}
+
+async fn wait_for_market_data_reconnect(context: MarketDataReconnectContext<'_>) -> bool {
+    let MarketDataReconnectContext {
+        task_key,
+        kind,
+        instrument_count,
+        config,
+        attempt,
+        stream_health,
+        reason,
+        exhausted_stage,
+    } = context;
     let mut next_attempt = attempt.load(Ordering::Relaxed);
     let Some(schedule) = plan_next_market_data_reconnect(
         &config.reconnect_policy,

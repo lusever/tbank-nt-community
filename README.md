@@ -55,7 +55,7 @@ tbank-nt-community = { path = "../tbank-nt-community" }
 For a reproducible Git dependency, use an immutable tag:
 
 ```toml
-tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.2.0" }
+tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.2.1" }
 ```
 
 All direct Nautilus dependencies in the consumer must use the same `v1.231.0` source as this
