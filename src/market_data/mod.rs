@@ -23,7 +23,7 @@ pub use client::TbankDataClient;
 pub use converters::{candle_to_bar, last_price_to_quote, orderbook_to_snapshot, trade_to_tick};
 pub use events::{
     TbankCandleReadinessState, TbankMarketDataEvent, TbankMarketDataStreamState,
-    subscribe_market_data_events,
+    register_tbank_custom_data,
 };
 pub use subscriptions::TbankSubscriptionRegistry;
 pub use trades::{TbankQuoteTick, TbankTradeTick};

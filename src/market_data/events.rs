@@ -1,10 +1,9 @@
-use std::sync::OnceLock;
+use std::{any::Any, sync::Arc};
 
-use nautilus_core::UnixNanos;
+use nautilus_common::messages::DataEvent;
+use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_model::data::{CustomData, CustomDataTrait, Data, DataType, HasTsInit};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
-
-const MARKET_DATA_EVENT_CAPACITY: usize = 10_240;
 
 /// Operational lifecycle state of one T-Bank market-data stream group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,12 +47,13 @@ impl TbankMarketDataStreamState {
     }
 }
 
-/// A typed market-data lifecycle event emitted by the T-Bank adapter.
+/// A typed market-data lifecycle event emitted through the Nautilus custom-data pipeline.
 ///
 /// Generation ownership, task cancellation, and stale-worker fencing stay inside the adapter.
 /// Consumers receive stable logical IDs and never need to parse adapter task keys or lifecycle
 /// stage strings.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TbankMarketDataEvent {
     /// The current logical stream changed state.
     StreamState {
@@ -65,6 +65,10 @@ pub enum TbankMarketDataEvent {
         readiness_ids: Vec<String>,
         /// Human-readable explanation for the state transition.
         reason: String,
+        /// UNIX timestamp (nanoseconds) when the transition occurred.
+        ts_event: UnixNanos,
+        /// UNIX timestamp (nanoseconds) when the event instance was initialized.
+        ts_init: UnixNanos,
     },
     /// The logical stream is no longer part of the desired subscription snapshot.
     StreamRetired {
@@ -74,6 +78,10 @@ pub enum TbankMarketDataEvent {
         readiness_ids: Vec<String>,
         /// Human-readable explanation for the retirement.
         reason: String,
+        /// UNIX timestamp (nanoseconds) when the transition occurred.
+        ts_event: UnixNanos,
+        /// UNIX timestamp (nanoseconds) when the event instance was initialized.
+        ts_init: UnixNanos,
     },
     /// The current logical candle source changed readiness state.
     CandleReadiness {
@@ -87,7 +95,135 @@ pub enum TbankMarketDataEvent {
         ready_through: Option<UnixNanos>,
         /// Human-readable explanation for the readiness transition.
         reason: String,
+        /// UNIX timestamp (nanoseconds) when the transition occurred.
+        ts_event: UnixNanos,
+        /// UNIX timestamp (nanoseconds) when the event instance was initialized.
+        ts_init: UnixNanos,
     },
+}
+
+impl TbankMarketDataEvent {
+    const TYPE_NAME: &'static str = "TbankMarketDataEvent";
+
+    fn timestamps() -> (UnixNanos, UnixNanos) {
+        let now = get_atomic_clock_realtime().get_time_ns();
+        (now, now)
+    }
+
+    /// Creates a stream-state transition with Nautilus event timestamps.
+    #[must_use]
+    pub fn stream_state(
+        stream_id: String,
+        state: TbankMarketDataStreamState,
+        readiness_ids: Vec<String>,
+        reason: String,
+    ) -> Self {
+        let (ts_event, ts_init) = Self::timestamps();
+        Self::StreamState {
+            stream_id,
+            state,
+            readiness_ids,
+            reason,
+            ts_event,
+            ts_init,
+        }
+    }
+
+    /// Creates a stream-retirement transition with Nautilus event timestamps.
+    #[must_use]
+    pub fn stream_retired(stream_id: String, readiness_ids: Vec<String>, reason: String) -> Self {
+        let (ts_event, ts_init) = Self::timestamps();
+        Self::StreamRetired {
+            stream_id,
+            readiness_ids,
+            reason,
+            ts_event,
+            ts_init,
+        }
+    }
+
+    /// Creates a candle-readiness transition with Nautilus event timestamps.
+    #[must_use]
+    pub fn candle_readiness(
+        readiness_id: String,
+        instrument_uid: String,
+        state: TbankCandleReadinessState,
+        ready_through: Option<UnixNanos>,
+        reason: String,
+    ) -> Self {
+        let (ts_event, ts_init) = Self::timestamps();
+        Self::CandleReadiness {
+            readiness_id,
+            instrument_uid,
+            state,
+            ready_through,
+            reason,
+            ts_event,
+            ts_init,
+        }
+    }
+
+    /// Returns the Nautilus data type used for MessageBus routing.
+    #[must_use]
+    pub fn data_type() -> DataType {
+        DataType::new(Self::TYPE_NAME, None, None)
+    }
+
+    pub(crate) fn into_data_event(self) -> DataEvent {
+        DataEvent::Data(Data::Custom(CustomData::from_arc(Arc::new(self))))
+    }
+
+    fn event_timestamp(&self) -> UnixNanos {
+        match self {
+            Self::StreamState { ts_event, .. }
+            | Self::StreamRetired { ts_event, .. }
+            | Self::CandleReadiness { ts_event, .. } => *ts_event,
+        }
+    }
+}
+
+impl HasTsInit for TbankMarketDataEvent {
+    fn ts_init(&self) -> UnixNanos {
+        match self {
+            Self::StreamState { ts_init, .. }
+            | Self::StreamRetired { ts_init, .. }
+            | Self::CandleReadiness { ts_init, .. } => *ts_init,
+        }
+    }
+}
+
+impl CustomDataTrait for TbankMarketDataEvent {
+    fn type_name(&self) -> &'static str {
+        Self::TYPE_NAME
+    }
+
+    fn type_name_static() -> &'static str {
+        Self::TYPE_NAME
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn ts_event(&self) -> UnixNanos {
+        self.event_timestamp()
+    }
+
+    fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+        Arc::new(self.clone())
+    }
+
+    fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn from_json(value: serde_json::Value) -> anyhow::Result<Arc<dyn CustomDataTrait>> {
+        Ok(Arc::new(serde_json::from_value::<Self>(value)?))
+    }
 }
 
 /// Candle-source readiness established by lifecycle recovery, an acknowledged initial live
@@ -103,18 +239,53 @@ pub enum TbankCandleReadinessState {
     Failed,
 }
 
-static MARKET_DATA_EVENTS: OnceLock<broadcast::Sender<TbankMarketDataEvent>> = OnceLock::new();
-
-fn market_data_event_sender() -> &'static broadcast::Sender<TbankMarketDataEvent> {
-    MARKET_DATA_EVENTS.get_or_init(|| broadcast::channel(MARKET_DATA_EVENT_CAPACITY).0)
+/// Registers T-Bank custom data types for Nautilus JSON deserialization.
+///
+/// Call this during process initialization before replaying persisted [`CustomData`]. The
+/// registration is idempotent and remains process-local, matching Nautilus custom-data contracts.
+pub fn register_tbank_custom_data() {
+    let _ = nautilus_model::data::ensure_custom_data_json_registered::<TbankMarketDataEvent>();
 }
 
-/// Subscribes to the ordered typed T-Bank market-data lifecycle stream for this process.
-#[must_use]
-pub fn subscribe_market_data_events() -> broadcast::Receiver<TbankMarketDataEvent> {
-    market_data_event_sender().subscribe()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub(crate) fn publish_market_data_event(event: TbankMarketDataEvent) {
-    let _ = market_data_event_sender().send(event);
+    #[test]
+    fn lifecycle_event_uses_the_nautilus_custom_data_contract() {
+        register_tbank_custom_data();
+        let event = TbankMarketDataEvent::stream_state(
+            "bars:group:0:1m".to_string(),
+            TbankMarketDataStreamState::Connected,
+            vec!["bars:group:0:1m:instrument:uid".to_string()],
+            "ready".to_string(),
+        );
+        let json = event.to_json().unwrap();
+        let decoded =
+            TbankMarketDataEvent::from_json(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(
+            decoded
+                .as_any()
+                .downcast_ref::<TbankMarketDataEvent>()
+                .unwrap(),
+            &event
+        );
+
+        let DataEvent::Data(Data::Custom(custom)) = event.clone().into_data_event() else {
+            panic!("lifecycle event must use DataEvent::Data(Data::Custom)");
+        };
+        assert_eq!(custom.data_type, TbankMarketDataEvent::data_type());
+
+        let json = serde_json::to_vec(&Data::Custom(custom)).unwrap();
+        let decoded = CustomData::from_json_bytes(&json).unwrap();
+        assert_eq!(decoded.data_type, TbankMarketDataEvent::data_type());
+        assert_eq!(
+            decoded
+                .data
+                .as_any()
+                .downcast_ref::<TbankMarketDataEvent>()
+                .unwrap(),
+            &event
+        );
+    }
 }

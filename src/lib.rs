@@ -34,3 +34,4 @@ pub use instruments::{
     TbankInstrumentMapper, TbankInstrumentMetadata, TbankInstrumentProvider,
     TbankMarketDataInstrumentMetadata,
 };
+pub use market_data::register_tbank_custom_data;

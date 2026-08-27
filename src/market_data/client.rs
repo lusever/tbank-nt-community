@@ -40,7 +40,7 @@ use crate::{
         candles::{ONE_MINUTE_NANOS, one_minute_candle_query_chunks},
         continuity::{BarContinuityDecision, BarContinuityTracker},
         converters::{candle_to_bar, last_price_to_quote, orderbook_to_snapshot, trade_to_tick},
-        events::publish_market_data_event,
+        events::register_tbank_custom_data,
         supervisor::{
             BackfillCoordinator, HistoricalRequestLimiter, MarketDataClient, RecoveryPublication,
             RecoveryRangeResult, retryable_stream_status,
@@ -150,9 +150,32 @@ struct MarketDataStreamHealthState {
 #[derive(Debug, Default)]
 struct MarketDataStreamHealth {
     state: std::sync::Mutex<MarketDataStreamHealthState>,
+    event_sender: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<DataEvent>>>,
 }
 
 impl MarketDataStreamHealth {
+    fn bind_event_sender(&self, sender: tokio::sync::mpsc::UnboundedSender<DataEvent>) {
+        *self
+            .event_sender
+            .lock()
+            .expect("market-data event sender lock") = Some(sender);
+    }
+
+    fn publish_event(&self, event: TbankMarketDataEvent) {
+        let sender = self
+            .event_sender
+            .lock()
+            .expect("market-data event sender lock")
+            .clone();
+        let Some(sender) = sender else {
+            tracing::debug!(event = ?event, "T-Bank lifecycle event sender is not bound");
+            return;
+        };
+        if let Err(error) = sender.send(event.into_data_event()) {
+            tracing::error!(%error, "failed to publish T-Bank lifecycle event");
+        }
+    }
+
     fn register(&self, task_key: &str) {
         let mut state = self.state.lock().expect("market-data lifecycle lock");
         Self::register_task_key(&mut state, task_key);
@@ -198,10 +221,11 @@ impl MarketDataStreamHealth {
 
     fn retire_task_key(&self, task_key: &str, reason: &str) {
         let mut state = self.state.lock().expect("market-data lifecycle lock");
-        Self::retire_task_key_locked(&mut state, task_key, None, reason);
+        self.retire_task_key_locked(&mut state, task_key, None, reason);
     }
 
     fn retire_task_key_locked(
+        &self,
         state: &mut MarketDataStreamHealthState,
         task_key: &str,
         stage: Option<&str>,
@@ -214,6 +238,7 @@ impl MarketDataStreamHealth {
         let readiness_ids = Self::readiness_ids_for_task_key_locked(state, task_key);
         if let Some(stage) = stage {
             trace_market_data_stream_event(
+                self,
                 MarketDataStreamEventInput {
                     stage,
                     task_key,
@@ -228,6 +253,7 @@ impl MarketDataStreamHealth {
             );
         }
         trace_market_data_stream_event(
+            self,
             MarketDataStreamEventInput {
                 stage: "stream_snapshot_replaced",
                 task_key,
@@ -255,7 +281,7 @@ impl MarketDataStreamHealth {
             .cloned()
             .collect::<Vec<_>>();
         for task_key in task_keys {
-            Self::retire_task_key_locked(&mut state, &task_key, stage, reason);
+            self.retire_task_key_locked(&mut state, &task_key, stage, reason);
         }
         state
             .current_task_keys
@@ -275,7 +301,7 @@ impl MarketDataStreamHealth {
             .cloned()
             .collect::<Vec<_>>();
         for old_task_key in old_task_keys {
-            Self::retire_task_key_locked(
+            self.retire_task_key_locked(
                 &mut state,
                 &old_task_key,
                 None,
@@ -313,7 +339,7 @@ impl MarketDataStreamHealth {
         let mut state = self.state.lock().expect("market-data lifecycle lock");
         let task_keys = state.expected_groups.iter().cloned().collect::<Vec<_>>();
         for task_key in task_keys {
-            Self::retire_task_key_locked(&mut state, &task_key, Some(stage), reason);
+            self.retire_task_key_locked(&mut state, &task_key, Some(stage), reason);
         }
         state.current_task_keys.clear();
         state.expected_groups.clear();
@@ -659,6 +685,7 @@ pub struct TbankDataClient {
 impl TbankDataClient {
     /// Creates a new instance.
     pub fn new(config: TbankDataClientConfig) -> Self {
+        register_tbank_custom_data();
         let resolved_instrument_stream_ids =
             Arc::new(RwLock::new(config.instrument_stream_ids.clone()));
         let historical_request_limiter =
@@ -1346,6 +1373,7 @@ impl TbankDataClient {
             .market_data
             .clone();
         let sender = get_data_event_sender();
+        self.stream_health.bind_event_sender(sender.clone());
         let timestamp_mode = self.config.candle_timestamp_mode;
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
@@ -1573,6 +1601,7 @@ impl TbankDataClient {
         self.stream_health
             .replace_expected("quotes:", expected_task_keys.iter().map(String::as_str));
         let sender = get_data_event_sender();
+        self.stream_health.bind_event_sender(sender.clone());
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
@@ -1708,6 +1737,7 @@ impl TbankDataClient {
         // only observe an old key after a replacement and cannot change the new task's health.
         self.stream_health.register(&task_key);
         let sender = get_data_event_sender();
+        self.stream_health.bind_event_sender(sender.clone());
         let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
@@ -2016,6 +2046,7 @@ async fn run_periodic_candle_poll(
                     );
                     if stream_health.is_current_task_key(&continuity_key) {
                         trace_market_data_stream_event(
+                            &stream_health,
                             MarketDataStreamEventInput {
                                 stage: "periodic_get_candles_failed",
                                 task_key: &continuity_key,
@@ -2413,6 +2444,7 @@ fn run_market_data_stream_worker(
                                                     &isolated_task_key,
                                                     || {
                                                         trace_market_data_stream_event(
+                                                            &stream_health,
                                                             MarketDataStreamEventInput {
                                                                 stage: "subscription_retry_isolated",
                                                                 task_key: &isolated_task_key,
@@ -3661,6 +3693,7 @@ struct MarketDataStreamEventInput<'a> {
 }
 
 fn trace_market_data_stream_event(
+    stream_health: &MarketDataStreamHealth,
     input: MarketDataStreamEventInput<'_>,
     readiness_ids: Vec<String>,
 ) {
@@ -3677,20 +3710,20 @@ fn trace_market_data_stream_event(
     );
     let stream_id = logical_stream_id(input.task_key);
     if input.stage == "stream_snapshot_replaced" {
-        publish_market_data_event(TbankMarketDataEvent::StreamRetired {
+        stream_health.publish_event(TbankMarketDataEvent::stream_retired(
             stream_id,
             readiness_ids,
-            reason: input.reason,
-        });
+            input.reason,
+        ));
         return;
     }
     if let Some(state) = TbankMarketDataStreamState::from_stage(input.stage) {
-        publish_market_data_event(TbankMarketDataEvent::StreamState {
+        stream_health.publish_event(TbankMarketDataEvent::stream_state(
             stream_id,
             state,
             readiness_ids,
-            reason: input.reason,
-        });
+            input.reason,
+        ));
     }
 }
 
@@ -3700,26 +3733,27 @@ fn trace_market_data_stream_event_if_current(
 ) {
     let task_key = input.task_key.to_string();
     stream_health.with_current_task_key_and_readiness(&task_key, |readiness_ids| {
-        trace_market_data_stream_event(input, readiness_ids);
+        trace_market_data_stream_event(stream_health, input, readiness_ids);
     });
 }
 
 fn publish_candle_readiness(
+    stream_health: &MarketDataStreamHealth,
     state: TbankCandleReadinessState,
     task_key: &str,
     instrument_uid: &str,
     ready_through: Option<i128>,
     reason: String,
 ) {
-    publish_market_data_event(TbankMarketDataEvent::CandleReadiness {
-        readiness_id: logical_readiness_id(task_key),
-        instrument_uid: instrument_uid.to_string(),
+    stream_health.publish_event(TbankMarketDataEvent::candle_readiness(
+        logical_readiness_id(task_key),
+        instrument_uid.to_string(),
         state,
-        ready_through: ready_through
+        ready_through
             .and_then(|value| u64::try_from(value).ok())
             .map(UnixNanos::from),
         reason,
-    });
+    ));
 }
 
 fn publish_candle_readiness_if_current(
@@ -3732,7 +3766,14 @@ fn publish_candle_readiness_if_current(
 ) {
     let task_key_copy = task_key.to_string();
     stream_health.with_current_task_key(&task_key_copy, || {
-        publish_candle_readiness(state, task_key, instrument_uid, ready_through, reason);
+        publish_candle_readiness(
+            stream_health,
+            state,
+            task_key,
+            instrument_uid,
+            ready_through,
+            reason,
+        );
     });
 }
 
@@ -4436,6 +4477,29 @@ mod tests {
 
     use super::*;
 
+    fn lifecycle_event_receiver(
+        health: &MarketDataStreamHealth,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<DataEvent> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        health.bind_event_sender(sender);
+        receiver
+    }
+
+    fn try_recv_lifecycle_event(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    ) -> std::result::Result<TbankMarketDataEvent, tokio::sync::mpsc::error::TryRecvError> {
+        let event = receiver.try_recv()?;
+        let DataEvent::Data(Data::Custom(custom)) = event else {
+            panic!("expected T-Bank lifecycle custom data, got {event:?}");
+        };
+        custom
+            .data
+            .as_any()
+            .downcast_ref::<TbankMarketDataEvent>()
+            .cloned()
+            .ok_or(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    }
+
     fn q(units: i64, nano: i32) -> Option<Quotation> {
         Some(Quotation { units, nano })
     }
@@ -4750,12 +4814,12 @@ mod tests {
         let readiness_key = format!("{group_key}:instrument:SBER_TQBR");
         client.stream_health.register(group_key);
         client.stream_health.register_current(&readiness_key);
-        let mut events = crate::market_data::subscribe_market_data_events();
+        let mut events = lifecycle_event_receiver(&client.stream_health);
 
         client.stop_market_data_streams("subscriptions disabled for reconnect", true);
 
         let stream = loop {
-            match events.try_recv() {
+            match try_recv_lifecycle_event(&mut events) {
                 Ok(TbankMarketDataEvent::StreamState {
                     stream_id, state, ..
                 }) if stream_id == "bars:group:opt_out:1m" => break state,
@@ -4766,7 +4830,7 @@ mod tests {
         assert_eq!(stream, TbankMarketDataStreamState::Dead);
 
         let retirement = loop {
-            match events.try_recv() {
+            match try_recv_lifecycle_event(&mut events) {
                 Ok(TbankMarketDataEvent::StreamRetired {
                     stream_id,
                     readiness_ids,
@@ -4806,14 +4870,14 @@ mod tests {
             .stream_health
             .mark_operational("bars:generation:1:group:0:1m");
         assert!(client.is_connected());
-        let mut events = crate::market_data::subscribe_market_data_events();
+        let mut events = lifecycle_event_receiver(&client.stream_health);
 
         client.bar_subscriptions.clear();
         client.schedule_bar_streams().unwrap();
 
         assert!(client.is_connected());
         let (stream_id, readiness_ids) = loop {
-            match events.try_recv() {
+            match try_recv_lifecycle_event(&mut events) {
                 Ok(TbankMarketDataEvent::StreamRetired {
                     stream_id,
                     readiness_ids,
@@ -5745,7 +5809,7 @@ mod tests {
         health.register(task_key);
         health.register_current(&readiness_key);
         health.mark_operational(task_key);
-        let mut events = crate::market_data::subscribe_market_data_events();
+        let mut events = lifecycle_event_receiver(&health);
         let kind = TbankStreamKind::Bars {
             bar_types: HashMap::from([("uid-dead".to_string(), sber_bar_type())]),
         };
@@ -5770,7 +5834,7 @@ mod tests {
         assert!(!health.is_operational());
 
         let event = loop {
-            match events.try_recv() {
+            match try_recv_lifecycle_event(&mut events) {
                 Ok(TbankMarketDataEvent::CandleReadiness {
                     readiness_id,
                     state,
@@ -6290,7 +6354,7 @@ mod tests {
         let kind = TbankStreamKind::Bars {
             bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
         };
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
         let metadata = Arc::new(RwLock::new(HashMap::from([(
             "sber-uid".to_string(),
             sber_market_data_metadata(),
@@ -6299,7 +6363,7 @@ mod tests {
         stream_health.register(task_key);
         stream_health.mark_operational(task_key);
         stream_health.register_current(&readiness_key);
-        let mut events = crate::market_data::subscribe_market_data_events();
+        stream_health.bind_event_sender(sender.clone());
         let mut continuity = HashMap::new();
         let watermarks = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let response = MarketDataResponse {
@@ -6339,8 +6403,12 @@ mod tests {
             1_060_000_000_000
         );
 
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DataEvent::Data(Data::Bar(_)))
+        ));
         let event = loop {
-            match events.try_recv() {
+            match try_recv_lifecycle_event(&mut events) {
                 Ok(TbankMarketDataEvent::CandleReadiness {
                     readiness_id,
                     state,
@@ -6350,11 +6418,10 @@ mod tests {
                     break (state, ready_through);
                 }
                 Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                     panic!("initial live candle readiness event missing")
                 }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     panic!("candle readiness event channel closed")
                 }
             }
