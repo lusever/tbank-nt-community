@@ -28,8 +28,7 @@ path = "src/bin/tbank_accounts.rs"
 required-features = ["tools"]
 
 [features]
-default = ["high-precision"]
-high-precision = ["nautilus-model/high-precision"]
+default = []
 sandbox-tests = []
 sandbox-futures-tests = []
 tools = [

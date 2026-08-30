@@ -142,10 +142,6 @@ consumer that owns the data policy.
 See the [capability matrix](docs/integrations/tbank.md) for the exact supported request and order
 surface.
 
-The crate enables Nautilus `high-precision` mode by default, matching official venue adapters. A
-consumer that disables default features must make the same precision choice for all direct Nautilus
-dependencies.
-
 Tokens and account IDs can be supplied in config, but environment variables are preferred:
 
 ```dotenv
