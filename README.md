@@ -1,89 +1,97 @@
 # tbank-nt-community
 
-> This is an independent community project. It is not affiliated with, endorsed by, or supported
-> by Nautech Systems Pty Ltd or the official NautilusTrader project.
+> Это независимый проект сообщества. Он не связан с Nautech Systems Pty Ltd и официальным
+> проектом NautilusTrader, а также не поддерживается и не одобрен ими.
 
-Rust-native T-Bank Invest API adapter for NautilusTrader.
+Rust-нативный адаптер API T-Bank Invest для NautilusTrader.
 
-The repository contains venue integration code only. Trading strategies, portfolio policy,
-position sizing, research, and live-runner orchestration belong in consumer repositories.
+Официальная документация T-Invest API доступна в [портале разработчика T-Bank](https://developer.tbank.ru/invest/intro/intro); [справочник API](https://developer.tbank.ru/invest/api) содержит описание сервисов и методов.
 
-## Status
+Репозиторий содержит только код интеграции с торговой площадкой. Торговые стратегии, портфельная
+политика, определение размера позиций, исследования и оркестрация запуска в реальном времени должны
+находиться в репозиториях потребителей.
 
-Rust-only adapter with NautilusTrader pinned to a Git source revision.
+## Статус
 
-Compatibility:
+Адаптер только для Rust; NautilusTrader закреплён на ревизии Git-источника.
 
-| tbank-nt-community | NautilusTrader | Rust | T-Bank contracts |
+Совместимость:
+
+| tbank-nt-community | NautilusTrader | Rust | Контракты T-Bank |
 | --- | --- | --- | --- |
 | `0.2.x` | `v1.231.0` | `1.97.1` | Release 1.49 |
 
-## Scope
+## Область поддержки
 
-Supported:
+Поддерживается:
 
-- MOEX TQBR equities and MOEX futures.
-- SPB equities, including `SPBKZ` shares settled in `KZT`.
-- Sandbox and live environments.
-- Instruments and symbol mapping.
-- Market data bars, trades, quotes, and order book snapshots.
-- Historical bars and trades through the main Nautilus data client.
-- Market, limit, stop-market, market-if-touched, trailing-stop-market, and
-  trailing-stop-limit execution mapping.
-- Broker order routing, deterministic request idempotency, and Nautilus execution reconciliation.
+- Акции MOEX TQBR и фьючерсы MOEX.
+- Акции SPB, включая акции `SPBKZ` с расчётами в `KZT`.
+- Песочница и рабочая среда.
+- Инструменты и сопоставление символов.
+- Рыночные данные: бары, сделки, котировки и снимки книги ордеров.
+- Исторические бары и сделки через основной клиент данных Nautilus.
+- Сопоставление исполнения для рыночных, лимитных, stop-market, market-if-touched,
+  trailing-stop-market и trailing-stop-limit ордеров.
+- Маршрутизация ордеров через брокера, детерминированная идемпотентность запросов и
+  reconciliation исполнения Nautilus.
 
-Not currently supported:
+В настоящее время не поддерживается:
 
-- Python bindings.
-- OTC, dealer, ETFs, bonds, and currencies as complete trading products.
-- Native venue order book deltas.
-- `OrderFillVoided`: T-Bank does not publish an authoritative trade-void/correction reference,
-  voided quantity, or reopened-order signal, so the adapter does not infer this event from order or
-  operation cancellation states.
+- Привязки для Python.
+- OTC, дилерские инструменты, ETF, облигации и валюты как полноценные торговые продукты.
+- Нативные дельты книги ордеров торговой площадки.
+- `OrderFillVoided`: T-Bank не публикует авторитетную ссылку на отмену или исправление сделки,
+  отменённый объём либо сигнал о повторном открытии ордера, поэтому адаптер не выводит это событие
+  из состояний отмены ордера или операции.
 
-## Distribution and use
+## Распространение и использование
 
-Releases are **Git-only**. This crate is intentionally not published to crates.io
-(`publish = false`); immutable signed Git tags are the distribution artifacts.
+Релизы распространяются **только через Git**. Этот crate намеренно не публикуется в crates.io
+(`publish = false`); артефактами распространения являются неизменяемые подписанные Git-теги.
 
-Use a local path during development:
+Для разработки используйте локальный путь:
 
 ```toml
 tbank-nt-community = { path = "../tbank-nt-community" }
 ```
 
-For a reproducible Git dependency, use an immutable tag:
+Для воспроизводимой Git-зависимости используйте неизменяемый тег:
 
 ```toml
 tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.2.1" }
 ```
 
-All direct Nautilus dependencies in the consumer must use the same `v1.231.0` source as this
-adapter. Mixing registry, branch, and Git-tag sources can create incompatible duplicate Nautilus
-domain types.
+Все прямые зависимости потребителя от Nautilus должны использовать тот же источник `v1.231.0`,
+что и этот адаптер. Смешивание источников из registry, ветки и Git-тега может создать
+несовместимые дубликаты доменных типов Nautilus.
 
-Native trailing stops accept Nautilus `TrailingOffsetType::Price` and
-`TrailingOffsetType::BasisPoints`. Basis points are converted to the percentage representation
-required by T-Bank (`100 bps = 1%`). `Ticks`, `PriceTier`, and trigger sources other than
-`Default`/`LastPrice` are rejected locally because T-Bank cannot preserve those semantics. `TrailingStopLimit` requires a
-`limit_offset`; omitting `activation_price` requests T-Bank's immediate trailing activation.
+Нативные trailing stop принимают значения Nautilus `TrailingOffsetType::Price` и
+`TrailingOffsetType::BasisPoints`. Базисные пункты преобразуются в процентное представление,
+требуемое T-Bank (`100 bps = 1%`). `Ticks`, `PriceTier` и источники срабатывания, отличные от
+`Default`/`LastPrice`, локально отклоняются, поскольку текущий wire-контракт T-Bank не позволяет
+сохранить исходный тип или семантику. Отсутствующий источник срабатывания и `Default` при этом
+нормализуются адаптером в `LastPrice`. Для `TrailingStopLimit` требуется `limit_offset` (в T-Bank
+он передаётся как `spread`); отсутствие `activation_price` отправляет `instant_execution = true`,
+запрашивая немедленную активацию trailing stop.
 
-Order submission follows Nautilus lifecycle semantics: local validation failures emit
-`OrderDenied`, while `OrderSubmitted` is emitted only after local preflight succeeds. Order lists
-are supported for independent orders with all-leg preflight; contingent OCO/OTO/OUO lists are
-denied as a whole because T-Bank cannot preserve their semantics.
+Отправка ордеров следует семантике жизненного цикла Nautilus: ошибки локальной валидации создают
+событие `OrderDenied`, а `OrderSubmitted` создаётся только после успешного локального preflight.
+Списки ордеров поддерживаются для независимых ордеров после preflight всех ног. Списки с условными
+связями OCO/OTO/OUO отклоняются целиком, поскольку T-Bank не может сохранить их семантику.
 
-The adapter follows Nautilus multi-venue conventions: `TBANK` is the broker execution client,
-while public exchange venues are `MOEX` and `SPBE`. Typed values are exported as
-`TBANK_CLIENT_ID`, `MOEX_VENUE`, `SPBE_VENUE`, and `TBANK_VENUE`. Instrument IDs use
-`{ticker}_{class_code}.MOEX` for MOEX shares/futures and `{ticker}_{class_code}.SPBE` for SPB shares;
-broker accounts use `TBANK-{broker_account_id}`.
+Адаптер следует соглашениям Nautilus для нескольких торговых площадок: `TBANK` — клиент исполнения
+брокера, а публичные торговые площадки — `MOEX` и `SPBE`. Типизированные значения экспортируются
+как `TBANK_CLIENT_ID`, `MOEX_VENUE`, `SPBE_VENUE` и `TBANK_VENUE`. Идентификаторы инструментов имеют
+вид `{ticker}_{class_code}.MOEX` для акций/фьючерсов MOEX и `{ticker}_{class_code}.SPBE` для акций
+SPB; брокерские счета имеют вид `TBANK-{broker_account_id}`.
 
-Nautilus supplies the concrete client config and client name to each `create` call. Both client
-factories are stateless and reject a wrong config type instead of silently substituting defaults.
-The execution config owns the trader identity, matching Nautilus' adapter config contract.
+Nautilus передаёт конкретную конфигурацию клиента и имя клиента в каждый вызов `create`. Обе
+фабрики клиентов не хранят состояние и отклоняют конфигурацию неверного типа, не подставляя
+молчаливые значения по умолчанию. Конфигурация исполнения отвечает за идентификатор трейдера,
+что соответствует контракту конфигурации адаптера Nautilus.
 
-Minimal `LiveNode` wiring:
+Минимальная настройка `LiveNode`:
 
 ```rust
 use nautilus_common::enums::Environment as NautilusEnvironment;
@@ -128,37 +136,39 @@ let node = LiveNode::builder(trader_id, NautilusEnvironment::Sandbox)?
 # Ok::<(), anyhow::Error>(())
 ```
 
-The data client loads the supported MOEX shares, SPB shares, and MOEX futures during `connect`,
-publishes Nautilus `Instrument` events before market data starts, and uses the same metadata to map
-T-Bank lot quantities to Nautilus share/contract quantities. Custom remote endpoints must use HTTPS; plaintext HTTP
-is accepted only for loopback test servers.
+Клиент данных загружает поддерживаемые акции MOEX, акции SPB и фьючерсы MOEX во время `connect`,
+публикует события Nautilus `Instrument` до начала передачи рыночных данных и использует те же
+метаданные для сопоставления лотов T-Bank с количеством акций/контрактов Nautilus. Пользовательские
+удалённые endpoint должны использовать HTTPS; обычный HTTP принимается только для loopback
+тестовых серверов.
 
-Historical `RequestBars` and `RequestTrades` messages are handled by that same data client, as in
-the Nautilus OKX, Bybit, and Deribit adapters. There is no downloader crate or catalog CLI in this
-repository. Candle requests are chunked to T-Bank limits; `GetLastTrades` is limited to T-Bank's
-guaranteed recent window. Catalog materialization and long-range archive ingestion belong in the
-consumer that owns the data policy.
+Сообщения `RequestBars` и `RequestTrades` для исторических данных обрабатываются тем же клиентом
+данных, как в адаптерах Nautilus для OKX, Bybit и Deribit. В этом репозитории нет crate для загрузки
+данных и CLI для каталога. Запросы свечей разбиваются на части в соответствии с ограничениями
+T-Bank; `GetLastTrades` ограничен гарантированным T-Bank недавним окном. Материализация каталога и
+загрузка длинных архивов относятся к потребителю, который отвечает за политику работы с данными.
 
-See the [capability matrix](docs/integrations/tbank.md) for the exact supported request and order
-surface.
+Точная поддерживаемая поверхность запросов и ордеров приведена в
+[матрице возможностей](docs/integrations/tbank.md).
 
-Tokens and account IDs can be supplied in config, but environment variables are preferred:
+Токены и идентификаторы счетов можно передавать в конфигурации, но предпочтительнее использовать
+переменные окружения:
 
 ```dotenv
-# Live
+# Рабочая среда
 TBANK_INVEST_TOKEN=...
 TBANK_ACCOUNT_ID=...
 
-# Sandbox
+# Песочница
 TBANK_SANDBOX_INVEST_TOKEN=...
 TBANK_SANDBOX_ACCOUNT_ID=...
 ```
 
-`TBANK_INVEST_TOKEN` is the live-token environment variable.
+`TBANK_INVEST_TOKEN` — переменная окружения для токена рабочей среды.
 
-Secret values are redacted from config serialization and debug output.
+Секретные значения маскируются при сериализации конфигурации и в отладочном выводе.
 
-## Offline validation
+## Офлайн-валидация
 
 ```bash
 bash scripts/check-proto-contracts.sh
@@ -170,21 +180,21 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 bash scripts/check-public-method-docs.sh
 ```
 
-Default tests do not connect to T-Bank and do not submit orders.
+Тесты по умолчанию не подключаются к T-Bank и не отправляют ордера.
 
-## T-Bank sandbox validation
+## Валидация в песочнице T-Bank
 
-Required environment variables:
+Необходимые переменные окружения:
 
 - `TBANK_SANDBOX_INVEST_TOKEN`
-- `TBANK_SANDBOX_ACCOUNT_ID` for account and order tests
-- `TBANK_SANDBOX_TEST_INSTRUMENT` optionally overrides `SBER_TQBR.MOEX`; the acceptance harness currently validates the MOEX/TQBR RUB share path
-- `TBANK_SANDBOX_FUTURES_INSTRUMENT` is required for the separate MOEX/SPBFUT acceptance feature and must name an active RUB futures contract as `TICKER_SPBFUT.MOEX`
-- `TBANK_SANDBOX_PAY_IN_RUB` optionally funds the configured sandbox account
+- `TBANK_SANDBOX_ACCOUNT_ID` для тестов счетов и ордеров
+- `TBANK_SANDBOX_TEST_INSTRUMENT` — необязательная замена `SBER_TQBR.MOEX`; текущий приёмочный контур проверяет путь акции MOEX/TQBR в RUB
+- `TBANK_SANDBOX_FUTURES_INSTRUMENT` — необходима для отдельной приёмочной функции MOEX/SPBFUT и должна содержать активный фьючерсный контракт в RUB в формате `TICKER_SPBFUT.MOEX`
+- `TBANK_SANDBOX_PAY_IN_RUB` — необязательное пополнение настроенного счёта песочницы
 
-Store these values in the repository-local `.env`, which is excluded from Git, and restrict the
-file to the current user. The tests do not load `.env` themselves, so export it into the current
-shell before running any sandbox command:
+Храните эти значения в локальном файле `.env`, исключённом из Git, и ограничьте доступ к файлу
+текущим пользователем. Тесты сами не загружают `.env`, поэтому перед выполнением любой команды
+для песочницы экспортируйте переменные в текущую оболочку:
 
 ```bash
 chmod 600 .env
@@ -193,9 +203,10 @@ source .env
 set +a
 ```
 
-Do not print the file or put its values directly into commands, logs, chat, or tracked files.
+Не выводите файл и не помещайте его значения непосредственно в команды, логи, чат или отслеживаемые
+файлы.
 
-Read-only checks:
+Проверки только для чтения:
 
 ```bash
 cargo test --locked \
@@ -205,7 +216,7 @@ cargo test --locked \
   -- --ignored --exact --nocapture
 ```
 
-Limit/stop placement and cancellation:
+Размещение и отмена лимитных/стоп-ордеров:
 
 ```bash
 cargo test --locked \
@@ -215,7 +226,7 @@ cargo test --locked \
   -- --ignored --exact --nocapture
 ```
 
-Market-fill round trip:
+Полный цикл с рыночным исполнением:
 
 ```bash
 cargo test --locked \
@@ -225,7 +236,7 @@ cargo test --locked \
   -- --ignored --exact --nocapture
 ```
 
-Full sandbox acceptance:
+Полная приёмочная проверка в песочнице:
 
 ```bash
 cargo test --locked \
@@ -234,8 +245,8 @@ cargo test --locked \
   -- --ignored --test-threads=1 --nocapture
 ```
 
-MOEX futures acceptance is intentionally separate because contracts expire and the active
-contract must be supplied explicitly:
+Проверка фьючерсов MOEX намеренно вынесена отдельно, поскольку контракты истекают, а активный
+контракт необходимо передавать явно:
 
 ```bash
 cargo test --locked \
@@ -244,94 +255,97 @@ cargo test --locked \
   -- --ignored --test-threads=1 --nocapture
 ```
 
-This separate test target resolves the contract through `FutureBy`, checks futures fills and order
-reports in Nautilus points, verifies the broker stop quotation, reconnect recovery, cancellation,
-and leaves no futures position or active stop order behind. Missing futures configuration fails
-this explicit suite; the default share acceptance does not depend on an expiring futures symbol.
+Эта отдельная тестовая цель разрешает контракт через `FutureBy`, проверяет исполнения фьючерсов и
+отчёты по ордерам в пунктах Nautilus, проверяет котировку стоп-ордера брокера, восстановление после
+переподключения и отмену, а также оставляет после себя нулевую позицию по фьючерсам и отсутствие
+активного стоп-ордера. Отсутствие конфигурации фьючерсов приводит к ошибке этого явно запущенного
+набора; приёмочная проверка акций по умолчанию не зависит от истекающего фьючерсного символа.
 
-For adapter, protobuf, transport, factory, execution, market-data, config, or sandbox-test changes,
-agents run this full acceptance suite by default immediately after `cargo test --locked`. The
-repository instructions provide standing authorization for sandbox mutations only; live trading is
-never implied. A failed or skipped acceptance run must be reported and is not a successful
-validation result.
+При изменениях адаптера, protobuf, транспорта, фабрик, исполнения, рыночных данных, конфигурации
+или sandbox-тестов агенты по умолчанию сразу после `cargo test --locked` запускают полный приёмочный
+набор. Инструкции репозитория дают постоянное разрешение только на мутации в песочнице; торговля
+в рабочей среде никогда не подразумевается. Неудачный или пропущенный acceptance-запуск необходимо
+отдельно указать; он не является успешным результатом валидации.
 
-The feature flag, ignored-test boundary, and explicit test name are the opt-in for sandbox order
-submission. A full acceptance run intentionally submits both resting and market orders. Tests
-serialize access to the account and clean up regular orders, stop orders, and market-fill position
-changes. Missing sandbox credentials or account configuration fails the affected test instead of
-self-skipping it.
+Флаг функции, граница тестов, помеченных `ignored`, и явное имя теста являются opt-in для отправки
+ордеров в песочницу. Полный приёмочный запуск намеренно отправляет и отложенные, и рыночные ордера. Тесты
+сериализуют доступ к счёту и очищают обычные ордера, стоп-ордера и изменения позиции после рыночных
+исполнений. Отсутствие учётных данных песочницы или конфигурации счёта приводит к ошибке затронутого
+теста, а не к его автоматическому пропуску.
 
-Sandbox execution acceptance drives the public Nautilus `ExecutionClient` boundary and asserts
-`OrderSubmitted`, execution reports, account state, cancellation, and report-based recovery after
-creating a fresh client. It does not call adapter-internal submit helpers or inspect adapter-owned
-JSON/JSONL state.
+Приёмочная проверка исполнения в песочнице работает через публичную границу Nautilus
+`ExecutionClient` и проверяет `OrderSubmitted`, отчёты об исполнении, состояние счёта, отмену и
+восстановление на основе отчётов после создания нового клиента. Она не вызывает внутренние helper-
+методы отправки адаптера и не проверяет принадлежащее адаптеру состояние JSON/JSONL.
 
-## Safety
+## Безопасность
 
-The execution client is dry by default. Order submission requires `enable_trading = true`.
-Live submission additionally requires `allow_live_trading = true`.
-Execution `connect` publishes the initial account state and waits up to
-`account_registration_timeout` (30 seconds by default) for Nautilus to register that account before
-reporting the client as connected.
+По умолчанию клиент исполнения работает в dry-режиме. Для отправки ордеров требуется
+`enable_trading = true`. Для отправки в рабочую среду дополнительно требуется
+`allow_live_trading = true`. Во время `connect` клиент исполнения публикует начальное состояние
+счёта и ожидает до `account_registration_timeout` (по умолчанию 30 секунд), пока Nautilus
+зарегистрирует этот счёт, прежде чем сообщить о подключении клиента.
 
-Never place access tokens in tracked repository files, command output, fixtures, or CI artifacts.
-Private broker tracking metadata—authorization metadata, account identifiers, venue order or
-position identifiers, and broker request/idempotency IDs—is not included in human-readable adapter
-errors or logs. Public instrument identifiers such as `ticker`, `class_code`, `FIGI`, and
-`instrument_uid` may be included when useful for diagnostics.
+Никогда не размещайте токены доступа в отслеживаемых файлах репозитория, выводе команд, фикстурах
+или артефактах CI. Приватные метаданные брокерского отслеживания — метаданные авторизации,
+идентификаторы счетов, идентификаторы ордеров или позиций торговой площадки, а также broker
+request/idempotency IDs — не включаются в удобочитаемые ошибки или логи адаптера. Публичные
+идентификаторы инструментов, такие как `ticker`, `class_code`, `FIGI` и `instrument_uid`, можно
+включать, если они полезны для диагностики.
 
-The adapter does not persist parallel lifecycle, event-journal, or market-data-health files.
-Nautilus execution events and reconciliation reports are the execution contract. The adapter
-keeps one debounced desired subscription snapshot, opens each broker stream and validates its
-subscription acknowledgement before publishing runtime data. Venue data that races ahead of the
-acknowledgement is held in a bounded per-stream buffer and drained in order after the ACK.
-`GetCandles` catch-up then runs
-at startup and after reconnects behind one client-wide request limiter shared by every stream group
-and periodic poller. Recovery never runs in front of a closed stream, never resets reconnect
-backoff, and does not infer missing data from sparse wall-clock minutes. Stream and recovery
-transitions are emitted through structured tracing and the ordered typed `TbankMarketDataEvent`
-stream for consumer health projection. The adapter hides reconnect generations and publishes
-stable logical stream/readiness IDs, including explicit retirement events. A panicked stream
-session is converted into a supervised failure and reconnected instead of silently detaching its
-task. Normal worker completion is also supervised;
-an exhausted reconnect burst enters a bounded historical-gap recovery and a delayed half-open
-probe. Historical recovery is single-flight deduplicated across stream groups and periodic polls,
-shares the client-wide limiter, and opens a circuit after repeated failures. A new subscription ACK
-does not publish candle readiness until its watermark gap has been recovered, unless the first
-acknowledged live candle establishes the initial baseline because there is no bounded gap to check.
-Terminal stream health
-is reflected by `is_connected() == false`; consumers own the execution gate, process-stop policy,
-and any durable operational storage. Every Nautilus market-data `Price` uses the instrument
-precision derived from `min_price_increment`; wire-value scale is never treated as instrument
-metadata.
+Адаптер не сохраняет параллельные файлы жизненного цикла, журнала событий или состояния здоровья
+рыночных данных. Контрактом исполнения служат события исполнения Nautilus и reconciliation-отчёты.
+Адаптер хранит один snapshot желаемых подписок с debounce, открывает каждый поток брокера и
+проверяет подтверждение подписки до публикации runtime-данных. Данные торговой площадки, пришедшие
+до подтверждения, удерживаются в ограниченном буфере для каждого потока и после ACK выгружаются в
+порядке поступления. Затем `GetCandles` выполняет catch-up при запуске и после переподключений,
+используя один общий для клиента ограничитель запросов, разделяемый всеми группами потоков и
+периодическим poller. Восстановление никогда не выполняется перед закрытым потоком, не сбрасывает
+backoff переподключения и не выводит пропущенные данные из разреженных минут настенных часов.
+Переходы состояния потоков и восстановления публикуются через структурированную трассировку и
+упорядоченный типизированный поток `TbankMarketDataEvent` для построения проекции состояния
+потребителем. Адаптер скрывает поколения переподключений и публикует стабильные логические
+идентификаторы потоков/готовности, включая явные события завершения. Сессия потока, завершившаяся
+паникой, преобразуется в контролируемую ошибку и переподключается вместо незаметного отсоединения
+её задачи. Нормальное завершение worker также контролируется; исчерпанная серия переподключений
+переходит к ограниченному восстановлению исторического разрыва и отложенному half-open probe.
+Восстановление истории дедуплицируется в режиме single-flight между группами потоков и
+периодическими опросами, использует общий ограничитель клиента и открывает circuit после повторных
+ошибок. Новый ACK подписки не публикует готовность свечей, пока разрыв watermark не восстановлен,
+если только первая подтверждённая живая свеча не задаёт исходную baseline, поскольку проверять
+ограниченный разрыв в этом случае не нужно. Терминальное состояние здоровья потока отражается как
+`is_connected() == false`; потребители отвечают за execution gate, политику остановки процесса и
+любое долговременное операционное хранилище. Для каждого Nautilus market-data `Price` используется
+точность инструмента, выведенная из `min_price_increment`; масштаб wire-значения никогда не
+рассматривается как метаданные инструмента.
 
-## Tools
+## Инструменты
 
-The package includes one read-only operational tool behind the opt-in `tools` feature:
+Пакет содержит один операционный инструмент только для чтения, доступный за opt-in-флагом `tools`:
 
 - `tbank-accounts`
 
-Use `cargo run --features tools --bin <name> -- --help` for arguments.
-Universe selection, margin snapshots, strategy configuration, and other research tooling belong
-in adapter consumers.
+Используйте `cargo run --features tools --bin <name> -- --help`, чтобы просмотреть аргументы.
+Выбор множества инструментов, снимки маржи, конфигурация стратегий и другие исследовательские
+инструменты должны находиться в потребителях адаптера.
 
-## Proto contracts
+## Контракты protobuf
 
-T-Bank protobuf contracts are vendored under `proto/`. Their source revision is recorded in
-`proto/contracts.lock`; `proto/contracts.sha256` pins the exact vendored file set and contents.
-Contract updates must be isolated, reviewed, regenerated, and validated against offline and sandbox
-suites before release. T-Bank confirmed that the public contracts and generated bindings may be
-redistributed under the Apache License 2.0, including as part of an independent open-source project
-and crates.io package. The permission record and attribution are in
+Protobuf-контракты T-Bank хранятся в `proto/`. Их исходная ревизия записана в
+`proto/contracts.lock`; `proto/contracts.sha256` фиксирует точный набор vendored-файлов и их
+содержимое. Обновления контрактов должны быть изолированы, проверены, сгенерированы заново и
+проверены офлайн- и sandbox-наборами до выпуска. T-Bank подтвердил, что публичные контракты и
+сгенерированные привязки можно распространять по лицензии Apache License 2.0, в том числе как часть
+независимого проекта с открытым исходным кодом и пакета crates.io. Запись о разрешении и сведения
+об атрибуции находятся в [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Лицензия
+
+Оригинальный исходный код адаптера распространяется по лицензии Apache License 2.0. См.
+[LICENSE](LICENSE). Vendored protobuf-контракты T-Bank и сгенерированные привязки также
+распространяются по лицензии Apache License 2.0 и принадлежат соответствующим правообладателям;
+сторонние файлы сохраняют условия своих лицензий. См.
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## License
-
-The adapter's original source code is licensed under the Apache License 2.0. See
-[LICENSE](LICENSE). Vendored T-Bank protobuf contracts and generated bindings are also distributed
-under the Apache License 2.0 under their respective ownership; third-party files retain their
-respective terms. See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development and release expectations and
-[SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
+Ожидания по разработке и выпуску описаны в [CONTRIBUTING.md](CONTRIBUTING.md), а порядок
+ответственного сообщения об уязвимостях — в [SECURITY.md](SECURITY.md).
