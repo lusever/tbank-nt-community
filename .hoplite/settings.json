@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "ports": {"preview": 3000, "additional": {}},
+  "scripts": {
+    "setup": {
+      "enabled": true,
+      "command": "mise install rust@1.97.1 >/dev/null 2>&1; RUST_BIN=\"$HOME/.local/share/mise/installs/rust/1.97.1\"; for b in cargo rustc rustup rustfmt cargo-clippy clippy-driver rust-analyzer; do ln -sf \"$RUST_BIN/$b\" /usr/local/bin/$b; done; hash -r; rustc --version"
+    },
+    "run": {"enabled": true, "command": null},
+    "archive": {"enabled": true, "command": null},
+    "check": {"enabled": true, "command": null}
+  },
+  "mcpServers": []
+}
