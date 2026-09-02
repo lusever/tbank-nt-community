@@ -4,7 +4,7 @@
   "scripts": {
     "setup": {
       "enabled": true,
-      "command": "mise install rust@1.97.1 >/dev/null 2>&1; RUST_BIN=\"$HOME/.local/share/mise/installs/rust/1.97.1\"; for b in cargo rustc rustup rustfmt cargo-clippy clippy-driver rust-analyzer; do ln -sf \"$RUST_BIN/$b\" /usr/local/bin/$b; done; hash -r; rustc --version"
+      "command": "apt-get update >/dev/null 2>&1 && apt-get install -y git-lfs >/dev/null 2>&1 && mise install rust@1.97.1 >/dev/null 2>&1; RUST_BIN=\"$HOME/.local/share/mise/installs/rust/1.97.1\"; for b in cargo rustc rustup rustfmt cargo-clippy clippy-driver rust-analyzer; do ln -sf \"$RUST_BIN/$b\" /usr/local/bin/$b; done; hash -r; rustc --version && git lfs version"
     },
     "run": {"enabled": true, "command": null},
     "archive": {"enabled": true, "command": null},
