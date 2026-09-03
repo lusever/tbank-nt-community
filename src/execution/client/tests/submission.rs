@@ -1645,3 +1645,531 @@ async fn submit_response_partial_fill_returns_fallback_reports_without_polling()
     assert_eq!(pending.stage, TbankPendingSubmitStage::Filled);
     assert_eq!(pending.venue_order_id.as_deref(), Some("exchange-order-1"));
 }
+
+// ---------------------------------------------------------------------------
+// Failure classification and pending-submit lifecycle unit tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
+    use super::{SubmitFailureKind, classify_submit_failure};
+
+    // Local validation and configuration failures reject without reconciliation.
+    for error in [
+        TbankAdapterError::ConfigError("bad endpoint".to_string()),
+        TbankAdapterError::MissingToken,
+        TbankAdapterError::MissingAccountId,
+        TbankAdapterError::InvalidEndpoint,
+        TbankAdapterError::UnsupportedInstrument("bond".to_string()),
+        TbankAdapterError::InstrumentOutOfScope("SBER".to_string()),
+        TbankAdapterError::UnsupportedOrderType("StopLimit".to_string()),
+        TbankAdapterError::UnsupportedTimeInForce("Fok".to_string()),
+        TbankAdapterError::InvalidQuantity("negative".to_string()),
+        TbankAdapterError::InvalidPrice("nan".to_string()),
+        TbankAdapterError::QuantityNotMultipleOfLot {
+            quantity: "15".to_string(),
+            lot: 10,
+        },
+        TbankAdapterError::PriceNotMultipleOfTick {
+            price: "0.15".to_string(),
+            tick: "0.01".to_string(),
+        },
+        TbankAdapterError::ConversionError("rounding".to_string()),
+        TbankAdapterError::InvalidInstrumentIdentity("uid".to_string()),
+        TbankAdapterError::BrokerOrderIdentityUnresolved("id".to_string()),
+    ] {
+        assert_eq!(
+            classify_submit_failure(&error),
+            SubmitFailureKind::LocalRejected,
+            "local error {error:?}"
+        );
+    }
+
+    // Broker rejections are terminal and must not schedule reconciliation.
+    for error in [
+        TbankAdapterError::PermissionDenied("no access".to_string()),
+        TbankAdapterError::RateLimited("slow down".to_string()),
+    ] {
+        assert_eq!(
+            classify_submit_failure(&error),
+            SubmitFailureKind::BrokerRejected,
+            "broker rejection {error:?}"
+        );
+    }
+
+    // Outcome-unknown failures must trigger reconciliation, never a rejection.
+    for error in [
+        TbankAdapterError::InstrumentNotFound("SBER".to_string()),
+        TbankAdapterError::InstrumentMetadataUnresolved("SBER".to_string()),
+        TbankAdapterError::FuturesMarginUnresolved("Si".to_string()),
+        TbankAdapterError::SubmitOutcomeUnknown("timeout".to_string()),
+        TbankAdapterError::ReconnectFailed("transport".to_string()),
+    ] {
+        assert_eq!(
+            classify_submit_failure(&error),
+            SubmitFailureKind::OutcomeUnknown,
+            "outcome-unknown {error:?}"
+        );
+    }
+}
+
+#[test]
+fn submit_grpc_status_classification_matches_broker_semantics() {
+    use super::{SubmitFailureKind, classify_submit_grpc_status};
+
+    for code in [
+        Code::InvalidArgument,
+        Code::NotFound,
+        Code::AlreadyExists,
+        Code::FailedPrecondition,
+        Code::OutOfRange,
+        Code::Unimplemented,
+        Code::PermissionDenied,
+        Code::ResourceExhausted,
+        Code::Unauthenticated,
+    ] {
+        assert_eq!(
+            classify_submit_grpc_status(code),
+            SubmitFailureKind::BrokerRejected,
+            "code {code:?}"
+        );
+    }
+
+    for code in [
+        Code::Cancelled,
+        Code::Unknown,
+        Code::DeadlineExceeded,
+        Code::Aborted,
+        Code::Internal,
+        Code::DataLoss,
+        Code::Unavailable,
+    ] {
+        assert_eq!(
+            classify_submit_grpc_status(code),
+            SubmitFailureKind::OutcomeUnknown,
+            "code {code:?}"
+        );
+    }
+
+    assert_eq!(classify_submit_grpc_status(Code::Ok), SubmitFailureKind::BrokerRejected);
+}
+
+#[test]
+fn classify_cancel_failure_distinguishes_rejected_from_unknown() {
+    use super::{CancelFailureKind, classify_cancel_failure};
+
+    assert_eq!(
+        classify_cancel_failure(&TbankAdapterError::PermissionDenied("no".to_string())),
+        CancelFailureKind::BrokerRejected
+    );
+    assert_eq!(
+        classify_cancel_failure(&TbankAdapterError::RateLimited("slow".to_string())),
+        CancelFailureKind::OutcomeUnknown
+    );
+    assert_eq!(
+        classify_cancel_failure(&TbankAdapterError::InstrumentMetadataUnresolved("x".to_string())),
+        CancelFailureKind::OutcomeUnknown
+    );
+    assert_eq!(
+        classify_cancel_failure(&TbankAdapterError::UnsupportedOrderType("x".to_string())),
+        CancelFailureKind::LocalFailure
+    );
+}
+
+#[test]
+fn pending_stage_after_submit_response_marks_rejected_orders_terminal() {
+    use super::{TbankPendingSubmitStage, pending_stage_after_submit_response};
+
+    let rejected = pending_stage_after_submit_response(&TbankSubmitResponse::Order(PostOrderResponse {
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusRejected as i32,
+        ..PostOrderResponse::default()
+    }));
+    assert_eq!(rejected, TbankPendingSubmitStage::Rejected);
+
+    let accepted = pending_stage_after_submit_response(&TbankSubmitResponse::Order(PostOrderResponse {
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
+        ..PostOrderResponse::default()
+    }));
+    assert_eq!(accepted, TbankPendingSubmitStage::Submitted);
+
+    let stop = pending_stage_after_submit_response(&TbankSubmitResponse::StopOrder(
+        PostStopOrderResponse {
+            stop_order_id: "stop-1".to_string(),
+            ..PostStopOrderResponse::default()
+        },
+    ));
+    assert_eq!(stop, TbankPendingSubmitStage::Submitted);
+}
+
+#[test]
+fn pending_stage_from_order_status_maps_lifecycle_terminal_states() {
+    use super::{TbankPendingSubmitStage, pending_stage_from_order_status};
+
+    assert_eq!(pending_stage_from_order_status(OrderStatus::Accepted), Some(TbankPendingSubmitStage::Accepted));
+    assert_eq!(pending_stage_from_order_status(OrderStatus::PartiallyFilled), Some(TbankPendingSubmitStage::Filled));
+    assert_eq!(pending_stage_from_order_status(OrderStatus::Filled), Some(TbankPendingSubmitStage::Filled));
+    assert_eq!(pending_stage_from_order_status(OrderStatus::Rejected), Some(TbankPendingSubmitStage::Rejected));
+    assert_eq!(pending_stage_from_order_status(OrderStatus::Canceled), Some(TbankPendingSubmitStage::Cancelled));
+    assert_eq!(pending_stage_from_order_status(OrderStatus::Expired), Some(TbankPendingSubmitStage::Cancelled));
+    assert_eq!(pending_stage_from_order_status(OrderStatus::Initialized), None);
+    assert_eq!(pending_stage_from_order_status(OrderStatus::Triggered), None);
+}
+
+#[test]
+fn update_pending_submit_binds_venue_order_id_and_timestamp() {
+    use super::{TbankPendingSubmitStage, update_pending_submit};
+
+    let ts = UnixNanos::from(200_u64);
+    let mut pending = TbankPendingSubmit {
+        instrument_id: "SBER_TQBR.MOEX".to_string(),
+        submitted_ts: UnixNanos::from(100_u64),
+        quantity_units: Decimal::from(20),
+        side: TbankOrderSide::Buy,
+        order_type: TbankOrderType::Limit,
+        time_in_force: TimeInForce::Day,
+        trailing: None,
+        venue_order_id: None,
+        last_reconciliation_ts: None,
+        stage: TbankPendingSubmitStage::Submitted,
+    };
+
+    update_pending_submit(&mut pending, TbankPendingSubmitStage::Accepted, Some("venue-1".to_string()), ts);
+    assert_eq!(pending.stage, TbankPendingSubmitStage::Accepted);
+    assert_eq!(pending.venue_order_id.as_deref(), Some("venue-1"));
+    assert_eq!(pending.last_reconciliation_ts, Some(ts));
+
+    // A subsequent update without a venue order id keeps the bound identity.
+    update_pending_submit(&mut pending, TbankPendingSubmitStage::Filled, None, ts);
+    assert_eq!(pending.stage, TbankPendingSubmitStage::Filled);
+    assert_eq!(pending.venue_order_id.as_deref(), Some("venue-1"));
+}
+
+#[test]
+fn mark_pending_submit_order_report_only_touches_matching_client_order() {
+    use super::{TbankPendingSubmitStage, mark_pending_submit_order_report};
+
+    let ts = UnixNanos::from(200_u64);
+    let pending_submits: Arc<Mutex<HashMap<String, TbankPendingSubmit>>> =
+        Arc::new(Mutex::new(HashMap::from([(
+            "client-1".to_string(),
+            TbankPendingSubmit {
+                instrument_id: "SBER_TQBR.MOEX".to_string(),
+                submitted_ts: UnixNanos::from(100_u64),
+                quantity_units: Decimal::from(20),
+                side: TbankOrderSide::Buy,
+                order_type: TbankOrderType::Limit,
+                time_in_force: TimeInForce::Day,
+                trailing: None,
+                venue_order_id: None,
+                last_reconciliation_ts: None,
+                stage: TbankPendingSubmitStage::Submitted,
+            },
+        )])));
+
+    let report = OrderStatusReport::new(
+        "TBANK-001".into(),
+        InstrumentId::from("SBER_TQBR.MOEX"),
+        Some(ClientOrderId::from("client-1")),
+        VenueOrderId::from("venue-1"),
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Day,
+        OrderStatus::Accepted,
+        Quantity::from(20),
+        Quantity::from(0),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    );
+    mark_pending_submit_order_report(&pending_submits, &report);
+    let pending = pending_submits.lock().unwrap();
+    assert_eq!(pending.get("client-1").unwrap().stage, TbankPendingSubmitStage::Accepted);
+    assert_eq!(
+        pending.get("client-1").unwrap().venue_order_id.as_deref(),
+        Some("venue-1")
+    );
+
+    // An unlinked report leaves the pending submit untouched.
+    let unlinked = OrderStatusReport::new(
+        "TBANK-001".into(),
+        InstrumentId::from("SBER_TQBR.MOEX"),
+        None,
+        VenueOrderId::from("venue-2"),
+        OrderSide::Buy,
+        OrderType::Limit,
+        TimeInForce::Day,
+        OrderStatus::Filled,
+        Quantity::from(20),
+        Quantity::from(20),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    );
+    mark_pending_submit_order_report(&pending_submits, &unlinked);
+    assert_eq!(pending.get("client-1").unwrap().stage, TbankPendingSubmitStage::Accepted);
+}
+
+#[test]
+fn mark_pending_submit_fill_report_matches_by_client_then_venue_order_id() {
+    use super::{TbankPendingSubmitStage, mark_pending_submit_fill_report};
+
+    let ts = UnixNanos::from(200_u64);
+    let pending_submits: Arc<Mutex<HashMap<String, TbankPendingSubmit>>> =
+        Arc::new(Mutex::new(HashMap::from([(
+            "client-1".to_string(),
+            TbankPendingSubmit {
+                instrument_id: "SBER_TQBR.MOEX".to_string(),
+                submitted_ts: UnixNanos::from(100_u64),
+                quantity_units: Decimal::from(20),
+                side: TbankOrderSide::Buy,
+                order_type: TbankOrderType::Limit,
+                time_in_force: TimeInForce::Day,
+                trailing: None,
+                venue_order_id: Some("venue-1".to_string()),
+                last_reconciliation_ts: None,
+                stage: TbankPendingSubmitStage::Accepted,
+            },
+        )])));
+
+    let fill = FillReport::new(
+        "TBANK-001".into(),
+        InstrumentId::from("SBER_TQBR.MOEX"),
+        VenueOrderId::from("venue-1"),
+        TradeId::from("trade-1"),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("100.00"),
+        Money::from_decimal(Decimal::ZERO, Currency::from("RUB")).unwrap(),
+        LiquiditySide::NoLiquiditySide,
+        Some(ClientOrderId::from("client-1")),
+        None,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    );
+    mark_pending_submit_fill_report(&pending_submits, &fill);
+    assert_eq!(
+        pending_submits.lock().unwrap().get("client-1").unwrap().stage,
+        TbankPendingSubmitStage::Filled
+    );
+
+    // A fill without a client order id still settles via the venue order id.
+    let anonymous = FillReport::new(
+        "TBANK-001".into(),
+        InstrumentId::from("SBER_TQBR.MOEX"),
+        VenueOrderId::from("venue-1"),
+        TradeId::from("trade-2"),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("100.00"),
+        Money::from_decimal(Decimal::ZERO, Currency::from("RUB")).unwrap(),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    );
+    mark_pending_submit_fill_report(&pending_submits, &anonymous);
+    assert_eq!(
+        pending_submits.lock().unwrap().get("client-1").unwrap().stage,
+        TbankPendingSubmitStage::Filled
+    );
+}
+
+#[test]
+fn stop_direction_and_type_mapping_covers_submit_side_contracts() {
+    use super::{tbank_order_type_from_stop_order, tbank_side_from_stop_direction};
+
+    assert_eq!(tbank_side_from_stop_direction(StopOrderDirection::Buy as i32), Some(TbankOrderSide::Buy));
+    assert_eq!(tbank_side_from_stop_direction(StopOrderDirection::Sell as i32), Some(TbankOrderSide::Sell));
+    assert_eq!(tbank_side_from_stop_direction(9999), None);
+
+    // Trailing take-profit stops keep their trailing identity.
+    let trailing_limit = StopOrder {
+        take_profit_type: TakeProfitType::Trailing as i32,
+        exchange_order_type: ExchangeOrderType::Limit as i32,
+        ..StopOrder::default()
+    };
+    assert_eq!(
+        tbank_order_type_from_stop_order(&trailing_limit),
+        Some(TbankOrderType::TrailingStopLimit)
+    );
+
+    let trailing_market = StopOrder {
+        take_profit_type: TakeProfitType::Trailing as i32,
+        ..StopOrder::default()
+    };
+    assert_eq!(
+        tbank_order_type_from_stop_order(&trailing_market),
+        Some(TbankOrderType::TrailingStopMarket)
+    );
+
+    let stop_loss = StopOrder {
+        order_type: StopOrderType::StopLoss as i32,
+        ..StopOrder::default()
+    };
+    assert_eq!(tbank_order_type_from_stop_order(&stop_loss), Some(TbankOrderType::StopMarket));
+
+    let take_profit_limit = StopOrder {
+        order_type: StopOrderType::TakeProfit as i32,
+        exchange_order_type: ExchangeOrderType::Limit as i32,
+        ..StopOrder::default()
+    };
+    assert_eq!(tbank_order_type_from_stop_order(&take_profit_limit), None);
+
+    let take_profit_market = StopOrder {
+        order_type: StopOrderType::TakeProfit as i32,
+        ..StopOrder::default()
+    };
+    assert_eq!(
+        tbank_order_type_from_stop_order(&take_profit_market),
+        Some(TbankOrderType::MarketIfTouched)
+    );
+
+    let stop_limit = StopOrder {
+        order_type: StopOrderType::StopLimit as i32,
+        ..StopOrder::default()
+    };
+    assert_eq!(tbank_order_type_from_stop_order(&stop_limit), None);
+}
+
+#[test]
+fn post_stop_order_response_builds_accepted_report_with_stop_identity() {
+    use super::order_status_report_from_post_stop_order_response;
+
+    let cmd = submit_stop_order_cmd();
+    let ts_init = current_unix_nanos();
+    let report = order_status_report_from_post_stop_order_response(
+        "TBANK-001".into(),
+        &cmd,
+        &PostStopOrderResponse {
+            stop_order_id: "stop-1".to_string(),
+            order_request_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
+            ..PostStopOrderResponse::default()
+        },
+        ts_init,
+    );
+
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+    assert_eq!(report.venue_order_id.to_string(), "stop-1");
+    assert_eq!(report.client_order_id.map(|id| id.to_string()).as_deref(), Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"));
+    assert_eq!(report.order_type, OrderType::StopMarket);
+    assert_eq!(report.trigger_price, Some(Price::from("270.00")));
+    assert_eq!(report.trigger_type, Some(TriggerType::Default));
+    assert_eq!(report.quantity.as_decimal(), Decimal::from(20));
+    assert_eq!(report.filled_qty.as_decimal(), Decimal::ZERO);
+}
+
+#[test]
+fn broker_order_route_for_submit_selects_stop_service_by_environment_and_type() {
+    use super::broker_order_route_for_submit;
+    use crate::execution::TbankExecutionService;
+
+    let base = TbankSubmitOrder {
+        instrument_id: "SBER_TQBR.MOEX".to_string(),
+        client_order_id: "client-1".to_string(),
+        broker_request_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
+        side: TbankOrderSide::Buy,
+        order_type: TbankOrderType::Market,
+        time_in_force: TimeInForce::Ioc,
+        quantity_units: Decimal::from(20),
+        limit_price: None,
+        trigger_price: None,
+        trailing: None,
+        confirm_margin_trade: false,
+    };
+    assert_eq!(
+        broker_order_route_for_submit(&base, TbankExecutionService::LiveOrders),
+        TbankBrokerOrderRoute::RegularOrder
+    );
+    assert_eq!(
+        broker_order_route_for_submit(&base, TbankExecutionService::Sandbox),
+        TbankBrokerOrderRoute::RegularOrder
+    );
+
+    let mut stop = base.clone();
+    stop.order_type = TbankOrderType::StopMarket;
+    assert_eq!(
+        broker_order_route_for_submit(&stop, TbankExecutionService::LiveStopOrders),
+        TbankBrokerOrderRoute::StopOrder
+    );
+    assert_eq!(
+        broker_order_route_for_submit(&stop, TbankExecutionService::Sandbox),
+        TbankBrokerOrderRoute::StopOrder
+    );
+
+    let mut trailing = base.clone();
+    trailing.order_type = TbankOrderType::TrailingStopLimit;
+    assert_eq!(
+        broker_order_route_for_submit(&trailing, TbankExecutionService::Sandbox),
+        TbankBrokerOrderRoute::StopOrder
+    );
+}
+
+#[test]
+fn stop_order_matches_submit_requires_exact_identity_and_prices() {
+    use super::stop_order_matches_submit;
+
+    let mut metadata = sber_metadata();
+    metadata.lot = 10;
+
+    let order = TbankSubmitOrder {
+        instrument_id: "SBER_TQBR.MOEX".to_string(),
+        client_order_id: "client-1".to_string(),
+        broker_request_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
+        side: TbankOrderSide::Sell,
+        order_type: TbankOrderType::StopMarket,
+        time_in_force: TimeInForce::Gtc,
+        quantity_units: Decimal::from(20),
+        limit_price: None,
+        trigger_price: Some(Decimal::from(270)),
+        trailing: None,
+        confirm_margin_trade: false,
+    };
+
+    let matching_stop = StopOrder {
+        stop_order_id: "stop-1".to_string(),
+        lots_requested: 2,
+        direction: StopOrderDirection::Sell as i32,
+        order_type: StopOrderType::StopLoss as i32,
+        instrument_uid: metadata.instrument_uid.clone(),
+        ticker: metadata.ticker.clone(),
+        class_code: metadata.class_code.clone(),
+        stop_price: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: 270,
+            nano: 0,
+        }),
+        exchange_order_type: ExchangeOrderType::Market as i32,
+        ..StopOrder::default()
+    };
+    assert!(stop_order_matches_submit(&order, &metadata, &matching_stop));
+
+    // A mismatched trigger price must not be attributed to this submit.
+    let wrong_price = StopOrder {
+        stop_price: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: 271,
+            nano: 0,
+        }),
+        ..matching_stop.clone()
+    };
+    assert!(!stop_order_matches_submit(&order, &metadata, &wrong_price));
+
+    // A mismatched instrument identity must not be attributed to this submit.
+    let wrong_instrument = StopOrder {
+        instrument_uid: "other-uid".to_string(),
+        ..matching_stop.clone()
+    };
+    assert!(!stop_order_matches_submit(&order, &metadata, &wrong_instrument));
+
+    // A mismatched direction must not be attributed to this submit.
+    let wrong_direction = StopOrder {
+        direction: StopOrderDirection::Buy as i32,
+        ..matching_stop
+    };
+    assert!(!stop_order_matches_submit(&order, &metadata, &wrong_direction));
+}
