@@ -100,10 +100,11 @@ impl ExecutionClient for TbankExecutionClient {
         margins: Vec<MarginBalance>,
         reported: bool,
         ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
         self.runtime
             .emitter
-            .emit_account_state(balances, margins, reported, ts_event);
+            .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
     }
 
@@ -164,7 +165,8 @@ impl ExecutionClient for TbankExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        TbankExecutionClient::disconnect(self);
+        self.runtime.disconnect_async().await;
+        self.core.set_disconnected();
         Ok(())
     }
 
@@ -242,12 +244,10 @@ impl ExecutionClient for TbankExecutionClient {
         }
         let mut client = self.runtime.clone();
         let emitter = self.runtime.emitter.clone();
-        let submit_routes = if commands.iter().any(|command| {
-            command
-                .order_init
-                .contingency_type
-                .is_some_and(|value| value != ContingencyType::NoContingency)
-        }) {
+        let submit_routes = if commands
+            .iter()
+            .any(|command| command.order_init.contingency_type.is_some())
+        {
             Vec::new()
         } else {
             commands
@@ -264,7 +264,7 @@ impl ExecutionClient for TbankExecutionClient {
                     command
                         .order_init
                         .contingency_type
-                        .is_some_and(|value| value != ContingencyType::NoContingency)
+                        .is_some()
                 })
             {
                 let reason = "T-Bank adapter does not support contingent order lists";

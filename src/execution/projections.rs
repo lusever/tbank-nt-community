@@ -5,7 +5,7 @@ use std::{
 
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
-    enums::{OrderStatus, PositionSideSpecified},
+    enums::{OrderStatus, PositionSide},
     identifiers::{AccountId, InstrumentId},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{Currency, Money, Price, Quantity},
@@ -125,7 +125,7 @@ mod tests {
 
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
-        enums::PositionSideSpecified, identifiers::InstrumentId, reports::PositionStatusReport,
+        enums::PositionSide, identifiers::InstrumentId, reports::PositionStatusReport,
         types::Quantity,
     };
     use rust_decimal::Decimal;
@@ -141,7 +141,7 @@ mod tests {
     fn position_report(
         account_id: nautilus_model::identifiers::AccountId,
         instrument_id: InstrumentId,
-        position_side: PositionSideSpecified,
+        position_side: PositionSide,
         quantity: Quantity,
         ts_last: UnixNanos,
         venue_position_id: &str,
@@ -167,7 +167,7 @@ mod tests {
         let active = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(20),
             current_unix_nanos(),
             "SBER-POSITION",
@@ -198,7 +198,7 @@ mod tests {
         let active = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             newer_stream_ts,
             "SBER-POSITION",
@@ -228,7 +228,7 @@ mod tests {
         let active = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             first_snapshot_ts,
             "SBER-POSITION",
@@ -243,7 +243,7 @@ mod tests {
         );
         assert_eq!(empty_snapshot.len(), 1);
         assert_eq!(empty_snapshot[0].instrument_id, instrument_id);
-        assert_eq!(empty_snapshot[0].position_side, PositionSideSpecified::Flat);
+        assert_eq!(empty_snapshot[0].position_side, PositionSide::Flat);
         assert_eq!(empty_snapshot[0].quantity.as_decimal(), Decimal::ZERO);
         assert_eq!(empty_snapshot[0].venue_position_id, None);
         {
@@ -266,7 +266,7 @@ mod tests {
         let delayed_active = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             delayed_active_ts,
             "SBER-POSITION",
@@ -293,7 +293,7 @@ mod tests {
         let portfolio = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             portfolio_ts,
             "SBER-POSITION",
@@ -309,7 +309,7 @@ mod tests {
         let delayed_securities = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             delayed_securities_ts,
             "SBER-POSITION",
@@ -337,7 +337,7 @@ mod tests {
         let security = position_report(
             account_id,
             "SBER_TQBR.MOEX".parse().unwrap(),
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             current_unix_nanos(),
             "SBER-POSITION",
@@ -365,7 +365,7 @@ mod tests {
         let active = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             current_unix_nanos(),
             "SBER-POSITION",
@@ -374,7 +374,7 @@ mod tests {
         let flat = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Flat,
+            PositionSide::Flat,
             Quantity::from(0),
             current_unix_nanos(),
             "SBER-POSITION",
@@ -402,7 +402,7 @@ mod tests {
         let reopened = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             reopened_ts,
             "SBER-POSITION",
@@ -422,7 +422,7 @@ mod tests {
         let active = position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             active_ts,
             "SBER-POSITION",
@@ -431,7 +431,7 @@ mod tests {
         let mut reports = vec![position_report(
             account_id,
             instrument_id,
-            PositionSideSpecified::Flat,
+            PositionSide::Flat,
             Quantity::from(0),
             flat_ts,
             "SBER-POSITION",
@@ -463,7 +463,7 @@ mod tests {
         let security = position_report(
             account_id,
             "SBER_TQBR.MOEX".parse().unwrap(),
-            PositionSideSpecified::Long,
+            PositionSide::Long,
             Quantity::from(10),
             current_unix_nanos(),
             "SBER-POSITION",
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(empty_portfolio_snapshot.len(), 1);
         assert_eq!(
             empty_portfolio_snapshot[0].position_side,
-            PositionSideSpecified::Flat
+            PositionSide::Flat
         );
         let projection = projection.lock().unwrap();
         assert_eq!(projection.len(), 1);
@@ -529,7 +529,7 @@ pub(super) fn projected_position_from_report(
         account_id: report.account_id,
         instrument_id: report.instrument_id,
         source,
-        is_flat: report.position_side == PositionSideSpecified::Flat
+        is_flat: report.position_side == PositionSide::Flat
             || report.quantity.as_decimal() == Decimal::ZERO,
         ts_last: report.ts_last,
         securities_watermark: previous
@@ -823,7 +823,7 @@ pub(super) fn reconcile_position_source_snapshot(
         reports.push(PositionStatusReport::new(
             position.account_id,
             position.instrument_id,
-            PositionSideSpecified::Flat,
+            PositionSide::Flat,
             Quantity::from(0),
             ts_init,
             ts_init,
