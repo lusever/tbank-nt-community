@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
@@ -662,6 +662,7 @@ pub struct TbankDataClient {
     bar_stream_task: Option<JoinHandle<()>>,
     quote_stream_task: Option<JoinHandle<()>>,
     instrument_refresh_task: Option<JoinHandle<()>>,
+    request_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     message_sequence: Arc<AtomicU64>,
     /// Desired Nautilus subscriptions. Broker stream IDs are derived only while building a
     /// concrete stream request, because catalogue discovery can change them between sessions.
@@ -703,6 +704,7 @@ impl TbankDataClient {
             bar_stream_task: None,
             quote_stream_task: None,
             instrument_refresh_task: None,
+            request_tasks: Arc::new(Mutex::new(Vec::new())),
             message_sequence: Arc::new(AtomicU64::new(0)),
             bar_subscriptions: HashMap::new(),
             scheduled_bar_continuity_keys: HashMap::new(),
@@ -848,12 +850,9 @@ impl TbankDataClient {
         Ok(())
     }
 
-    /// Disconnects the client and stops its background tasks.
+    /// Disconnects the client and aborts its background tasks.
     pub fn disconnect(&mut self) {
-        self.stop_market_data_streams("market data client disconnected", false);
-        if let Some(task) = self.instrument_refresh_task.take() {
-            task.abort();
-        }
+        drop(self.abort_background_tasks("market data client disconnected", false));
         self.unsubscribe_instrument_updates();
         self.clients = None;
         *self
@@ -863,7 +862,37 @@ impl TbankDataClient {
         tracing::info!("disconnected T-Bank data client");
     }
 
-    fn stop_market_data_streams(&mut self, reason: &str, terminal: bool) {
+    /// Disconnects the client and joins every task owned by its async lifecycle.
+    pub async fn disconnect_async(&mut self) {
+        let tasks = self.abort_background_tasks("market data client disconnected", false);
+        self.unsubscribe_instrument_updates();
+        self.clients = None;
+        *self
+            .resolved_instrument_stream_ids
+            .write()
+            .expect("market-data stream IDs lock") = self.config.instrument_stream_ids.clone();
+        for task in tasks {
+            let _ = task.await;
+        }
+        tracing::info!("disconnected T-Bank data client");
+    }
+
+    fn abort_background_tasks(&mut self, reason: &str, terminal: bool) -> Vec<JoinHandle<()>> {
+        let mut tasks = self.stop_market_data_streams(reason, terminal);
+        if let Some(task) = self.instrument_refresh_task.take() {
+            task.abort();
+            tasks.push(task);
+        }
+        let mut request_tasks = self.request_tasks.lock().expect("request_tasks lock");
+        for task in request_tasks.drain(..) {
+            task.abort();
+            tasks.push(task);
+        }
+        tasks
+    }
+
+    fn stop_market_data_streams(&mut self, reason: &str, terminal: bool) -> Vec<JoinHandle<()>> {
+        let mut tasks = Vec::new();
         let stage = if terminal {
             "stream_subscriptions_disabled"
         } else {
@@ -873,14 +902,18 @@ impl TbankDataClient {
         self.stream_health.retire_all(stage, reason);
         for (_, task) in self.stream_tasks.drain() {
             task.abort();
+            tasks.push(task);
         }
         self.active_stream_task_keys.clear();
         if let Some(task) = self.bar_stream_task.take() {
             task.abort();
+            tasks.push(task);
         }
         if let Some(task) = self.quote_stream_task.take() {
             task.abort();
+            tasks.push(task);
         }
+        tasks
     }
 
     fn advance_bar_stream_generation_with_stage(
@@ -4263,15 +4296,6 @@ fn unix_nanos(value: i128) -> anyhow::Result<UnixNanos> {
     Ok(UnixNanos::from(value))
 }
 
-fn datetime_to_unix_nanos(value: Option<chrono::DateTime<chrono::Utc>>) -> Option<UnixNanos> {
-    value.and_then(|datetime| {
-        datetime
-            .timestamp_nanos_opt()
-            .and_then(|nanos| u64::try_from(nanos).ok())
-            .map(UnixNanos::from)
-    })
-}
-
 pub(crate) fn now_unix_nanos() -> UnixNanos {
     get_atomic_clock_realtime().get_time_ns()
 }
@@ -4311,8 +4335,8 @@ fn nautilus_trade_from_tbank(
         metadata.preserve_instrument_id,
     )?;
     let aggressor_side = match tick.side {
-        crate::market_data::trades::TbankTradeSide::Buy => AggressorSide::Buyer,
-        crate::market_data::trades::TbankTradeSide::Sell => AggressorSide::Seller,
+        crate::market_data::trades::TbankTradeSide::Buy => AggressorSide::Buy,
+        crate::market_data::trades::TbankTradeSide::Sell => AggressorSide::Sell,
         crate::market_data::trades::TbankTradeSide::Unknown => AggressorSide::NoAggressor,
     };
     let trade_id = tbank_trade_id(trade, instrument_id, message_sequence);
@@ -5480,6 +5504,41 @@ mod tests {
         assert!(enabled.instrument_refresh_task.is_none());
     }
 
+    #[tokio::test]
+    async fn async_disconnect_aborts_and_joins_owned_request_tasks() {
+        struct DropGuard(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_started = Arc::clone(&started);
+        let started_notification = started.notified();
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let task = get_runtime().spawn(async move {
+            let _guard = DropGuard(task_dropped);
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+        client
+            .request_tasks
+            .lock()
+            .expect("request_tasks lock")
+            .push(task);
+        started_notification.await;
+
+        client.disconnect_async().await;
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(client.request_tasks.lock().unwrap().is_empty());
+        assert!(client.is_disconnected());
+    }
+
     #[test]
     fn reconnect_resolution_rebuilds_runtime_streams_from_explicit_config() {
         let client = TbankDataClient::new(TbankDataClientConfig {
@@ -6459,7 +6518,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(tick.instrument_id, sber_id());
-        assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(tick.aggressor_side, AggressorSide::Sell);
         assert_eq!(tick.price.as_f64(), 251.0);
         assert_eq!(tick.size.as_f64(), 30.0);
         assert_eq!(tick.ts_init, received_at);

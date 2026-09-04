@@ -23,9 +23,7 @@ pub(super) fn trailing_stop_params(
             "T-Bank native trailing stops use activation_price, not an explicit trigger_price"
         );
     }
-    let requested_trigger_type = init
-        .trigger_type
-        .filter(|value| *value != TriggerType::NoTrigger);
+    let requested_trigger_type = init.trigger_type;
     if !matches!(
         requested_trigger_type,
         None | Some(TriggerType::Default | TriggerType::LastPrice)
@@ -39,7 +37,6 @@ pub(super) fn trailing_stop_params(
         .ok_or_else(|| anyhow::anyhow!("trailing_offset is required"))?;
     let trailing_offset_type = init
         .trailing_offset_type
-        .filter(|value| *value != nautilus_model::enums::TrailingOffsetType::NoTrailingOffset)
         .ok_or_else(|| anyhow::anyhow!("trailing_offset_type is required"))?;
     match init.order_type {
         OrderType::TrailingStopLimit if init.limit_offset.is_none() => {
@@ -799,7 +796,7 @@ pub(super) fn order_status_report_from_post_order_response(
         order_initialized_instrument_id(cmd),
         Some(cmd.client_order_id),
         response.order_id.as_str().into(),
-        cmd.order_init.order_side,
+        Some(cmd.order_init.order_side),
         cmd.order_init.order_type,
         cmd.order_init.time_in_force,
         nautilus_order_status(
@@ -847,7 +844,7 @@ pub(super) fn order_status_report_from_post_stop_order_response(
         order_initialized_instrument_id(cmd),
         Some(cmd.client_order_id),
         response.stop_order_id.as_str().into(),
-        cmd.order_init.order_side,
+        Some(cmd.order_init.order_side),
         cmd.order_init.order_type,
         cmd.order_init.time_in_force,
         OrderStatus::Accepted,

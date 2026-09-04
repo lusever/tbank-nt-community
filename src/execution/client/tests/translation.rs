@@ -298,9 +298,9 @@ fn stop_order_status_maps_each_broker_status() {
 
 #[test]
 fn position_side_classifies_sign_of_balance() {
-    assert_eq!(super::position_side(Decimal::from(5)), PositionSideSpecified::Long);
-    assert_eq!(super::position_side(Decimal::from(-5)), PositionSideSpecified::Short);
-    assert_eq!(super::position_side(Decimal::ZERO), PositionSideSpecified::Flat);
+    assert_eq!(super::position_side(Decimal::from(5)), PositionSide::Long);
+    assert_eq!(super::position_side(Decimal::from(-5)), PositionSide::Short);
+    assert_eq!(super::position_side(Decimal::ZERO), PositionSide::Flat);
 }
 
 #[test]
@@ -666,7 +666,7 @@ fn base_order_status_report(order_type: OrderType) -> OrderStatusReport {
         "SBER_TQBR.MOEX".parse().unwrap(),
         Some(ClientOrderId::from("client-1")),
         VenueOrderId::from("venue-1"),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         order_type,
         TimeInForce::Gtc,
         OrderStatus::Accepted,

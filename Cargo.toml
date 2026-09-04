@@ -2,7 +2,7 @@
 name = "tbank-nt-community"
 version = "0.2.2"
 edition = "2024"
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 authors = ["lusever"]
 license = "Apache-2.0"
 description = "Independent Rust-native T-Bank Invest API adapter for NautilusTrader"
@@ -45,11 +45,12 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 dotenvy = { version = "0.15", optional = true }
 futures-util = "0.3"
 http = "1"
-nautilus-common = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0", features = ["live", "tracing-bridge"] }
-nautilus-core = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
-nautilus-execution = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
-nautilus-live = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
-nautilus-model = { version = "=0.61.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v1.231.0" }
+jiff = { version = "=0.2.35", default-features = false, features = ["std"] }
+nautilus-common = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4", features = ["live", "tracing-bridge"] }
+nautilus-core = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4" }
+nautilus-execution = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4" }
+nautilus-live = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4" }
+nautilus-model = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4" }
 prost = { version = "0.14.4", default-features = false, features = ["std"] }
 prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }

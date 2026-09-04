@@ -1,7 +1,6 @@
 use std::{env, fmt, time::Duration};
 
 use nautilus_common::factories::ClientConfig;
-use nautilus_model::identifiers::TraderId;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -17,9 +16,6 @@ use crate::{
 #[serde(default, deny_unknown_fields)]
 /// Configuration for the T-Bank execution client.
 pub struct TbankExecutionClientConfig {
-    #[builder(default = TraderId::from("TRADER-001"))]
-    /// Nautilus trader identity for the execution client.
-    pub trader_id: TraderId,
     #[builder(default = TbankEnvironment::Sandbox)]
     /// Broker environment.
     pub environment: TbankEnvironment,
@@ -54,7 +50,6 @@ pub struct TbankExecutionClientConfig {
 impl fmt::Debug for TbankExecutionClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TbankExecutionClientConfig")
-            .field("trader_id", &self.trader_id)
             .field("environment", &self.environment)
             .field("token_present", &self.token.is_some())
             .field("account_id_present", &self.account_id.is_some())
