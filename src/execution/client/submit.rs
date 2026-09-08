@@ -73,6 +73,52 @@ pub(super) enum SubmitPipelineOutcome {
     Rejected(String),
 }
 
+/// Evidence attached to an error from a mutating command.
+///
+/// The adapter error itself is not enough to classify an outcome: the same
+/// gRPC status can be returned while resolving local command inputs or after
+/// the broker RPC has started. Keep that evidence with the error until the
+/// Nautilus lifecycle decision is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TbankCommandStage {
+    BeforeRpc,
+    RpcStarted,
+}
+
+#[derive(Debug)]
+pub(super) struct TbankCommandError {
+    pub(super) error: TbankAdapterError,
+    pub(super) stage: TbankCommandStage,
+}
+
+impl TbankCommandError {
+    pub(super) fn before_rpc(error: TbankAdapterError) -> Self {
+        Self {
+            error,
+            stage: TbankCommandStage::BeforeRpc,
+        }
+    }
+
+    pub(super) fn rpc_started(error: TbankAdapterError) -> Self {
+        Self {
+            error,
+            stage: TbankCommandStage::RpcStarted,
+        }
+    }
+}
+
+impl std::fmt::Display for TbankCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for TbankCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 pub(super) struct PreparedNautilusOrder {
     pub(super) cmd: nautilus_common::messages::execution::SubmitOrder,
     pub(super) order: TbankSubmitOrder,
@@ -520,14 +566,19 @@ fn quotation_matches(expected: Option<&Quotation>, actual: Option<&Quotation>) -
 
 /// Maps an adapter error to the upstream command-failure contract.
 ///
-/// The same wire condition classifies identically for submit, cancel, and
-/// their batch/list forms: deterministic local failures prove the command was
-/// never transmitted, explicit broker denials (including rate limits) are
-/// venue rejections, and transport or post-send lookup failures leave the
-/// venue outcome undefined. Retryability is a separate axis handled by the
-/// transport and reconciliation layers, not by this mapping.
-pub(super) fn classify_command_failure(error: &TbankAdapterError) -> CommandFailure {
-    match error {
+/// Maps a mutating command error to the upstream command-failure contract.
+///
+/// `TbankCommandError` carries the evidence needed to distinguish a local
+/// failure from an error returned after the broker RPC started. In particular,
+/// a rate limit is `NotSent` before the RPC and `Ambiguous` after it: the wire
+/// status does not prove that a request which reached T-Bank was not applied.
+/// Retryability remains a separate transport/reconciliation concern.
+pub(super) fn classify_command_failure(error: &TbankCommandError) -> CommandFailure {
+    if error.stage == TbankCommandStage::BeforeRpc {
+        return CommandFailure::not_sent(error.to_string());
+    }
+
+    match &error.error {
         TbankAdapterError::ConfigError(_)
         | TbankAdapterError::MissingToken
         | TbankAdapterError::MissingAccountId
@@ -545,9 +596,8 @@ pub(super) fn classify_command_failure(error: &TbankAdapterError) -> CommandFail
         | TbankAdapterError::BrokerOrderIdentityUnresolved(_) => {
             CommandFailure::not_sent(error.to_string())
         }
-        TbankAdapterError::PermissionDenied(_) | TbankAdapterError::RateLimited(_) => {
-            CommandFailure::venue_rejected(error.to_string())
-        }
+        TbankAdapterError::PermissionDenied(_) => CommandFailure::venue_rejected(error.to_string()),
+        TbankAdapterError::RateLimited(_) => CommandFailure::ambiguous(error.to_string()),
         TbankAdapterError::InstrumentNotFound(_)
         | TbankAdapterError::InstrumentMetadataUnresolved(_)
         | TbankAdapterError::FuturesMarginUnresolved(_)
@@ -574,8 +624,8 @@ pub(super) fn classify_grpc_command_failure(code: tonic::Code, reason: String) -
         | tonic::Code::Unimplemented
         | tonic::Code::Ok
         | tonic::Code::PermissionDenied
-        | tonic::Code::ResourceExhausted
         | tonic::Code::Unauthenticated => CommandFailure::venue_rejected(reason),
+        tonic::Code::ResourceExhausted => CommandFailure::ambiguous(reason),
         tonic::Code::Cancelled
         | tonic::Code::Unknown
         | tonic::Code::DeadlineExceeded

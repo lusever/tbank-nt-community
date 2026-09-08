@@ -1793,21 +1793,27 @@ fn cancel_failure_classification_matches_upstream_terminal_semantics() {
     use nautilus_live::execution::failure::CommandFailure;
 
     assert!(matches!(
-        super::classify_command_failure(&TbankAdapterError::ConfigError("missing id".to_string())),
+        super::classify_command_failure(&super::TbankCommandError::before_rpc(
+            TbankAdapterError::ConfigError("missing id".to_string())
+        )),
         CommandFailure::NotSent(_)
     ));
     assert!(matches!(
-        super::classify_command_failure(&TbankAdapterError::GrpcStatus {
-            code: Code::NotFound,
-            message: "order not found".to_string(),
-        }),
+        super::classify_command_failure(&super::TbankCommandError::rpc_started(
+            TbankAdapterError::GrpcStatus {
+                code: Code::NotFound,
+                message: "order not found".to_string(),
+            },
+        )),
         CommandFailure::VenueRejected(_)
     ));
     assert!(matches!(
-        super::classify_command_failure(&TbankAdapterError::GrpcStatus {
-            code: Code::Unavailable,
-            message: "transport lost".to_string(),
-        }),
+        super::classify_command_failure(&super::TbankCommandError::rpc_started(
+            TbankAdapterError::GrpcStatus {
+                code: Code::Unavailable,
+                message: "transport lost".to_string(),
+            },
+        )),
         CommandFailure::Ambiguous(_)
     ));
     assert!(matches!(
@@ -1815,10 +1821,12 @@ fn cancel_failure_classification_matches_upstream_terminal_semantics() {
         CommandFailure::Ambiguous(_)
     ));
     assert!(matches!(
-        super::classify_command_failure(&TbankAdapterError::GrpcStatus {
-            code: Code::DataLoss,
-            message: "response corrupted".to_string(),
-        }),
+        super::classify_command_failure(&super::TbankCommandError::rpc_started(
+            TbankAdapterError::GrpcStatus {
+                code: Code::DataLoss,
+                message: "response corrupted".to_string(),
+            },
+        )),
         CommandFailure::Ambiguous(_)
     ));
 }
