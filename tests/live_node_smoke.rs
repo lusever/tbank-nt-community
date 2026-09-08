@@ -17,7 +17,6 @@ fn live_node_builds_with_tbank_factories_and_configs() {
         ..TbankDataClientConfig::default()
     };
     let execution_config = TbankExecutionClientConfig {
-        trader_id,
         environment: TbankEnvironment::Sandbox,
         token: Some("test-token".to_string()),
         account_id: Some("test-account".to_string()),

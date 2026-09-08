@@ -64,8 +64,8 @@ use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        PositionSideSpecified, TimeInForce, TriggerType,
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+        TimeInForce, TriggerType,
     },
     events::{OrderCanceled, OrderEventAny},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue, VenueOrderId},
@@ -884,39 +884,53 @@ impl TbankExecutionRuntime {
         Ok(())
     }
 
-    /// Disconnects the client and stops its background tasks.
-    pub fn disconnect(&mut self) {
+    fn abort_background_tasks(&self) -> Vec<JoinHandle<()>> {
+        let mut aborted = Vec::new();
         self.lifecycle_active.store(false, Ordering::Release);
         {
             let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
-            tasks.retain(|task| {
+            let mut retained = Vec::with_capacity(tasks.len());
+            for task in tasks.drain(..) {
                 if task.handle.is_finished() {
-                    return false;
-                }
-                if task.kind == TbankCommandTaskKind::ReadOnly {
+                } else if task.kind == TbankCommandTaskKind::ReadOnly {
                     task.handle.abort();
-                    return false;
+                    aborted.push(task.handle);
+                } else {
+                    retained.push(task);
                 }
-                true
-            });
+            }
+            *tasks = retained;
         }
-        for task in self
-            .stream_tasks
-            .lock()
-            .expect("stream_tasks lock")
-            .drain(..)
-        {
-            task.abort();
-        }
-        for task in self
-            .reconciliation_tasks
-            .lock()
-            .expect("reconciliation_tasks lock")
-            .drain(..)
-        {
-            task.abort();
-        }
+        aborted.extend(
+            self.stream_tasks
+                .lock()
+                .expect("stream_tasks lock")
+                .drain(..)
+                .inspect(|task| task.abort()),
+        );
+        aborted.extend(
+            self.reconciliation_tasks
+                .lock()
+                .expect("reconciliation_tasks lock")
+                .drain(..)
+                .inspect(|task| task.abort()),
+        );
+        aborted
+    }
+
+    /// Disconnects the client and stops its background tasks.
+    pub fn disconnect(&mut self) {
+        drop(self.abort_background_tasks());
         self.clients = None;
+        tracing::info!("disconnected T-Bank execution client");
+    }
+
+    async fn disconnect_async(&mut self) {
+        let tasks = self.abort_background_tasks();
+        self.clients = None;
+        for task in tasks {
+            let _ = task.await;
+        }
         tracing::info!("disconnected T-Bank execution client");
     }
 
@@ -2625,6 +2639,14 @@ impl TbankExecutionRuntime {
             );
             return Ok(None);
         };
+        let Some(order_side) = report.order_side else {
+            tracing::warn!(
+                order_id,
+                order_request_id = order_request_id.unwrap_or(""),
+                "skipping order-status fill report because T-Bank order state has unknown direction"
+            );
+            return Ok(None);
+        };
         let cumulative_notional = cumulative_avg_px * cumulative_quantity;
         let Some(projected) = project_cumulative_order_fill(
             &self.fill_projection,
@@ -2641,7 +2663,7 @@ impl TbankExecutionRuntime {
             report.instrument_id,
             report.venue_order_id,
             trade_id.into(),
-            report.order_side,
+            order_side,
             projected.quantity,
             projected.price,
             projected.commission,

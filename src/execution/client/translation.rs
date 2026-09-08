@@ -8,7 +8,6 @@ pub(super) fn tbank_side(side: OrderSide) -> anyhow::Result<crate::common::Tbank
     match side {
         OrderSide::Buy => Ok(crate::common::TbankOrderSide::Buy),
         OrderSide::Sell => Ok(crate::common::TbankOrderSide::Sell),
-        OrderSide::NoOrderSide => anyhow::bail!("unsupported order side {side:?}"),
     }
 }
 
@@ -259,19 +258,26 @@ pub(super) fn apply_trailing_params(
     Ok(report)
 }
 
-pub(super) fn nautilus_order_side(direction: i32) -> OrderSide {
+pub(super) fn nautilus_order_side(direction: i32) -> Option<OrderSide> {
     match OrderDirection::try_from(direction).ok() {
-        Some(OrderDirection::Sell) => OrderSide::Sell,
-        _ => OrderSide::Buy,
+        Some(OrderDirection::Sell) => Some(OrderSide::Sell),
+        Some(OrderDirection::Buy) => Some(OrderSide::Buy),
+        _ => None,
     }
 }
 
-pub(super) fn nautilus_stop_order_side(direction: i32) -> OrderSide {
+pub(super) fn nautilus_stop_order_side(direction: i32) -> Option<OrderSide> {
     match StopOrderDirection::try_from(direction).ok() {
-        Some(StopOrderDirection::Sell) => OrderSide::Sell,
-        Some(StopOrderDirection::Buy) => OrderSide::Buy,
-        _ => OrderSide::NoOrderSide,
+        Some(StopOrderDirection::Sell) => Some(OrderSide::Sell),
+        Some(StopOrderDirection::Buy) => Some(OrderSide::Buy),
+        _ => None,
     }
+}
+
+fn order_side_for_fill(direction: i32) -> anyhow::Result<OrderSide> {
+    nautilus_order_side(direction).ok_or_else(|| {
+        anyhow::anyhow!("cannot create T-Bank fill report with unknown order direction {direction}")
+    })
 }
 
 pub(super) fn nautilus_order_status(status: i32, requested: i64, executed: i64) -> OrderStatus {
@@ -1110,6 +1116,7 @@ pub(super) fn fill_report_from_order_trade(
     ts_init: UnixNanos,
     instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
 ) -> anyhow::Result<FillReport> {
+    let side = order_side_for_fill(order.direction)?;
     let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
         "",
         "",
@@ -1128,7 +1135,7 @@ pub(super) fn fill_report_from_order_trade(
         instrument_id,
         order.order_id.as_str().into(),
         trade.trade_id.as_str().into(),
-        nautilus_order_side(order.direction),
+        side,
         Quantity::from_decimal(Decimal::from(trade.quantity))?,
         quotation_price_from_points_required(trade.price.as_ref())?,
         Money::from_decimal(Decimal::ZERO, Currency::from("RUB"))?,
@@ -1182,6 +1189,10 @@ pub(super) fn fill_reports_from_order_state_stream(
     ts_init: UnixNanos,
     instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
 ) -> Vec<anyhow::Result<FillReport>> {
+    let side = match order_side_for_fill(state.direction) {
+        Ok(side) => side,
+        Err(error) => return vec![Err(error)],
+    };
     let instrument_id = match instrument_id_from_ticker_class_or_cached_identity(
         &state.ticker,
         &state.class_code,
@@ -1209,7 +1220,7 @@ pub(super) fn fill_reports_from_order_state_stream(
                 instrument_id,
                 venue_order_id.into(),
                 trade.trade_id.as_str().into(),
-                nautilus_order_side(state.direction),
+                side,
                 Quantity::from_decimal(Decimal::from(trade.quantity))?,
                 quotation_price_from_points_required(trade.price.as_ref())?,
                 Money::from_decimal(Decimal::ZERO, Currency::from("RUB"))?,
@@ -1373,13 +1384,13 @@ pub(super) fn position_status_report_from_future_with_instruments(
     ))
 }
 
-pub(super) fn position_side(quantity: Decimal) -> PositionSideSpecified {
+pub(super) fn position_side(quantity: Decimal) -> PositionSide {
     if quantity > Decimal::ZERO {
-        PositionSideSpecified::Long
+        PositionSide::Long
     } else if quantity < Decimal::ZERO {
-        PositionSideSpecified::Short
+        PositionSide::Short
     } else {
-        PositionSideSpecified::Flat
+        PositionSide::Flat
     }
 }
 
