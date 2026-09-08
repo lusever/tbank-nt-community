@@ -1072,10 +1072,10 @@ async fn exhausted_single_cancel_recovery_blocks_reset_until_known_outcome() {
         .cancel_resolved_broker_order(identity.clone())
         .await
         .unwrap_err();
-    assert_eq!(
-        classify_cancel_failure(&initial),
-        CancelFailureKind::OutcomeUnknown
-    );
+    assert!(matches!(
+        super::classify_command_failure(&initial),
+        nautilus_live::execution::failure::CommandFailure::Ambiguous(_)
+    ));
     assert!(
         client
             .runtime
@@ -1145,10 +1145,10 @@ async fn terminal_cancel_retry_reconciles_cancelled_state_and_clears_unknown_out
         .cancel_resolved_broker_order(identity.clone())
         .await
         .unwrap_err();
-    assert_eq!(
-        classify_cancel_failure(&initial),
-        CancelFailureKind::OutcomeUnknown
-    );
+    assert!(matches!(
+        super::classify_command_failure(&initial),
+        nautilus_live::execution::failure::CommandFailure::Ambiguous(_)
+    ));
     *cancel_error.lock().unwrap() = Some((Code::NotFound, "already gone".to_string()));
 
     client
@@ -1653,9 +1653,11 @@ async fn submit_response_partial_fill_returns_fallback_reports_without_polling()
 
 #[test]
 fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
-    use super::{SubmitFailureKind, classify_submit_failure};
+    use super::classify_command_failure;
+    use nautilus_live::execution::failure::CommandFailure;
 
-    // Local validation and configuration failures reject without reconciliation.
+    // Local validation and configuration failures prove the command was never
+    // transmitted, so a terminal rejection event is valid for this evidence.
     for error in [
         TbankAdapterError::ConfigError("bad endpoint".to_string()),
         TbankAdapterError::MissingToken,
@@ -1679,9 +1681,11 @@ fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
         TbankAdapterError::InvalidInstrumentIdentity("uid".to_string()),
         TbankAdapterError::BrokerOrderIdentityUnresolved("id".to_string()),
     ] {
-        assert_eq!(
-            classify_submit_failure(&error),
-            SubmitFailureKind::LocalRejected,
+        assert!(
+            matches!(
+                classify_command_failure(&error),
+                CommandFailure::NotSent(_)
+            ),
             "local error {error:?}"
         );
     }
@@ -1691,14 +1695,16 @@ fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
         TbankAdapterError::PermissionDenied("no access".to_string()),
         TbankAdapterError::RateLimited("slow down".to_string()),
     ] {
-        assert_eq!(
-            classify_submit_failure(&error),
-            SubmitFailureKind::BrokerRejected,
+        assert!(
+            matches!(
+                classify_command_failure(&error),
+                CommandFailure::VenueRejected(_)
+            ),
             "broker rejection {error:?}"
         );
     }
 
-    // Outcome-unknown failures must trigger reconciliation, never a rejection.
+    // Ambiguous failures must trigger reconciliation, never a rejection.
     for error in [
         TbankAdapterError::InstrumentNotFound("SBER".to_string()),
         TbankAdapterError::InstrumentMetadataUnresolved("SBER".to_string()),
@@ -1706,17 +1712,20 @@ fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
         TbankAdapterError::SubmitOutcomeUnknown("timeout".to_string()),
         TbankAdapterError::ReconnectFailed("transport".to_string()),
     ] {
-        assert_eq!(
-            classify_submit_failure(&error),
-            SubmitFailureKind::OutcomeUnknown,
-            "outcome-unknown {error:?}"
+        assert!(
+            matches!(
+                classify_command_failure(&error),
+                CommandFailure::Ambiguous(_)
+            ),
+            "ambiguous {error:?}"
         );
     }
 }
 
 #[test]
 fn submit_grpc_status_classification_matches_broker_semantics() {
-    use super::{SubmitFailureKind, classify_submit_grpc_status};
+    use super::classify_grpc_command_failure;
+    use nautilus_live::execution::failure::CommandFailure;
 
     for code in [
         Code::InvalidArgument,
@@ -1729,9 +1738,11 @@ fn submit_grpc_status_classification_matches_broker_semantics() {
         Code::ResourceExhausted,
         Code::Unauthenticated,
     ] {
-        assert_eq!(
-            classify_submit_grpc_status(code),
-            SubmitFailureKind::BrokerRejected,
+        assert!(
+            matches!(
+                classify_grpc_command_failure(code, "denied".to_string()),
+                CommandFailure::VenueRejected(_)
+            ),
             "code {code:?}"
         );
     }
@@ -1745,36 +1756,46 @@ fn submit_grpc_status_classification_matches_broker_semantics() {
         Code::DataLoss,
         Code::Unavailable,
     ] {
-        assert_eq!(
-            classify_submit_grpc_status(code),
-            SubmitFailureKind::OutcomeUnknown,
+        assert!(
+            matches!(
+                classify_grpc_command_failure(code, "lost".to_string()),
+                CommandFailure::Ambiguous(_)
+            ),
             "code {code:?}"
         );
     }
 
-    assert_eq!(classify_submit_grpc_status(Code::Ok), SubmitFailureKind::BrokerRejected);
+    assert!(matches!(
+        classify_grpc_command_failure(Code::Ok, "ok".to_string()),
+        CommandFailure::VenueRejected(_)
+    ));
 }
 
 #[test]
 fn classify_cancel_failure_distinguishes_rejected_from_unknown() {
-    use super::{CancelFailureKind, classify_cancel_failure};
+    use super::classify_command_failure;
+    use nautilus_live::execution::failure::CommandFailure;
 
-    assert_eq!(
-        classify_cancel_failure(&TbankAdapterError::PermissionDenied("no".to_string())),
-        CancelFailureKind::BrokerRejected
-    );
-    assert_eq!(
-        classify_cancel_failure(&TbankAdapterError::RateLimited("slow".to_string())),
-        CancelFailureKind::OutcomeUnknown
-    );
-    assert_eq!(
-        classify_cancel_failure(&TbankAdapterError::InstrumentMetadataUnresolved("x".to_string())),
-        CancelFailureKind::OutcomeUnknown
-    );
-    assert_eq!(
-        classify_cancel_failure(&TbankAdapterError::UnsupportedOrderType("x".to_string())),
-        CancelFailureKind::LocalFailure
-    );
+    assert!(matches!(
+        classify_command_failure(&TbankAdapterError::PermissionDenied("no".to_string())),
+        CommandFailure::VenueRejected(_)
+    ));
+    // A throttled cancel is an explicit broker denial: the request was not
+    // processed, so a terminal cancel-rejected event is valid for it.
+    assert!(matches!(
+        classify_command_failure(&TbankAdapterError::RateLimited("slow".to_string())),
+        CommandFailure::VenueRejected(_)
+    ));
+    assert!(matches!(
+        classify_command_failure(&TbankAdapterError::InstrumentMetadataUnresolved(
+            "x".to_string()
+        )),
+        CommandFailure::Ambiguous(_)
+    ));
+    assert!(matches!(
+        classify_command_failure(&TbankAdapterError::UnsupportedOrderType("x".to_string())),
+        CommandFailure::NotSent(_)
+    ));
 }
 
 #[test]

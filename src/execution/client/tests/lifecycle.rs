@@ -1,9 +1,9 @@
 use super::submit::synthetic_fill_trade_id;
 use super::{
-    CANCEL_OUTCOME_RECOVERY_ATTEMPTS, CancelFailureKind, MAX_UNRESOLVED_TRADE_FILLS_PER_ORDER,
+    CANCEL_OUTCOME_RECOVERY_ATTEMPTS, MAX_UNRESOLVED_TRADE_FILLS_PER_ORDER,
     TBANK_CONFIRM_MARGIN_TRADE_PARAM, TbankFillProjection,
     activated_stop_child_status_report_with_context, buffer_unresolved_trade_fill,
-    canonicalize_reconciled_stop_fill, classify_cancel_failure,
+    canonicalize_reconciled_stop_fill,
     current_utc_day_bounds, order_filter_windows, project_and_settle_reconciled_trade_fill,
     project_managed_trade_fill_report, project_trade_fill_report, tbank_account_id,
 };
@@ -1790,35 +1790,37 @@ async fn malformed_share_metadata_classifies_out_of_scope_without_retry() {
 
 #[test]
 fn cancel_failure_classification_matches_upstream_terminal_semantics() {
-    assert_eq!(
-        super::classify_cancel_failure(&TbankAdapterError::ConfigError("missing id".to_string())),
-        super::CancelFailureKind::LocalFailure
-    );
-    assert_eq!(
-        super::classify_cancel_failure(&TbankAdapterError::GrpcStatus {
+    use nautilus_live::execution::failure::CommandFailure;
+
+    assert!(matches!(
+        super::classify_command_failure(&TbankAdapterError::ConfigError("missing id".to_string())),
+        CommandFailure::NotSent(_)
+    ));
+    assert!(matches!(
+        super::classify_command_failure(&TbankAdapterError::GrpcStatus {
             code: Code::NotFound,
             message: "order not found".to_string(),
         }),
-        super::CancelFailureKind::BrokerRejected
-    );
-    assert_eq!(
-        super::classify_cancel_failure(&TbankAdapterError::GrpcStatus {
+        CommandFailure::VenueRejected(_)
+    ));
+    assert!(matches!(
+        super::classify_command_failure(&TbankAdapterError::GrpcStatus {
             code: Code::Unavailable,
             message: "transport lost".to_string(),
         }),
-        super::CancelFailureKind::OutcomeUnknown
-    );
-    assert_eq!(
-        super::classify_submit_grpc_status(Code::DataLoss),
-        super::SubmitFailureKind::OutcomeUnknown
-    );
-    assert_eq!(
-        super::classify_cancel_failure(&TbankAdapterError::GrpcStatus {
+        CommandFailure::Ambiguous(_)
+    ));
+    assert!(matches!(
+        super::classify_grpc_command_failure(Code::DataLoss, "corrupted".to_string()),
+        CommandFailure::Ambiguous(_)
+    ));
+    assert!(matches!(
+        super::classify_command_failure(&TbankAdapterError::GrpcStatus {
             code: Code::DataLoss,
             message: "response corrupted".to_string(),
         }),
-        super::CancelFailureKind::OutcomeUnknown
-    );
+        CommandFailure::Ambiguous(_)
+    ));
 }
 
 #[test]

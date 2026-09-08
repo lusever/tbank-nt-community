@@ -350,8 +350,8 @@ impl ExecutionClient for TbankExecutionClient {
                         "failed to resolve T-Bank cancel target"
                     );
                     if matches!(
-                        classify_cancel_failure(&error),
-                        CancelFailureKind::BrokerRejected | CancelFailureKind::LocalFailure
+                        classify_command_failure(&error),
+                        CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
                     ) {
                         emitter.emit_order_cancel_rejected_event(
                             cmd.strategy_id,
@@ -374,7 +374,10 @@ impl ExecutionClient for TbankExecutionClient {
                             %client_order_id,
                             "failed to cancel T-Bank order"
                         );
-                        if classify_cancel_failure(&error) == CancelFailureKind::BrokerRejected {
+                        if matches!(
+                            classify_command_failure(&error),
+                            CommandFailure::VenueRejected(_)
+                        ) {
                             emitter.emit_order_cancel_rejected_event(
                                 cmd.strategy_id,
                                 cmd.instrument_id,
