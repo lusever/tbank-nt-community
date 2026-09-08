@@ -344,13 +344,14 @@ impl ExecutionClient for TbankExecutionClient {
             {
                 Ok(target) => target,
                 Err(error) => {
+                    let command_error = TbankCommandError::before_rpc(error);
                     tracing::error!(
-                        %error,
+                        %command_error,
                         %client_order_id,
                         "failed to resolve T-Bank cancel target"
                     );
                     if matches!(
-                        classify_command_failure(&error),
+                        classify_command_failure(&command_error),
                         CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
                     ) {
                         emitter.emit_order_cancel_rejected_event(
@@ -358,7 +359,7 @@ impl ExecutionClient for TbankExecutionClient {
                             cmd.instrument_id,
                             cmd.client_order_id,
                             cmd.venue_order_id,
-                            &error.to_string(),
+                            &command_error.to_string(),
                             current_unix_nanos(),
                         );
                     }

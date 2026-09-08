@@ -1430,9 +1430,14 @@ impl TbankExecutionRuntime {
             attempts = CANCEL_OUTCOME_RECOVERY_ATTEMPTS,
             "T-Bank cancel outcome remained ambiguous after bounded retries"
         );
-        Err(last_error.unwrap_or_else(|| {
-            TbankAdapterError::ConfigError("T-Bank cancel outcome remained unresolved".to_string())
-        }))
+        Err(last_error.map_or_else(
+            || {
+                TbankAdapterError::ConfigError(
+                    "T-Bank cancel outcome remained unresolved".to_string(),
+                )
+            },
+            |error| error.error,
+        ))
     }
 
     async fn reconcile_cancel_after_terminal_response(
@@ -1687,11 +1692,11 @@ impl TbankExecutionRuntime {
         &mut self,
         order: &TbankSubmitOrder,
         instrument: &TbankInstrumentMetadata,
-    ) -> Result<TbankSubmitResponse> {
+    ) -> std::result::Result<TbankSubmitResponse, TbankCommandError> {
         let request_timeout = self.config.request_timeout;
         if let Err(error) = self.ensure_broker_request_mapping(order) {
             self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
-            return Err(error);
+            return Err(TbankCommandError::before_rpc(error));
         }
         self.record_pending_submit(order, current_unix_nanos());
         self.submit_order_request(order, instrument, request_timeout)
@@ -1703,7 +1708,7 @@ impl TbankExecutionRuntime {
         order: &TbankSubmitOrder,
         instrument: &TbankInstrumentMetadata,
         request_timeout: Duration,
-    ) -> Result<TbankSubmitResponse> {
+    ) -> std::result::Result<TbankSubmitResponse, TbankCommandError> {
         if let Err(error) = self.config.ensure_submit_allowed() {
             self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
             self.mark_pending_submit_stage(
@@ -1711,7 +1716,7 @@ impl TbankExecutionRuntime {
                 TbankPendingSubmitStage::Rejected,
                 None,
             );
-            return Err(error);
+            return Err(TbankCommandError::before_rpc(error));
         }
         let account_id = match self.config.resolve_account_id() {
             Ok(account_id) => account_id,
@@ -1722,7 +1727,7 @@ impl TbankExecutionRuntime {
                     TbankPendingSubmitStage::Rejected,
                     None,
                 );
-                return Err(error);
+                return Err(TbankCommandError::before_rpc(error));
             }
         };
 
@@ -1740,7 +1745,7 @@ impl TbankExecutionRuntime {
                 TbankPendingSubmitStage::Rejected,
                 None,
             );
-            return Err(error);
+            return Err(TbankCommandError::before_rpc(error));
         }
 
         let result = match service {
@@ -1751,11 +1756,13 @@ impl TbankExecutionRuntime {
                             .orders
                             .post_order(with_timeout(request, request_timeout))
                             .await
-                            .map_err(TbankAdapterError::from)
+                            .map_err(|status| {
+                                TbankCommandError::rpc_started(TbankAdapterError::from(status))
+                            })
                             .map(|response| TbankSubmitResponse::Order(response.into_inner())),
-                        Err(error) => Err(error),
+                        Err(error) => Err(TbankCommandError::before_rpc(error)),
                     },
-                    Err(error) => Err(error),
+                    Err(error) => Err(TbankCommandError::before_rpc(error)),
                 }
             }
             TbankExecutionService::LiveStopOrders => {
@@ -1765,11 +1772,13 @@ impl TbankExecutionRuntime {
                             .stop_orders
                             .post_stop_order(with_timeout(request, request_timeout))
                             .await
-                            .map_err(TbankAdapterError::from)
+                            .map_err(|status| {
+                                TbankCommandError::rpc_started(TbankAdapterError::from(status))
+                            })
                             .map(|response| TbankSubmitResponse::StopOrder(response.into_inner())),
-                        Err(error) => Err(error),
+                        Err(error) => Err(TbankCommandError::before_rpc(error)),
                     },
-                    Err(error) => Err(error),
+                    Err(error) => Err(TbankCommandError::before_rpc(error)),
                 }
             }
             TbankExecutionService::Sandbox => match order.order_type {
@@ -1780,11 +1789,13 @@ impl TbankExecutionRuntime {
                                 .sandbox
                                 .post_sandbox_order(with_timeout(request, request_timeout))
                                 .await
-                                .map_err(TbankAdapterError::from)
+                                .map_err(|status| {
+                                    TbankCommandError::rpc_started(TbankAdapterError::from(status))
+                                })
                                 .map(|response| TbankSubmitResponse::Order(response.into_inner())),
-                            Err(error) => Err(error),
+                            Err(error) => Err(TbankCommandError::before_rpc(error)),
                         },
-                        Err(error) => Err(error),
+                        Err(error) => Err(TbankCommandError::before_rpc(error)),
                     }
                 }
                 crate::common::TbankOrderType::StopMarket
@@ -1804,13 +1815,15 @@ impl TbankExecutionRuntime {
                                 .sandbox
                                 .post_sandbox_stop_order(with_timeout(request, request_timeout))
                                 .await
-                                .map_err(TbankAdapterError::from)
+                                .map_err(|status| {
+                                    TbankCommandError::rpc_started(TbankAdapterError::from(status))
+                                })
                                 .map(|response| {
                                     TbankSubmitResponse::StopOrder(response.into_inner())
                                 }),
-                            Err(error) => Err(error),
+                            Err(error) => Err(TbankCommandError::before_rpc(error)),
                         },
-                        Err(error) => Err(error),
+                        Err(error) => Err(TbankCommandError::before_rpc(error)),
                     }
                 }
             },
@@ -1833,7 +1846,7 @@ impl TbankExecutionRuntime {
                 TbankExecutionService::LiveOrders => "OrdersService.PostOrder",
                 TbankExecutionService::LiveStopOrders => "StopOrdersService.PostStopOrder",
             };
-            log_tbank_rpc_failure(rpc, error);
+            log_tbank_rpc_failure(rpc, &error.error);
         }
 
         match result {
@@ -1859,7 +1872,7 @@ impl TbankExecutionRuntime {
                         TbankPendingSubmitStage::Unknown,
                         Some(current_unix_nanos()),
                     );
-                    return Err(error);
+                    return Err(TbankCommandError::rpc_started(error));
                 }
                 self.mark_pending_submit_stage(
                     order.client_order_id.as_str(),
@@ -1892,8 +1905,14 @@ impl TbankExecutionRuntime {
     }
 
     /// Cancels a regular T-Bank order.
-    pub async fn cancel_order(&mut self, order_id: &str) -> Result<CancelOrderResponse> {
-        let account_id = self.config.resolve_account_id()?;
+    pub async fn cancel_order(
+        &mut self,
+        order_id: &str,
+    ) -> std::result::Result<CancelOrderResponse, TbankCommandError> {
+        let account_id = self
+            .config
+            .resolve_account_id()
+            .map_err(TbankCommandError::before_rpc)?;
         let request = CancelOrderRequest {
             account_id,
             order_id: order_id.to_string(),
@@ -1902,20 +1921,20 @@ impl TbankExecutionRuntime {
         let request = with_timeout(request, self.config.request_timeout);
 
         if self.config.environment.is_live() {
-            Ok(self
-                .clients_mut()?
+            let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
+            Ok(clients
                 .orders
                 .cancel_order(request)
                 .await
-                .map_err(TbankAdapterError::from)?
+                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
                 .into_inner())
         } else {
-            Ok(self
-                .clients_mut()?
+            let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
+            Ok(clients
                 .sandbox
                 .cancel_sandbox_order(request)
                 .await
-                .map_err(TbankAdapterError::from)?
+                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
                 .into_inner())
         }
     }
@@ -1924,28 +1943,32 @@ impl TbankExecutionRuntime {
     pub async fn cancel_stop_order(
         &mut self,
         stop_order_id: &str,
-    ) -> Result<CancelStopOrderResponse> {
+    ) -> std::result::Result<CancelStopOrderResponse, TbankCommandError> {
+        let account_id = self
+            .config
+            .resolve_account_id()
+            .map_err(TbankCommandError::before_rpc)?;
         let request = CancelStopOrderRequest {
-            account_id: self.config.resolve_account_id()?,
+            account_id,
             stop_order_id: stop_order_id.to_string(),
         };
         let request = with_timeout(request, self.config.request_timeout);
 
         if self.config.environment.is_live() {
-            Ok(self
-                .clients_mut()?
+            let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
+            Ok(clients
                 .stop_orders
                 .cancel_stop_order(request)
                 .await
-                .map_err(TbankAdapterError::from)?
+                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
                 .into_inner())
         } else {
-            Ok(self
-                .clients_mut()?
+            let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
+            Ok(clients
                 .sandbox
                 .cancel_sandbox_stop_order(request)
                 .await
-                .map_err(TbankAdapterError::from)?
+                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
                 .into_inner())
         }
     }
@@ -1953,8 +1976,9 @@ impl TbankExecutionRuntime {
     async fn cancel_resolved_broker_order(
         &mut self,
         identity: TbankBrokerOrderIdentity,
-    ) -> Result<()> {
-        self.ensure_lifecycle_active()?;
+    ) -> std::result::Result<(), TbankCommandError> {
+        self.ensure_lifecycle_active()
+            .map_err(TbankCommandError::before_rpc)?;
         let was_unresolved = self
             .unresolved_cancellations
             .lock()
@@ -1997,7 +2021,7 @@ impl TbankExecutionRuntime {
             {
                 Ok(true) => Ok(()),
                 Ok(false) => result,
-                Err(error) => Err(error),
+                Err(error) => Err(TbankCommandError::rpc_started(error)),
             };
         }
         result
@@ -2006,7 +2030,7 @@ impl TbankExecutionRuntime {
     async fn cancel_resolved_broker_order_unchecked(
         &mut self,
         identity: TbankBrokerOrderIdentity,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), TbankCommandError> {
         let broker_order_id = identity.broker_order_id;
         match identity.route {
             TbankBrokerOrderRoute::RegularOrder => {
@@ -2041,7 +2065,7 @@ impl TbankExecutionRuntime {
                     }),
             );
         let mut cancelled = 0;
-        let mut first_error = None;
+        let mut first_error: Option<TbankAdapterError> = None;
         for identity in identities {
             match self.cancel_resolved_broker_order(identity.clone()).await {
                 Ok(()) => cancelled += 1,
@@ -2069,7 +2093,7 @@ impl TbankExecutionRuntime {
                 }
                 Err(error) => {
                     if first_error.is_none() {
-                        first_error = Some(error);
+                        first_error = Some(error.error);
                     }
                 }
             }

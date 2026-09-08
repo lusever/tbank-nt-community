@@ -1,3 +1,5 @@
+use super::TbankCommandError;
+
 #[test]
 fn confirm_margin_trade_param_overrides_global_default() {
     let mut params = Params::new();
@@ -834,6 +836,65 @@ async fn explicit_broker_submit_rejection_emits_upstream_rejected_event() {
 }
 
 #[tokio::test]
+async fn rate_limited_submit_reconciles_instead_of_emitting_rejection() {
+    let service = MockOrdersService::default();
+    let state_calls = Arc::clone(&service.state_calls);
+    *service.post_error.lock().unwrap() =
+        Some((Code::ResourceExhausted, "too many requests".to_string()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        enable_trading: true,
+        allow_live_trading: true,
+        ..TbankExecutionClientConfig::default()
+    });
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert(metadata.instrument_id.clone(), metadata);
+    client.connect_for_queries().await.unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    client.runtime.emitter.set_sender(sender);
+
+    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::submit_order(
+        &client,
+        submit_order_cmd(None),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        receiver.recv().await,
+        Some(ExecutionEvent::Order(OrderEventAny::Submitted(_)))
+    ));
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        event,
+        ExecutionEvent::Report(ExecutionReport::Order(report))
+            if report.order_status == OrderStatus::Accepted
+    ));
+    assert!(!state_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn successful_submit_emits_submitted_then_accepted_report() {
     let service = MockOrdersService::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1029,6 +1090,15 @@ async fn unresolved_broker_identity_emits_cancel_rejected() {
 async fn ambiguous_cancel_failure_does_not_emit_cancel_rejected() {
     assert!(
         cancel_event_for_broker_error(Code::Unavailable)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_cancel_failure_does_not_emit_cancel_rejected() {
+    assert!(
+        cancel_event_for_broker_error(Code::ResourceExhausted)
             .await
             .is_none()
     );
@@ -1681,28 +1751,30 @@ fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
         TbankAdapterError::InvalidInstrumentIdentity("uid".to_string()),
         TbankAdapterError::BrokerOrderIdentityUnresolved("id".to_string()),
     ] {
+        let command_error = TbankCommandError::before_rpc(error);
         assert!(
             matches!(
-                classify_command_failure(&error),
+                classify_command_failure(&command_error),
                 CommandFailure::NotSent(_)
             ),
-            "local error {error:?}"
+            "local error {:?}",
+            command_error.error
         );
     }
 
-    // Broker rejections are terminal and must not schedule reconciliation.
-    for error in [
-        TbankAdapterError::PermissionDenied("no access".to_string()),
-        TbankAdapterError::RateLimited("slow down".to_string()),
-    ] {
-        assert!(
-            matches!(
-                classify_command_failure(&error),
-                CommandFailure::VenueRejected(_)
-            ),
-            "broker rejection {error:?}"
-        );
-    }
+    // Explicit broker denials are terminal and must not schedule
+    // reconciliation.
+    let command_error = TbankCommandError::rpc_started(TbankAdapterError::PermissionDenied(
+        "no access".to_string(),
+    ));
+    assert!(
+        matches!(
+            classify_command_failure(&command_error),
+            CommandFailure::VenueRejected(_)
+        ),
+        "broker rejection {:?}",
+        command_error.error
+    );
 
     // Ambiguous failures must trigger reconciliation, never a rejection.
     for error in [
@@ -1712,12 +1784,14 @@ fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
         TbankAdapterError::SubmitOutcomeUnknown("timeout".to_string()),
         TbankAdapterError::ReconnectFailed("transport".to_string()),
     ] {
+        let command_error = TbankCommandError::rpc_started(error);
         assert!(
             matches!(
-                classify_command_failure(&error),
+                classify_command_failure(&command_error),
                 CommandFailure::Ambiguous(_)
             ),
-            "ambiguous {error:?}"
+            "ambiguous {:?}",
+            command_error.error
         );
     }
 }
@@ -1735,7 +1809,6 @@ fn submit_grpc_status_classification_matches_broker_semantics() {
         Code::OutOfRange,
         Code::Unimplemented,
         Code::PermissionDenied,
-        Code::ResourceExhausted,
         Code::Unauthenticated,
     ] {
         assert!(
@@ -1755,6 +1828,7 @@ fn submit_grpc_status_classification_matches_broker_semantics() {
         Code::Internal,
         Code::DataLoss,
         Code::Unavailable,
+        Code::ResourceExhausted,
     ] {
         assert!(
             matches!(
@@ -1777,23 +1851,37 @@ fn classify_cancel_failure_distinguishes_rejected_from_unknown() {
     use nautilus_live::execution::failure::CommandFailure;
 
     assert!(matches!(
-        classify_command_failure(&TbankAdapterError::PermissionDenied("no".to_string())),
+        classify_command_failure(&TbankCommandError::rpc_started(
+            TbankAdapterError::PermissionDenied("no".to_string())
+        )),
         CommandFailure::VenueRejected(_)
     ));
-    // A throttled cancel is an explicit broker denial: the request was not
-    // processed, so a terminal cancel-rejected event is valid for it.
+    // Before the cancel RPC starts, rate limiting proves this command was not
+    // sent and permits a terminal cancel-rejected event.
     assert!(matches!(
-        classify_command_failure(&TbankAdapterError::RateLimited("slow".to_string())),
-        CommandFailure::VenueRejected(_)
+        classify_command_failure(&TbankCommandError::before_rpc(
+            TbankAdapterError::RateLimited("slow".to_string())
+        )),
+        CommandFailure::NotSent(_)
     ));
+    // Once the cancel RPC starts, the same status is ambiguous until broker
+    // state confirms whether the cancellation was applied.
     assert!(matches!(
-        classify_command_failure(&TbankAdapterError::InstrumentMetadataUnresolved(
-            "x".to_string()
+        classify_command_failure(&TbankCommandError::rpc_started(
+            TbankAdapterError::RateLimited("slow".to_string())
         )),
         CommandFailure::Ambiguous(_)
     ));
     assert!(matches!(
-        classify_command_failure(&TbankAdapterError::UnsupportedOrderType("x".to_string())),
+        classify_command_failure(&TbankCommandError::rpc_started(
+            TbankAdapterError::InstrumentMetadataUnresolved("x".to_string())
+        )),
+        CommandFailure::Ambiguous(_)
+    ));
+    assert!(matches!(
+        classify_command_failure(&TbankCommandError::before_rpc(
+            TbankAdapterError::UnsupportedOrderType("x".to_string())
+        )),
         CommandFailure::NotSent(_)
     ));
 }
