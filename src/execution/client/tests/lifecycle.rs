@@ -45,7 +45,7 @@ use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{
         AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        PositionSideSpecified, TimeInForce, TrailingOffsetType, TriggerType,
+        PositionSide, TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::{AccountState, OrderEventAny, OrderInitialized},
     identifiers::{
@@ -462,7 +462,7 @@ fn inactive_order_state_does_not_commit_fill_projection() {
         "SBER_TQBR.MOEX".parse().unwrap(),
         Some("client-order-1".into()),
         "venue-order-1".into(),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Market,
         TimeInForce::Ioc,
         OrderStatus::PartiallyFilled,
@@ -516,7 +516,7 @@ fn partial_order_state_trades_use_cumulative_fill_without_mixing_prices() {
         "SBER_TQBR.MOEX".parse().unwrap(),
         Some("client-order-1".into()),
         "venue-order-1".into(),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Market,
         TimeInForce::Ioc,
         OrderStatus::PartiallyFilled,
@@ -645,7 +645,7 @@ fn unresolved_portfolio_position_does_not_flatten_projection() {
     let active = PositionStatusReport::new(
         account_id,
         instrument_id,
-        PositionSideSpecified::Long,
+        PositionSide::Long,
         Quantity::from(10),
         ts_init,
         ts_init,
@@ -702,7 +702,7 @@ fn out_of_scope_portfolio_position_does_not_block_scoped_reconciliation() {
     let active = PositionStatusReport::new(
         account_id,
         instrument_id,
-        PositionSideSpecified::Long,
+        PositionSide::Long,
         Quantity::from(10),
         ts_init,
         ts_init,
@@ -863,7 +863,7 @@ fn unresolved_initial_position_does_not_flatten_projection() {
     let active = PositionStatusReport::new(
         account_id,
         instrument_id,
-        PositionSideSpecified::Long,
+        PositionSide::Long,
         Quantity::from(10),
         ts_init,
         ts_init,
@@ -1060,7 +1060,7 @@ fn terminal_order_report_settles_submit_and_ambiguous_cancel_state() {
         InstrumentId::from("SBER_TQBR.MOEX"),
         Some(ClientOrderId::from("client-order-1")),
         VenueOrderId::from("venue-order-1"),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Limit,
         TimeInForce::Day,
         OrderStatus::Canceled,

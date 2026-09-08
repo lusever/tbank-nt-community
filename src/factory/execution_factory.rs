@@ -28,6 +28,7 @@ impl TbankExecutionClientFactory {
 impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
     fn create(
         &self,
+        trader_id: nautilus_model::identifiers::TraderId,
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
@@ -44,7 +45,7 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
         config.validate()?;
         let account_id = tbank_account_id(&config.resolve_account_id()?);
         let core = ExecutionClientCore::new(
-            config.trader_id,
+            trader_id,
             name.into(),
             *TBANK_VENUE,
             OmsType::Netting,
@@ -105,7 +106,12 @@ mod tests {
             ..TbankExecutionClientConfig::default()
         };
         let client = TbankExecutionClientFactory::new()
-            .create("TBANK-CUSTOM", &config, cache())
+            .create(
+                nautilus_model::identifiers::TraderId::from("TRADER-001"),
+                "TBANK-CUSTOM",
+                &config,
+                cache(),
+            )
             .unwrap();
 
         assert_eq!(client.client_id(), ClientId::from("TBANK-CUSTOM"));
@@ -118,7 +124,12 @@ mod tests {
     #[test]
     fn rejects_wrong_config_type() {
         let error = TbankExecutionClientFactory::new()
-            .create("TBANK", &WrongConfig, cache())
+            .create(
+                nautilus_model::identifiers::TraderId::from("TRADER-001"),
+                "TBANK",
+                &WrongConfig,
+                cache(),
+            )
             .err()
             .expect("wrong config type should fail");
 
@@ -136,7 +147,12 @@ mod tests {
         };
 
         let error = TbankExecutionClientFactory::new()
-            .create("TBANK", &config, cache())
+            .create(
+                nautilus_model::identifiers::TraderId::from("TRADER-001"),
+                "TBANK",
+                &config,
+                cache(),
+            )
             .err()
             .expect("invalid config should fail at the factory boundary");
 

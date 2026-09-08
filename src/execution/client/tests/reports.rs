@@ -788,7 +788,7 @@ fn stop_order_maps_to_order_status_report() {
 
     assert_eq!(report.instrument_id.to_string(), "SBER_TQBR.MOEX");
     assert_eq!(report.venue_order_id.to_string(), "stop-1");
-    assert_eq!(report.order_side, OrderSide::Sell);
+    assert_eq!(report.order_side, Some(OrderSide::Sell));
     assert_eq!(report.order_type, OrderType::StopMarket);
     assert_eq!(report.trigger_type, Some(TriggerType::Default));
     assert_eq!(report.order_status, OrderStatus::Accepted);
@@ -1054,7 +1054,10 @@ fn trailing_stop_query_preserves_native_offsets() {
     assert!(report.trigger_price.is_none());
     assert_eq!(report.trailing_offset, Some(Decimal::from(125)));
     assert_eq!(report.limit_offset, Some(Decimal::from(50)));
-    assert_eq!(report.trailing_offset_type, TrailingOffsetType::BasisPoints);
+    assert_eq!(
+        report.trailing_offset_type,
+        Some(TrailingOffsetType::BasisPoints)
+    );
     assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
 }
 
@@ -1330,7 +1333,7 @@ fn order_status_fill_projection_requires_execution_average_price() {
         "SBER_TQBR.MOEX".parse().unwrap(),
         Some("client-order-1".into()),
         "venue-order-1".into(),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Limit,
         TimeInForce::Day,
         OrderStatus::Filled,
@@ -1367,7 +1370,7 @@ fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
         "SBER_TQBR.MOEX".parse().unwrap(),
         Some("client-order-1".into()),
         "venue-order-1".into(),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Market,
         TimeInForce::Day,
         OrderStatus::PartiallyFilled,
@@ -1399,7 +1402,7 @@ fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
         "SBER_TQBR.MOEX".parse().unwrap(),
         Some("client-order-1".into()),
         "venue-order-1".into(),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Market,
         TimeInForce::Day,
         OrderStatus::Filled,
@@ -1426,6 +1429,75 @@ fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
 
     assert_eq!(second_fill.last_qty.as_decimal(), Decimal::from(5));
     assert_eq!(second_fill.last_px.as_decimal(), Decimal::from(110));
+}
+
+#[test]
+fn unknown_order_side_does_not_advance_fill_projection() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    let ts = super::current_unix_nanos();
+    let unknown_side = OrderStatusReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        Some("client-order-1".into()),
+        "venue-order-1".into(),
+        None,
+        OrderType::Market,
+        TimeInForce::Day,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(10),
+        Quantity::from(5),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    )
+    .with_avg_px(Decimal::from(100));
+
+    assert!(client
+        .runtime
+        .project_order_status_fill_report(
+            &unknown_side,
+            "venue-order-1",
+            "synthetic-trade-unknown-side",
+            ts,
+            Some("client-order-1"),
+            None,
+        )
+        .unwrap()
+        .is_none());
+    assert!(client.runtime.fill_projection.lock().unwrap().orders.is_empty());
+
+    let known_side = OrderStatusReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        Some("client-order-1".into()),
+        "venue-order-1".into(),
+        Some(OrderSide::Buy),
+        OrderType::Market,
+        TimeInForce::Day,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(10),
+        Quantity::from(5),
+        ts,
+        ts,
+        ts,
+        Some(UUID4::new()),
+    )
+    .with_avg_px(Decimal::from(100));
+    let fill = client
+        .runtime
+        .project_order_status_fill_report(
+            &known_side,
+            "venue-order-1",
+            "synthetic-trade-known-side",
+            ts,
+            Some("client-order-1"),
+            None,
+        )
+        .unwrap()
+        .expect("known side should publish the previously unprojected fill");
+
+    assert_eq!(fill.last_qty.as_decimal(), Decimal::from(5));
 }
 
 #[tokio::test]

@@ -1977,7 +1977,7 @@ async fn sandbox_order_lifecycle() -> Result<()> {
             |reports| {
                 reports.iter().any(|report| {
                     report.order_type == OrderType::StopMarket
-                        && report.order_side == OrderSide::Buy
+                        && report.order_side == Some(OrderSide::Buy)
                         && report.order_status == OrderStatus::Canceled
                 })
             },
@@ -1989,7 +1989,7 @@ async fn sandbox_order_lifecycle() -> Result<()> {
         wait_for_mass_order_report(&mass_execution.client, |reports| {
             reports.iter().any(|report| {
                 report.order_type == OrderType::StopMarket
-                    && report.order_side == OrderSide::Buy
+                    && report.order_side == Some(OrderSide::Buy)
                     && report.order_status == OrderStatus::Canceled
             })
         })

@@ -88,8 +88,8 @@ SPB; брокерские счета имеют вид `TBANK-{broker_account_id
 
 Nautilus передаёт конкретную конфигурацию клиента и имя клиента в каждый вызов `create`. Обе
 фабрики клиентов не хранят состояние и отклоняют конфигурацию неверного типа, не подставляя
-молчаливые значения по умолчанию. Конфигурация исполнения отвечает за идентификатор трейдера,
-что соответствует контракту конфигурации адаптера Nautilus.
+молчаливые значения по умолчанию. Идентификатор трейдера передаётся `LiveNode` в factory API,
+а конфигурация исполнения содержит только venue- и broker-specific параметры.
 
 Минимальная настройка `LiveNode`:
 
@@ -110,7 +110,6 @@ let data_config = TbankDataClientConfig {
     ..TbankDataClientConfig::default()
 };
 let execution_config = TbankExecutionClientConfig {
-    trader_id,
     environment: TbankEnvironment::Sandbox,
     ..TbankExecutionClientConfig::default()
 };

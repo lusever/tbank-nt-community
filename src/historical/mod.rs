@@ -605,8 +605,8 @@ fn tbank_trade_to_nautilus(
         )?,
         quantity_from_lots(trade.quantity, lot_size, quantity_precision)?,
         match TradeDirection::try_from(trade.direction).unwrap_or(TradeDirection::Unspecified) {
-            TradeDirection::Buy => AggressorSide::Buyer,
-            TradeDirection::Sell => AggressorSide::Seller,
+            TradeDirection::Buy => AggressorSide::Buy,
+            TradeDirection::Sell => AggressorSide::Sell,
             TradeDirection::Unspecified => AggressorSide::NoAggressor,
         },
         nautilus_model::identifiers::TradeId::new(format!("{}", ts.as_u64())),

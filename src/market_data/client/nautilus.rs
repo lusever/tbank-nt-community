@@ -1,5 +1,15 @@
 use super::*;
 
+fn request_timestamp_to_datetime(
+    timestamp: jiff::Timestamp,
+) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let nanos = timestamp.as_nanosecond();
+    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000))?;
+    let sub_nanos = u32::try_from(nanos.rem_euclid(1_000_000_000))?;
+    chrono::DateTime::from_timestamp(seconds, sub_nanos)
+        .ok_or_else(|| anyhow::anyhow!("historical request timestamp is out of range"))
+}
+
 impl TbankDataClient {
     fn sync_nautilus_order_book_registry(&mut self, instrument_id: InstrumentId) {
         let mut depths = HashSet::new();
@@ -61,7 +71,7 @@ impl DataClient for TbankDataClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        TbankDataClient::disconnect(self);
+        TbankDataClient::disconnect_async(self).await;
         Ok(())
     }
 
@@ -166,10 +176,14 @@ impl DataClient for TbankDataClient {
         let end = request.end;
         let limit = request.limit.map(|limit| limit.get());
         let params = request.params;
-        let start_nanos = datetime_to_unix_nanos(start);
-        let end_nanos = datetime_to_unix_nanos(end);
+        let start_nanos = start
+            .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
+            .transpose()?;
+        let end_nanos = end
+            .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
+            .transpose()?;
 
-        get_runtime().spawn(async move {
+        let task = get_runtime().spawn(async move {
             let result = async {
                 let mut historical = crate::historical::TbankHistoricalClient::new(
                     clients,
@@ -178,8 +192,12 @@ impl DataClient for TbankDataClient {
                     indicative_instruments,
                 );
                 let resolved = historical.resolve_instrument(instrument_id).await?;
-                let from = start.ok_or_else(|| anyhow::anyhow!("request_trades requires start"))?;
-                let to = end.ok_or_else(|| anyhow::anyhow!("request_trades requires end"))?;
+                let from = request_timestamp_to_datetime(
+                    start.ok_or_else(|| anyhow::anyhow!("request_trades requires start"))?,
+                )?;
+                let to = request_timestamp_to_datetime(
+                    end.ok_or_else(|| anyhow::anyhow!("request_trades requires end"))?,
+                )?;
                 historical
                     .request_trades(
                         &resolved,
@@ -212,6 +230,9 @@ impl DataClient for TbankDataClient {
                 Err(error) => tracing::error!(%error, "T-Bank request_trades failed"),
             }
         });
+        let mut request_tasks = self.request_tasks.lock().expect("request_tasks lock");
+        request_tasks.retain(|task| !task.is_finished());
+        request_tasks.push(task);
 
         Ok(())
     }
@@ -236,10 +257,14 @@ impl DataClient for TbankDataClient {
         let end = request.end;
         let limit = request.limit.map(|limit| limit.get());
         let params = request.params;
-        let start_nanos = datetime_to_unix_nanos(start);
-        let end_nanos = datetime_to_unix_nanos(end);
+        let start_nanos = start
+            .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
+            .transpose()?;
+        let end_nanos = end
+            .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
+            .transpose()?;
 
-        get_runtime().spawn(async move {
+        let task = get_runtime().spawn(async move {
             let result = async {
                 let mut historical = crate::historical::TbankHistoricalClient::new(
                     clients,
@@ -248,8 +273,12 @@ impl DataClient for TbankDataClient {
                     indicative_instruments,
                 );
                 let resolved = historical.resolve_instrument(instrument_id).await?;
-                let from = start.ok_or_else(|| anyhow::anyhow!("request_bars requires start"))?;
-                let to = end.ok_or_else(|| anyhow::anyhow!("request_bars requires end"))?;
+                let from = request_timestamp_to_datetime(
+                    start.ok_or_else(|| anyhow::anyhow!("request_bars requires start"))?,
+                )?;
+                let to = request_timestamp_to_datetime(
+                    end.ok_or_else(|| anyhow::anyhow!("request_bars requires end"))?,
+                )?;
                 historical
                     .request_bars(&resolved, bar_type, interval, from, to, limit, retries)
                     .await
@@ -275,6 +304,9 @@ impl DataClient for TbankDataClient {
                 Err(error) => tracing::error!(%error, "T-Bank request_bars failed"),
             }
         });
+        let mut request_tasks = self.request_tasks.lock().expect("request_tasks lock");
+        request_tasks.retain(|task| !task.is_finished());
+        request_tasks.push(task);
 
         Ok(())
     }

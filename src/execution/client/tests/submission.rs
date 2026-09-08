@@ -38,7 +38,7 @@ fn reconciliation_report_filters_match_upstream_command_contracts() {
         instrument_id,
         Some(ClientOrderId::from("order-1")),
         VenueOrderId::from("venue-1"),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Limit,
         TimeInForce::Gtc,
         OrderStatus::Accepted,
@@ -142,7 +142,7 @@ fn reconciliation_report_filters_match_upstream_command_contracts() {
     let position = PositionStatusReport::new(
         account_id,
         instrument_id,
-        PositionSideSpecified::Long,
+        PositionSide::Long,
         Quantity::from(1),
         ts,
         ts,
@@ -255,6 +255,7 @@ fn generate_account_state_emits_without_duplicating_core_cache() {
         Vec::new(),
         true,
         UnixNanos::from(100),
+        None,
     )
     .unwrap();
 
@@ -1324,8 +1325,8 @@ async fn submit_order_list_accepts_explicit_no_contingency_orders() {
     let mut first = submit_order_cmd_for("SBER_TQBR.MOEX", OrderType::Market, None).order_init;
     let mut second = first.clone();
     second.client_order_id = ClientOrderId::from("order-2");
-    first.contingency_type = Some(ContingencyType::NoContingency);
-    second.contingency_type = Some(ContingencyType::NoContingency);
+    first.contingency_type = None;
+    second.contingency_type = None;
     let list = submit_order_list_cmd(vec![first, second]);
     let mut client = test_client(TbankExecutionClientConfig {
         account_id: Some("account-1".to_string()),
@@ -1871,7 +1872,7 @@ fn mark_pending_submit_order_report_only_touches_matching_client_order() {
         InstrumentId::from("SBER_TQBR.MOEX"),
         Some(ClientOrderId::from("client-1")),
         VenueOrderId::from("venue-1"),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Limit,
         TimeInForce::Day,
         OrderStatus::Accepted,
@@ -1896,7 +1897,7 @@ fn mark_pending_submit_order_report_only_touches_matching_client_order() {
         InstrumentId::from("SBER_TQBR.MOEX"),
         None,
         VenueOrderId::from("venue-2"),
-        OrderSide::Buy,
+        Some(OrderSide::Buy),
         OrderType::Limit,
         TimeInForce::Day,
         OrderStatus::Filled,

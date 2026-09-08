@@ -710,7 +710,7 @@ pub fn build_equity_instrument(
     info.insert("exchange".to_string(), metadata.exchange.clone().into());
     info.insert("venue".to_string(), metadata.venue.to_string().into());
     TbankInstrumentMetadata::insert_trading_flags(&mut info, metadata);
-    Ok(InstrumentAny::Equity(Equity::new_checked(
+    Ok(InstrumentAny::Equity(Equity::build_checked(
         instrument_id,
         Symbol::new(metadata.ticker.as_str()),
         None,
@@ -807,7 +807,7 @@ pub fn build_futures_instrument(
         );
     }
     Ok(InstrumentAny::FuturesContract(
-        FuturesContract::new_checked(
+        FuturesContract::build_checked(
             instrument_id,
             Symbol::new(&metadata.ticker),
             metadata.asset_class,
@@ -877,7 +877,7 @@ pub fn build_index_instrument(
     info.insert("tbank_market_data_only".to_string(), true.into());
 
     Ok(InstrumentAny::IndexInstrument(
-        IndexInstrument::new_checked(
+        IndexInstrument::build_checked(
             instrument_id,
             Symbol::new(&indicative.ticker),
             currency,
