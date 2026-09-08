@@ -226,8 +226,10 @@ pub(super) async fn publish_order_state_stream(
                                     {
                                         Ok(()) => {}
                                         Err(error)
-                                            if classify_cancel_failure(&error)
-                                                == CancelFailureKind::OutcomeUnknown =>
+                                            if matches!(
+                                                classify_command_failure(&error),
+                                                CommandFailure::Ambiguous(_)
+                                            ) =>
                                         {
                                             match cancel_client
                                                 .recover_ambiguous_cancel(pending_cancel)

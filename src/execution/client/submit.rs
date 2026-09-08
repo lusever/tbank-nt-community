@@ -297,12 +297,12 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
     let response = match client.submit_order(&order, &metadata).await {
         Ok(response) => response,
         Err(error) => {
-            match classify_submit_failure(&error) {
-                SubmitFailureKind::LocalRejected | SubmitFailureKind::BrokerRejected => {
+            match classify_command_failure(&error) {
+                CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_) => {
                     tracing::error!(%error, client_order_id = %cmd.client_order_id, "T-Bank rejected Nautilus order");
                     return Ok(SubmitPipelineOutcome::Rejected(error.to_string()));
                 }
-                SubmitFailureKind::OutcomeUnknown => {}
+                CommandFailure::Ambiguous(_) => {}
             }
             tracing::warn!(
                 %error,
@@ -518,53 +518,15 @@ fn quotation_matches(expected: Option<&Quotation>, actual: Option<&Quotation>) -
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SubmitFailureKind {
-    LocalRejected,
-    BrokerRejected,
-    OutcomeUnknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CancelFailureKind {
-    LocalFailure,
-    BrokerRejected,
-    OutcomeUnknown,
-}
-
-pub(super) fn classify_cancel_failure(error: &TbankAdapterError) -> CancelFailureKind {
-    match error {
-        TbankAdapterError::PermissionDenied(_) => CancelFailureKind::BrokerRejected,
-        TbankAdapterError::GrpcStatus { code, .. } => match classify_submit_grpc_status(*code) {
-            SubmitFailureKind::BrokerRejected => CancelFailureKind::BrokerRejected,
-            SubmitFailureKind::OutcomeUnknown => CancelFailureKind::OutcomeUnknown,
-            SubmitFailureKind::LocalRejected => unreachable!("gRPC status is never local"),
-        },
-        TbankAdapterError::RateLimited(_)
-        | TbankAdapterError::InstrumentNotFound(_)
-        | TbankAdapterError::InstrumentMetadataUnresolved(_)
-        | TbankAdapterError::FuturesMarginUnresolved(_)
-        | TbankAdapterError::SubmitOutcomeUnknown(_)
-        | TbankAdapterError::ReconnectFailed(_) => CancelFailureKind::OutcomeUnknown,
-        TbankAdapterError::ConfigError(_)
-        | TbankAdapterError::MissingToken
-        | TbankAdapterError::MissingAccountId
-        | TbankAdapterError::InvalidEndpoint
-        | TbankAdapterError::UnsupportedInstrument(_)
-        | TbankAdapterError::InstrumentOutOfScope(_)
-        | TbankAdapterError::UnsupportedOrderType(_)
-        | TbankAdapterError::UnsupportedTimeInForce(_)
-        | TbankAdapterError::InvalidQuantity(_)
-        | TbankAdapterError::InvalidPrice(_)
-        | TbankAdapterError::QuantityNotMultipleOfLot { .. }
-        | TbankAdapterError::PriceNotMultipleOfTick { .. }
-        | TbankAdapterError::ConversionError(_)
-        | TbankAdapterError::InvalidInstrumentIdentity(_)
-        | TbankAdapterError::BrokerOrderIdentityUnresolved(_) => CancelFailureKind::LocalFailure,
-    }
-}
-
-pub(super) fn classify_submit_failure(error: &TbankAdapterError) -> SubmitFailureKind {
+/// Maps an adapter error to the upstream command-failure contract.
+///
+/// The same wire condition classifies identically for submit, cancel, and
+/// their batch/list forms: deterministic local failures prove the command was
+/// never transmitted, explicit broker denials (including rate limits) are
+/// venue rejections, and transport or post-send lookup failures leave the
+/// venue outcome undefined. Retryability is a separate axis handled by the
+/// transport and reconciliation layers, not by this mapping.
+pub(super) fn classify_command_failure(error: &TbankAdapterError) -> CommandFailure {
     match error {
         TbankAdapterError::ConfigError(_)
         | TbankAdapterError::MissingToken
@@ -580,38 +542,47 @@ pub(super) fn classify_submit_failure(error: &TbankAdapterError) -> SubmitFailur
         | TbankAdapterError::PriceNotMultipleOfTick { .. }
         | TbankAdapterError::ConversionError(_)
         | TbankAdapterError::InvalidInstrumentIdentity(_)
-        | TbankAdapterError::BrokerOrderIdentityUnresolved(_) => SubmitFailureKind::LocalRejected,
+        | TbankAdapterError::BrokerOrderIdentityUnresolved(_) => {
+            CommandFailure::not_sent(error.to_string())
+        }
         TbankAdapterError::PermissionDenied(_) | TbankAdapterError::RateLimited(_) => {
-            SubmitFailureKind::BrokerRejected
+            CommandFailure::venue_rejected(error.to_string())
         }
         TbankAdapterError::InstrumentNotFound(_)
         | TbankAdapterError::InstrumentMetadataUnresolved(_)
         | TbankAdapterError::FuturesMarginUnresolved(_)
         | TbankAdapterError::SubmitOutcomeUnknown(_)
-        | TbankAdapterError::ReconnectFailed(_) => SubmitFailureKind::OutcomeUnknown,
-        TbankAdapterError::GrpcStatus { code, .. } => classify_submit_grpc_status(*code),
+        | TbankAdapterError::ReconnectFailed(_) => CommandFailure::ambiguous(error.to_string()),
+        TbankAdapterError::GrpcStatus { code, .. } => {
+            classify_grpc_command_failure(*code, error.to_string())
+        }
     }
 }
 
-pub(super) fn classify_submit_grpc_status(code: tonic::Code) -> SubmitFailureKind {
+/// Maps a gRPC status code to the upstream command-failure contract.
+///
+/// Definitive broker denials are venue rejections; transport failures and
+/// timeouts leave the outcome ambiguous because a sent request may still have
+/// been applied. No gRPC code proves the command was never transmitted.
+pub(super) fn classify_grpc_command_failure(code: tonic::Code, reason: String) -> CommandFailure {
     match code {
         tonic::Code::InvalidArgument
         | tonic::Code::NotFound
         | tonic::Code::AlreadyExists
         | tonic::Code::FailedPrecondition
         | tonic::Code::OutOfRange
-        | tonic::Code::Unimplemented => SubmitFailureKind::BrokerRejected,
+        | tonic::Code::Unimplemented
+        | tonic::Code::Ok
+        | tonic::Code::PermissionDenied
+        | tonic::Code::ResourceExhausted
+        | tonic::Code::Unauthenticated => CommandFailure::venue_rejected(reason),
         tonic::Code::Cancelled
         | tonic::Code::Unknown
         | tonic::Code::DeadlineExceeded
         | tonic::Code::Aborted
         | tonic::Code::Internal
         | tonic::Code::DataLoss
-        | tonic::Code::Unavailable => SubmitFailureKind::OutcomeUnknown,
-        tonic::Code::Ok
-        | tonic::Code::PermissionDenied
-        | tonic::Code::ResourceExhausted
-        | tonic::Code::Unauthenticated => SubmitFailureKind::BrokerRejected,
+        | tonic::Code::Unavailable => CommandFailure::ambiguous(reason),
     }
 }
 

@@ -60,7 +60,7 @@ use nautilus_common::{
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_execution::client::core::ExecutionClientCore;
-use nautilus_live::ExecutionEventEmitter;
+use nautilus_live::{ExecutionEventEmitter, execution::failure::CommandFailure};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
@@ -1384,7 +1384,10 @@ impl TbankExecutionRuntime {
                     return Ok(TbankCancelRecoveryOutcome::Canceled);
                 }
                 Err(error)
-                    if classify_cancel_failure(&error) == CancelFailureKind::OutcomeUnknown =>
+                    if matches!(
+                        classify_command_failure(&error),
+                        CommandFailure::Ambiguous(_)
+                    ) =>
                 {
                     tracing::warn!(
                         %error,
@@ -1873,8 +1876,8 @@ impl TbankExecutionRuntime {
             }
             Err(error) => {
                 if matches!(
-                    classify_submit_failure(&error),
-                    SubmitFailureKind::LocalRejected | SubmitFailureKind::BrokerRejected
+                    classify_command_failure(&error),
+                    CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
                 ) {
                     self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
                     self.mark_pending_submit_stage(
@@ -1967,7 +1970,12 @@ impl TbankExecutionRuntime {
                     .expect("unresolved_cancellations lock")
                     .remove(&identity);
             }
-            Err(error) if classify_cancel_failure(error) == CancelFailureKind::OutcomeUnknown => {
+            Err(error)
+                if matches!(
+                    classify_command_failure(error),
+                    CommandFailure::Ambiguous(_)
+                ) =>
+            {
                 self.unresolved_cancellations
                     .lock()
                     .expect("unresolved_cancellations lock")
@@ -1977,7 +1985,10 @@ impl TbankExecutionRuntime {
         }
         if was_unresolved
             && result.as_ref().is_err_and(|error| {
-                classify_cancel_failure(error) != CancelFailureKind::OutcomeUnknown
+                !matches!(
+                    classify_command_failure(error),
+                    CommandFailure::Ambiguous(_)
+                )
             })
         {
             return match self
@@ -2035,7 +2046,10 @@ impl TbankExecutionRuntime {
             match self.cancel_resolved_broker_order(identity.clone()).await {
                 Ok(()) => cancelled += 1,
                 Err(error)
-                    if classify_cancel_failure(&error) == CancelFailureKind::OutcomeUnknown =>
+                    if matches!(
+                        classify_command_failure(&error),
+                        CommandFailure::Ambiguous(_)
+                    ) =>
                 {
                     match self.recover_ambiguous_cancel(identity.clone()).await {
                         Ok(TbankCancelRecoveryOutcome::Canceled) => cancelled += 1,
