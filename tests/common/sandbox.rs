@@ -846,7 +846,6 @@ fn futures_initial_margin(instrument: &InstrumentMeta, side: OrderSide) -> Resul
     let margin = match side {
         OrderSide::Buy => instrument.initial_margin_on_buy,
         OrderSide::Sell => instrument.initial_margin_on_sell,
-        _ => None,
     }
     .with_context(|| {
         format!(
