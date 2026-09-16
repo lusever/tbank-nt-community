@@ -65,6 +65,20 @@ currency-valued execution averages and the legacy `GetOperations`/`GetSandboxOpe
 are converted through the current tick amount.
 FOK is rejected locally for futures until the broker provides equivalent semantics.
 
+### T-Invest API 1.51 additions
+
+The vendored contracts are pinned to T-Invest API 1.51. Generated responses expose the broker's
+`price_currency` fields, bond `ratings`, market-value interest statistics, and the additional
+account types from the contract. Portfolio account-state events copy `total_var_margin` and
+`total_var_margin_settled` into `AccountState.info` as exact decimal strings under
+`TBANK_TOTAL_VAR_MARGIN_INFO_KEY` and `TBANK_TOTAL_VAR_MARGIN_SETTLED_INFO_KEY`.
+
+`GetStopOrders` has no cursor. When an unbounded history response returns broker error `30261`,
+the adapter retries in bounded windows over the last 30 days; explicitly bounded reconciliation
+requests are split into daily windows and then subdivided when necessary. Broker error `80007`
+means that the instrument's stop-order limit was reached and is surfaced as a terminal venue
+rejection, rather than as a retryable transport rate limit.
+
 ### 0.2.x routing migration
 
 Register one T-Bank data client and one T-Bank execution client with the same routing configuration:

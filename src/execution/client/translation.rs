@@ -1408,21 +1408,44 @@ pub(super) fn account_state_from_portfolio(
         .filter(|cash| cash.currency.eq_ignore_ascii_case(total.currency.as_str()))
         .map(crate::common::decimal::money_value_to_decimal)
         .unwrap_or(total_amount);
-    Ok(Some(nautilus_model::events::AccountState::new(
-        nautilus_account_id(&portfolio.account_id),
-        AccountType::Margin,
-        vec![AccountBalance::from_total_and_free(
-            total_amount,
-            free_amount,
-            currency,
-        )?],
-        Vec::new(),
-        true,
-        UUID4::new(),
-        current_unix_nanos(),
-        current_unix_nanos(),
-        Some(currency),
-    )))
+    let mut info = Params::new();
+    if let Some(var_margin) = portfolio.total_var_margin.as_ref() {
+        info.insert(
+            crate::execution::TBANK_TOTAL_VAR_MARGIN_INFO_KEY.to_string(),
+            crate::common::decimal::money_value_to_decimal(var_margin)
+                .normalize()
+                .to_string()
+                .into(),
+        );
+    }
+    if let Some(var_margin_settled) = portfolio.total_var_margin_settled.as_ref() {
+        info.insert(
+            crate::execution::TBANK_TOTAL_VAR_MARGIN_SETTLED_INFO_KEY.to_string(),
+            crate::common::decimal::money_value_to_decimal(var_margin_settled)
+                .normalize()
+                .to_string()
+                .into(),
+        );
+    }
+    let info = (!info.is_empty()).then_some(info);
+    Ok(Some(
+        nautilus_model::events::AccountState::new(
+            nautilus_account_id(&portfolio.account_id),
+            AccountType::Margin,
+            vec![AccountBalance::from_total_and_free(
+                total_amount,
+                free_amount,
+                currency,
+            )?],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            current_unix_nanos(),
+            current_unix_nanos(),
+            Some(currency),
+        )
+        .with_info(info),
+    ))
 }
 
 pub(super) fn metadata_from_instrument(

@@ -1950,6 +1950,7 @@ struct MockStopOrdersService {
     post_error: Arc<Mutex<Option<(Code, String)>>>,
     post_response: Arc<Mutex<Option<PostStopOrderResponse>>>,
     get_calls: Arc<Mutex<Vec<GetStopOrdersRequest>>>,
+    get_errors: Arc<Mutex<VecDeque<(Code, String)>>>,
     get_responses: Arc<Mutex<VecDeque<GetStopOrdersResponse>>>,
     get_response: Arc<Mutex<Option<GetStopOrdersResponse>>>,
     cancel_calls: Arc<Mutex<Vec<CancelStopOrderRequest>>>,
@@ -2333,6 +2334,53 @@ async fn reconnect_stop_query_keeps_active_orders_and_bounds_terminal_history() 
     );
     assert_eq!(calls[1].from.as_ref().unwrap().seconds, from_seconds);
     assert!(calls[1].to.as_ref().unwrap().seconds >= from_seconds);
+}
+
+#[tokio::test]
+async fn unbounded_stop_query_recovers_from_response_limit_in_bounded_windows() {
+    let service = MockStopOrdersService::default();
+    let get_calls = Arc::clone(&service.get_calls);
+    service
+        .get_errors
+        .lock()
+        .unwrap()
+        .push_back((Code::InvalidArgument, "30261".to_string()));
+    *service.get_response.lock().unwrap() = Some(GetStopOrdersResponse {
+        stop_orders: vec![active_sber_stop_order("stop-order-1")],
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(StopOrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    client.runtime.connect().await.unwrap();
+
+    let response = client
+        .runtime
+        .query_stop_orders_for_reconciliation(None)
+        .await
+        .unwrap();
+
+    assert_eq!(response.stop_orders.len(), 1);
+    let calls = get_calls.lock().unwrap();
+    assert!(calls.len() > 2, "expected fallback windows after 30261");
+    assert!(calls[0].from.is_none() && calls[0].to.is_none());
+    assert!(calls[1..]
+        .iter()
+        .all(|request| request.from.is_some() && request.to.is_some()));
 }
 
 #[tokio::test]
