@@ -1764,17 +1764,21 @@ fn submit_failure_classification_covers_local_broker_and_unknown_outcomes() {
 
     // Explicit broker denials are terminal and must not schedule
     // reconciliation.
-    let command_error = TbankCommandError::rpc_started(TbankAdapterError::PermissionDenied(
-        "no access".to_string(),
-    ));
-    assert!(
-        matches!(
-            classify_command_failure(&command_error),
-            CommandFailure::VenueRejected(_)
-        ),
-        "broker rejection {:?}",
-        command_error.error
-    );
+    for error in [
+        TbankAdapterError::PermissionDenied("no access".to_string()),
+        TbankAdapterError::StopOrderLimitReached("80007".to_string()),
+        TbankAdapterError::StopOrdersResponseLimitExceeded("30261".to_string()),
+    ] {
+        let command_error = TbankCommandError::rpc_started(error);
+        assert!(
+            matches!(
+                classify_command_failure(&command_error),
+                CommandFailure::VenueRejected(_)
+            ),
+            "broker rejection {:?}",
+            command_error.error
+        );
+    }
 
     // Ambiguous failures must trigger reconciliation, never a rejection.
     for error in [

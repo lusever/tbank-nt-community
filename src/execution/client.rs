@@ -89,6 +89,10 @@ use translation::*;
 
 /// Nautilus execution parameter controlling T-Bank margin-trade confirmation.
 pub const TBANK_CONFIRM_MARGIN_TRADE_PARAM: &str = "tbank_confirm_margin_trade";
+/// Account-state info key containing the portfolio's current variation margin as a decimal string.
+pub const TBANK_TOTAL_VAR_MARGIN_INFO_KEY: &str = "tbank_total_var_margin";
+/// Account-state info key containing the settled variation margin as a decimal string.
+pub const TBANK_TOTAL_VAR_MARGIN_SETTLED_INFO_KEY: &str = "tbank_total_var_margin_settled";
 
 fn log_tbank_rpc_failure(rpc: &'static str, error: &TbankAdapterError) {
     match error {
@@ -126,6 +130,24 @@ fn log_tbank_rpc_failure(rpc: &'static str, error: &TbankAdapterError) {
                 tracing::Level::WARN,
                 rpc,
                 error_kind = "rate_limited",
+                "T-Bank RPC failed"
+            );
+        }
+        TbankAdapterError::StopOrderLimitReached(_) => {
+            tracing::event!(
+                target: "tbank.rpc",
+                tracing::Level::WARN,
+                rpc,
+                error_kind = "stop_order_limit_reached",
+                "T-Bank RPC failed"
+            );
+        }
+        TbankAdapterError::StopOrdersResponseLimitExceeded(_) => {
+            tracing::event!(
+                target: "tbank.rpc",
+                tracing::Level::WARN,
+                rpc,
+                error_kind = "stop_orders_response_limit_exceeded",
                 "T-Bank RPC failed"
             );
         }
@@ -466,6 +488,9 @@ const STOP_ORDER_SUBMIT_RECONCILIATION_WINDOW: Duration = Duration::from_secs(5 
 const RECONNECT_RECONCILIATION_MAX_ATTEMPTS: u32 = 5;
 const CANCEL_OUTCOME_RECOVERY_ATTEMPTS: u32 = 5;
 const RECONNECT_RECONCILIATION_OVERLAP_NANOS: u64 = 5 * 60 * 1_000_000_000;
+const STOP_ORDER_QUERY_WINDOW_NANOS: i128 = 24 * 60 * 60 * 1_000_000_000;
+const STOP_ORDER_QUERY_SPLIT_FLOOR_NANOS: i128 = 60 * 60 * 1_000_000_000;
+const STOP_ORDER_UNBOUNDED_FALLBACK_LOOKBACK_NANOS: i128 = 30 * 24 * 60 * 60 * 1_000_000_000;
 const FUTURES_MARGIN_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_UNRESOLVED_TRADE_FILLS: usize = 1_024;
 const MAX_UNRESOLVED_TRADE_FILLS_PER_ORDER: usize = 64;
@@ -2344,9 +2369,76 @@ impl TbankExecutionRuntime {
         status: StopOrderStatusOption,
         range: Option<(prost_types::Timestamp, prost_types::Timestamp)>,
     ) -> Result<GetStopOrdersResponse> {
-        let (from, to) = range
-            .map(|(from, to)| (Some(from), Some(to)))
-            .unwrap_or((None, None));
+        if let Some((from, to)) = range {
+            let from = crate::common::time::timestamp_to_unix_nanos(&from)?;
+            let to = crate::common::time::timestamp_to_unix_nanos(&to)?;
+            return self.query_stop_orders_range(status, from, to).await;
+        }
+        match self.query_stop_orders_request(status, None, None).await {
+            Ok(response) => Ok(response),
+            Err(TbankAdapterError::StopOrdersResponseLimitExceeded(_)) => {
+                let to = i128::from(current_unix_nanos().as_u64());
+                let from = to.saturating_sub(STOP_ORDER_UNBOUNDED_FALLBACK_LOOKBACK_NANOS);
+                tracing::warn!(
+                    lookback_days = 30,
+                    "T-Bank stop-order history exceeded the unbounded response limit; retrying in bounded windows"
+                );
+                self.query_stop_orders_range(status, from, to).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn query_stop_orders_range(
+        &mut self,
+        status: StopOrderStatusOption,
+        from_unix_nanos: i128,
+        to_unix_nanos: i128,
+    ) -> Result<GetStopOrdersResponse> {
+        if from_unix_nanos >= to_unix_nanos {
+            return Ok(GetStopOrdersResponse::default());
+        }
+        let mut merged = GetStopOrdersResponse::default();
+        let mut windows = VecDeque::new();
+        let mut cursor = from_unix_nanos;
+        while cursor < to_unix_nanos {
+            let end = cursor
+                .saturating_add(STOP_ORDER_QUERY_WINDOW_NANOS)
+                .min(to_unix_nanos);
+            windows.push_back((cursor, end));
+            cursor = end;
+        }
+        while let Some((window_from, window_to)) = windows.pop_front() {
+            match self
+                .query_stop_orders_request(
+                    status,
+                    Some(unix_nanos_to_timestamp(window_from)?),
+                    Some(unix_nanos_to_timestamp(window_to)?),
+                )
+                .await
+            {
+                Ok(response) => merged = merge_stop_order_snapshots(merged, response),
+                Err(TbankAdapterError::StopOrdersResponseLimitExceeded(_))
+                    if window_to.saturating_sub(window_from)
+                        > STOP_ORDER_QUERY_SPLIT_FLOOR_NANOS =>
+                {
+                    let midpoint =
+                        window_from.saturating_add(window_to.saturating_sub(window_from) / 2);
+                    windows.push_front((midpoint, window_to));
+                    windows.push_front((window_from, midpoint));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(merged)
+    }
+
+    async fn query_stop_orders_request(
+        &mut self,
+        status: StopOrderStatusOption,
+        from: Option<prost_types::Timestamp>,
+        to: Option<prost_types::Timestamp>,
+    ) -> Result<GetStopOrdersResponse> {
         let request = GetStopOrdersRequest {
             account_id: self.config.resolve_account_id()?,
             status: status as i32,

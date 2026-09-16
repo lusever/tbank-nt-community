@@ -35,6 +35,12 @@ pub enum TbankAdapterError {
     /// The broker rate limit was reached.
     #[error("rate limited: {0}")]
     RateLimited(String),
+    /// The broker rejected a stop order because the instrument reached its stop-order limit.
+    #[error("stop-order limit reached: {0}")]
+    StopOrderLimitReached(String),
+    /// The broker response contained too many stop orders for the requested range.
+    #[error("stop-orders response limit exceeded: {0}")]
+    StopOrdersResponseLimitExceeded(String),
     /// The requested instrument was not found.
     #[error("instrument not found: {0}")]
     InstrumentNotFound(String),
@@ -98,9 +104,26 @@ pub enum TbankAdapterError {
 impl From<tonic::Status> for TbankAdapterError {
     fn from(status: tonic::Status) -> Self {
         let message = grpc_status_message(&status);
+        let broker_code = broker_error_code(&message);
         match status.code() {
             tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
                 Self::PermissionDenied(message)
+            }
+            tonic::Code::InvalidArgument
+                if broker_code == Some(30261)
+                    || message
+                        .to_ascii_lowercase()
+                        .contains("stop-orders response limit exceeded") =>
+            {
+                Self::StopOrdersResponseLimitExceeded(message)
+            }
+            tonic::Code::ResourceExhausted
+                if broker_code == Some(80007)
+                    || message
+                        .to_ascii_lowercase()
+                        .contains("stop-orders limit has been reached") =>
+            {
+                Self::StopOrderLimitReached(message)
             }
             tonic::Code::ResourceExhausted => Self::RateLimited(message),
             _ => Self::GrpcStatus {
@@ -109,6 +132,13 @@ impl From<tonic::Status> for TbankAdapterError {
             },
         }
     }
+}
+
+fn broker_error_code(message: &str) -> Option<u32> {
+    message
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|token| token.len() >= 5)
+        .and_then(|token| token.parse().ok())
 }
 
 fn grpc_status_message(status: &tonic::Status) -> String {
@@ -136,6 +166,23 @@ mod tests {
         assert!(matches!(
             error,
             TbankAdapterError::RateLimited(message) if message == "too many requests"
+        ));
+    }
+
+    #[test]
+    fn broker_stop_order_codes_are_preserved_as_specific_errors() {
+        let response_limit =
+            TbankAdapterError::from(tonic::Status::new(Code::InvalidArgument, "30261"));
+        assert!(matches!(
+            response_limit,
+            TbankAdapterError::StopOrdersResponseLimitExceeded(message) if message == "30261"
+        ));
+
+        let instrument_limit =
+            TbankAdapterError::from(tonic::Status::new(Code::ResourceExhausted, "80007"));
+        assert!(matches!(
+            instrument_limit,
+            TbankAdapterError::StopOrderLimitReached(message) if message == "80007"
         ));
     }
 }

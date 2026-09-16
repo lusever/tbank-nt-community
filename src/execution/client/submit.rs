@@ -598,6 +598,10 @@ pub(super) fn classify_command_failure(error: &TbankCommandError) -> CommandFail
         }
         TbankAdapterError::PermissionDenied(_) => CommandFailure::venue_rejected(error.to_string()),
         TbankAdapterError::RateLimited(_) => CommandFailure::ambiguous(error.to_string()),
+        TbankAdapterError::StopOrderLimitReached(_)
+        | TbankAdapterError::StopOrdersResponseLimitExceeded(_) => {
+            CommandFailure::venue_rejected(error.to_string())
+        }
         TbankAdapterError::InstrumentNotFound(_)
         | TbankAdapterError::InstrumentMetadataUnresolved(_)
         | TbankAdapterError::FuturesMarginUnresolved(_)

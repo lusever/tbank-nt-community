@@ -10,8 +10,9 @@ mod projections;
 pub mod stop_orders;
 
 pub use client::{
-    TBANK_CONFIRM_MARGIN_TRADE_PARAM, TbankExecutionClient, TbankSubmitResponse, tbank_account_id,
-    tbank_broker_request_id_for_client_order_id,
+    TBANK_CONFIRM_MARGIN_TRADE_PARAM, TBANK_TOTAL_VAR_MARGIN_INFO_KEY,
+    TBANK_TOTAL_VAR_MARGIN_SETTLED_INFO_KEY, TbankExecutionClient, TbankSubmitResponse,
+    tbank_account_id, tbank_broker_request_id_for_client_order_id,
 };
 pub use orders::{
     TbankExecutionService, TbankSubmitOrder, TbankTrailingStopParams, build_post_order_request,

@@ -590,6 +590,42 @@ fn portfolio_account_state_supports_kazakhstani_tenge() {
 }
 
 #[test]
+fn portfolio_account_state_exposes_variation_margin_in_info() {
+    let portfolio = PortfolioResponse {
+        account_id: "2289788994".to_string(),
+        total_amount_portfolio: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: 100_000,
+            nano: 0,
+        }),
+        total_var_margin: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: -1_250,
+            nano: -500_000_000,
+        }),
+        total_var_margin_settled: Some(MoneyValue {
+            currency: "rub".to_string(),
+            units: -1_000,
+            nano: 0,
+        }),
+        ..PortfolioResponse::default()
+    };
+
+    let state = super::account_state_from_portfolio(&portfolio)
+        .unwrap()
+        .unwrap();
+    let info = state.info.as_ref().expect("variation margin info");
+    assert_eq!(
+        info.get_str(crate::execution::TBANK_TOTAL_VAR_MARGIN_INFO_KEY),
+        Some("-1250.5")
+    );
+    assert_eq!(
+        info.get_str(crate::execution::TBANK_TOTAL_VAR_MARGIN_SETTLED_INFO_KEY),
+        Some("-1000")
+    );
+}
+
+#[test]
 fn trades_stream_fill_uses_figi_when_uid_is_empty() {
     let mut metadata = sber_metadata();
     metadata.instrument_uid = "cached-sber-uid".to_string();
@@ -1829,6 +1865,9 @@ impl StopOrdersService for MockStopOrdersService {
         request: Request<GetStopOrdersRequest>,
     ) -> std::result::Result<Response<GetStopOrdersResponse>, Status> {
         self.get_calls.lock().unwrap().push(request.into_inner());
+        if let Some((code, message)) = self.get_errors.lock().unwrap().pop_front() {
+            return Err(Status::new(code, message));
+        }
         if let Some(response) = self.get_responses.lock().unwrap().pop_front() {
             return Ok(Response::new(response));
         }
