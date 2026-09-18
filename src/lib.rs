@@ -34,4 +34,16 @@ pub use instruments::{
     TbankInstrumentMapper, TbankInstrumentMetadata, TbankInstrumentProvider,
     TbankMarketDataInstrumentMetadata,
 };
-pub use market_data::register_tbank_custom_data;
+pub use market_data::{
+    TbankCandleReadinessState, TbankMarketDataEvent, TbankMarketDataStreamState,
+    register_tbank_market_data_custom_data,
+};
+
+/// Registers every T-Bank custom data type for Nautilus JSON deserialization.
+///
+/// Call this during process initialization before replaying persisted custom data. Both the
+/// market-data and execution registrations are idempotent and process-local.
+pub fn register_tbank_custom_data() {
+    register_tbank_market_data_custom_data();
+    execution::register_tbank_execution_custom_data();
+}

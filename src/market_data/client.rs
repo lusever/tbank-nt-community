@@ -40,7 +40,7 @@ use crate::{
         candles::{ONE_MINUTE_NANOS, one_minute_candle_query_chunks},
         continuity::{BarContinuityDecision, BarContinuityTracker},
         converters::{candle_to_bar, last_price_to_quote, orderbook_to_snapshot, trade_to_tick},
-        events::register_tbank_custom_data,
+        events::register_tbank_market_data_custom_data,
         supervisor::{
             BackfillCoordinator, HistoricalRequestLimiter, MarketDataClient, RecoveryPublication,
             RecoveryRangeResult, retryable_stream_status,
@@ -686,7 +686,7 @@ pub struct TbankDataClient {
 impl TbankDataClient {
     /// Creates a new instance.
     pub fn new(config: TbankDataClientConfig) -> Self {
-        register_tbank_custom_data();
+        register_tbank_market_data_custom_data();
         let resolved_instrument_stream_ids =
             Arc::new(RwLock::new(config.instrument_stream_ids.clone()));
         let historical_request_limiter =

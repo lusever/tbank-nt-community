@@ -1,8 +1,21 @@
 //! Translation between T-Bank protobuf models and Nautilus reports.
 
 use super::*;
+use crate::execution::projections::{
+    project_trade_fill_report_locked, update_duplicate_fill_provenance,
+};
 use crate::grpc::generated::{StopOrderDirection, StopOrderType};
 use anyhow::Context;
+use rust_decimal::prelude::ToPrimitive;
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "T-Bank operation {operation_id} contains trade {trade_id} without canonical broker order identity; refusing a partial fill result"
+)]
+pub(super) struct TbankFillIdentityUnresolved {
+    operation_id: String,
+    trade_id: String,
+}
 
 pub(super) fn tbank_side(side: OrderSide) -> anyhow::Result<crate::common::TbankOrderSide> {
     match side {
@@ -1033,7 +1046,8 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
     item: &OperationItem,
     ts_init: UnixNanos,
     instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
-) -> Vec<anyhow::Result<FillReport>> {
+    broker_order_index: Option<&Arc<Mutex<TbankBrokerOrderIndex>>>,
+) -> Vec<anyhow::Result<TbankFillReport>> {
     let Some(side) = fill_side_from_operation_type(item.r#type) else {
         return Vec::new();
     };
@@ -1048,8 +1062,7 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
         Err(error) => return vec![Err(error)],
     };
     let commission = match item.commission.as_ref().map(money_from_value).transpose() {
-        Ok(Some(value)) => value,
-        Ok(None) => Money::from_decimal(Decimal::ZERO, Currency::from("RUB")).unwrap(),
+        Ok(value) => TbankFillCommission::from(value),
         Err(error) => return vec![Err(error)],
     };
     let trades = item
@@ -1057,29 +1070,85 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
         .as_ref()
         .map(|info| info.trades.as_slice())
         .unwrap_or_default();
-    trades
+    let prices = match trades
         .iter()
         .map(|trade| {
-            let ts_event = trade
-                .date
+            price_from_point_valued_money_value(
+                trade
+                    .price
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing trade price"))?,
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(prices) => prices,
+        Err(error) => return vec![Err(error)],
+    };
+    let commissions = match allocate_operation_commission(
+        commission,
+        trades
+            .iter()
+            .zip(&prices)
+            .map(|(trade, price)| Decimal::from(trade.quantity).abs() * price.as_decimal().abs())
+            .collect::<Vec<_>>()
+            .as_slice(),
+    ) {
+        Ok(commissions) => commissions,
+        Err(error) => return vec![Err(error)],
+    };
+    let venue_order_ids = broker_order_index.map(|index| {
+        let index = index.lock().expect("broker_order_index lock");
+        trades
+            .iter()
+            .map(|trade| index.venue_order_id_for_trade_id(trade.num.as_str()))
+            .collect::<Vec<_>>()
+    });
+    if let Some((trade_index, trade)) = trades.iter().enumerate().find(|(trade_index, _)| {
+        venue_order_ids
+            .as_ref()
+            .and_then(|order_ids| order_ids.get(*trade_index))
+            .and_then(Option::as_deref)
+            .is_none()
+    }) {
+        tracing::warn!(
+            operation_id = %item.id,
+            trade_id = %trade.num,
+            trade_index,
+            "T-Bank operations fill cannot be reconciled because the operation is missing broker order identity"
+        );
+        return vec![Err(anyhow::Error::new(TbankFillIdentityUnresolved {
+            operation_id: item.id.clone(),
+            trade_id: trade.num.clone(),
+        }))];
+    }
+    trades
+        .iter()
+        .enumerate()
+        .map(|(trade_index, trade)| {
+            let venue_order_id = venue_order_ids
                 .as_ref()
-                .map(timestamp_to_unix_nanos)
-                .transpose()?
-                .unwrap_or(ts_init);
-            Ok(FillReport::new(
+                .and_then(|order_ids| order_ids.get(trade_index))
+                .and_then(Option::as_deref)
+                .expect("all operation trades have been validated for broker order identity");
+            let commission = commissions[trade_index];
+            let source = TbankFillCommissionSource::OperationsCursor;
+            let ts_event = match trade.date.as_ref().map(timestamp_to_unix_nanos).transpose() {
+                Ok(value) => value.unwrap_or(ts_init),
+                Err(error) => return Err(error),
+            };
+            let report = FillReport::new(
                 account_id,
                 instrument_id,
-                item.id.as_str().into(),
+                venue_order_id.into(),
                 trade.num.as_str().into(),
                 side,
-                Quantity::from_decimal(Decimal::from(trade.quantity))?,
-                price_from_point_valued_money_value(
-                    trade
-                        .price
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("missing trade price"))?,
-                )?,
-                commission,
+                match Quantity::from_decimal(Decimal::from(trade.quantity)) {
+                    Ok(quantity) => quantity,
+                    Err(error) => return Err(error.into()),
+                },
+                prices[trade_index],
+                fill_report_commission(commission),
                 LiquiditySide::NoLiquiditySide,
                 None,
                 // T-Bank exposes a stable position_uid for the instrument, but this
@@ -1091,9 +1160,105 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
                 ts_event,
                 ts_init,
                 Some(UUID4::new()),
-            ))
+            );
+            Ok(TbankFillReport::new(report, commission, source))
         })
         .collect()
+}
+
+pub(super) fn allocate_operation_commission(
+    commission: TbankFillCommission,
+    notional_weights: &[Decimal],
+) -> anyhow::Result<Vec<TbankFillCommission>> {
+    if notional_weights.is_empty() {
+        return Ok(Vec::new());
+    }
+    let TbankFillCommission::Reported(total) = commission else {
+        return Ok(vec![TbankFillCommission::Unknown; notional_weights.len()]);
+    };
+    for weight in notional_weights {
+        anyhow::ensure!(
+            *weight >= Decimal::ZERO,
+            "T-Bank operation commission weight must be non-negative: {weight}"
+        );
+    }
+    let status = if notional_weights.len() == 1 {
+        TbankFillCommission::Reported
+    } else {
+        TbankFillCommission::Allocated
+    };
+    let total_weight = notional_weights.iter().copied().sum::<Decimal>();
+    let total_minor = money_to_minor_units(total)?;
+    let sign = total_minor.signum();
+    let total_minor = total_minor
+        .checked_abs()
+        .ok_or_else(|| anyhow::anyhow!("T-Bank operation commission minor units overflow"))?;
+    let total_minor_decimal = Decimal::from_i128_with_scale(total_minor, 0);
+    let mut allocations = vec![0_i128; notional_weights.len()];
+    let mut remainders = vec![Decimal::ZERO; notional_weights.len()];
+
+    if total_weight > Decimal::ZERO {
+        for (index, weight) in notional_weights.iter().copied().enumerate() {
+            let ideal = total_minor_decimal * weight / total_weight;
+            let base = ideal.floor().to_i128().ok_or_else(|| {
+                anyhow::anyhow!("T-Bank operation commission allocation overflow")
+            })?;
+            allocations[index] = base;
+            remainders[index] = ideal - Decimal::from_i128_with_scale(base, 0);
+        }
+    } else {
+        let count = i128::try_from(notional_weights.len())?;
+        let base = total_minor / count;
+        let remainder = usize::try_from(total_minor % count)?;
+        allocations.fill(base);
+        for index in 0..remainder {
+            remainders[index] = Decimal::ONE;
+        }
+    }
+
+    let allocated_minor = allocations.iter().copied().sum::<i128>();
+    let remaining_minor = total_minor - allocated_minor;
+    anyhow::ensure!(
+        (0..=i128::try_from(notional_weights.len())?).contains(&remaining_minor),
+        "T-Bank operation commission minor-unit allocation overflow: total={total_minor}, allocated={allocated_minor}"
+    );
+    let mut remainder_order = (0..notional_weights.len()).collect::<Vec<_>>();
+    remainder_order.sort_by(|left, right| {
+        remainders[*right]
+            .partial_cmp(&remainders[*left])
+            .expect("Decimal values are finite")
+            .then_with(|| left.cmp(right))
+    });
+    for index in remainder_order
+        .into_iter()
+        .take(usize::try_from(remaining_minor)?)
+    {
+        allocations[index] += 1;
+    }
+
+    let mut result = Vec::with_capacity(notional_weights.len());
+    for allocation in allocations {
+        let allocation = if sign < 0 { -allocation } else { allocation };
+        let amount = Decimal::from_i128_with_scale(allocation, u32::from(total.currency.precision));
+        let money = Money::from_decimal(amount, total.currency)?;
+        result.push(status(money));
+    }
+    Ok(result)
+}
+
+fn money_to_minor_units(money: Money) -> anyhow::Result<i128> {
+    let scale = 10_i128
+        .checked_pow(u32::from(money.currency.precision))
+        .ok_or_else(|| anyhow::anyhow!("currency precision is too large for minor units"))?;
+    let minor = money.as_decimal() * Decimal::from_i128_with_scale(scale, 0);
+    let integer = minor.trunc();
+    anyhow::ensure!(
+        integer == minor,
+        "money amount is not representable in currency minor units: {money}"
+    );
+    integer
+        .to_i128()
+        .ok_or_else(|| anyhow::anyhow!("money amount exceeds minor-unit range: {money}"))
 }
 
 pub(super) fn fill_side_from_operation_type(operation_type: i32) -> Option<OrderSide> {
@@ -1115,7 +1280,7 @@ pub(super) fn fill_report_from_order_trade(
     trade: &crate::grpc::generated::OrderTrade,
     ts_init: UnixNanos,
     instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
-) -> anyhow::Result<FillReport> {
+) -> anyhow::Result<TbankFillReport> {
     let side = order_side_for_fill(order.direction)?;
     let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
         "",
@@ -1130,7 +1295,9 @@ pub(super) fn fill_report_from_order_trade(
         .map(timestamp_to_unix_nanos)
         .transpose()?
         .unwrap_or(ts_init);
-    Ok(FillReport::new(
+    let commission = TbankFillCommission::Unknown;
+    let source = TbankFillCommissionSource::TradesStream;
+    let report = FillReport::new(
         nautilus_account_id(&order.account_id),
         instrument_id,
         order.order_id.as_str().into(),
@@ -1138,14 +1305,15 @@ pub(super) fn fill_report_from_order_trade(
         side,
         Quantity::from_decimal(Decimal::from(trade.quantity))?,
         quotation_price_from_points_required(trade.price.as_ref())?,
-        Money::from_decimal(Decimal::ZERO, Currency::from("RUB"))?,
+        fill_report_commission(commission),
         LiquiditySide::NoLiquiditySide,
         None,
         None,
         ts_event,
         ts_init,
         Some(UUID4::new()),
-    ))
+    );
+    Ok(TbankFillReport::new(report, commission, source))
 }
 
 fn average_price_from_stream_trades(
@@ -1188,7 +1356,7 @@ pub(super) fn fill_reports_from_order_state_stream(
     client_order_id: Option<&str>,
     ts_init: UnixNanos,
     instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
-) -> Vec<anyhow::Result<FillReport>> {
+) -> Vec<anyhow::Result<TbankFillReport>> {
     let side = match order_side_for_fill(state.direction) {
         Ok(side) => side,
         Err(error) => return vec![Err(error)],
@@ -1215,7 +1383,12 @@ pub(super) fn fill_reports_from_order_state_stream(
                 .map(timestamp_to_unix_nanos)
                 .transpose()?
                 .unwrap_or(ts_init);
-            Ok(FillReport::new(
+            // `OrderStateStreamResponse.OrderState` has no `executed_commission` in the pinned
+            // proto. The similarly named top-level `OrderState` returned by `GetOrderState` does;
+            // keep this fill unknown until a query or OperationsCursor provides commission.
+            let commission = TbankFillCommission::Unknown;
+            let source = TbankFillCommissionSource::OrderStateStream;
+            let report = FillReport::new(
                 account_id,
                 instrument_id,
                 venue_order_id.into(),
@@ -1223,14 +1396,15 @@ pub(super) fn fill_reports_from_order_state_stream(
                 side,
                 Quantity::from_decimal(Decimal::from(trade.quantity))?,
                 quotation_price_from_points_required(trade.price.as_ref())?,
-                Money::from_decimal(Decimal::ZERO, Currency::from("RUB"))?,
+                fill_report_commission(commission),
                 LiquiditySide::NoLiquiditySide,
                 client_order_id,
                 None,
                 ts_event,
                 ts_init,
                 Some(UUID4::new()),
-            ))
+            );
+            Ok(TbankFillReport::new(report, commission, source))
         })
         .collect()
 }
@@ -1238,11 +1412,73 @@ pub(super) fn fill_reports_from_order_state_stream(
 pub(super) fn project_managed_trade_fill_report(
     broker_order_index: &Arc<Mutex<TbankBrokerOrderIndex>>,
     fill_projection: &Arc<Mutex<TbankFillProjection>>,
-    report: FillReport,
+    report: TbankFillReport,
+    sender: Option<&TbankDataEventSender>,
 ) -> anyhow::Result<Option<FillReport>> {
-    let report = canonicalize_managed_trade_fill_report(broker_order_index, report);
-    let mut projection = fill_projection.lock().expect("fill_projection lock");
-    project_trade_fill_report_locked(&mut projection, report)
+    let (projected, provenance) =
+        project_managed_trade_fill_report_deferred(broker_order_index, fill_projection, report)?;
+    for fill in provenance {
+        fill.publish_provenance_best_effort(sender);
+    }
+    Ok(projected)
+}
+
+/// Projects one fill and returns its commission events for publication after the caller's
+/// enclosing unit of work succeeds. Snapshot generation uses this to avoid publishing events
+/// for fill reports which are later discarded with an incomplete snapshot.
+pub(super) fn project_managed_trade_fill_report_deferred(
+    broker_order_index: &Arc<Mutex<TbankBrokerOrderIndex>>,
+    fill_projection: &Arc<Mutex<TbankFillProjection>>,
+    report: TbankFillReport,
+) -> anyhow::Result<(Option<FillReport>, Vec<TbankFillReport>)> {
+    let mut report = report;
+    report.report = canonicalize_managed_trade_fill_report(broker_order_index, report.report);
+    let (projected, provenance_reports) = {
+        let mut projection = fill_projection.lock().expect("fill_projection lock");
+        // Keep all fallible projection work on a candidate. The shared ledger is committed only
+        // after both execution deduplication and any deferred commission correction succeed.
+        let mut candidate = projection.clone();
+        let projected = project_trade_fill_report_locked(
+            &mut candidate,
+            report.report.clone(),
+            report.commission,
+        )?;
+        let (provenance, residual_commission) =
+            update_duplicate_fill_provenance(&mut candidate, &report.report, report.commission)?;
+        let projected = projected.map(|mut projected_report| {
+            // The projected report is the non-synthetic residual of a partially matched trade.
+            // Keep its commission on the same largest-remainder allocation as the synthetic
+            // correction; otherwise the residual's scaled amount and the correction each round
+            // the full operation fee independently and provenance can exceed the ledger total.
+            if let Some(residual_commission) = residual_commission {
+                projected_report.commission = residual_commission
+                    .amount()
+                    .expect("allocated residual commission must be known");
+            }
+            projected_report
+        });
+        let mut provenance_reports =
+            Vec::with_capacity(provenance.len() + usize::from(projected.is_some()));
+        if let Some(projected_report) = projected.as_ref() {
+            let mut projected_fill = report.clone();
+            projected_fill.report = projected_report.clone();
+            projected_fill.commission = residual_commission.unwrap_or(report.commission);
+            provenance_reports.push(projected_fill);
+        }
+        for (provenance_trade_id, commission) in &provenance {
+            let Some(commission_amount) = commission.amount() else {
+                continue;
+            };
+            let mut correction = report.clone();
+            correction.report.trade_id = provenance_trade_id.as_str().into();
+            correction.report.commission = commission_amount;
+            correction.commission = *commission;
+            provenance_reports.push(correction);
+        }
+        *projection = candidate;
+        (projected, provenance_reports)
+    };
+    Ok((projected, provenance_reports))
 }
 
 pub(super) fn canonicalize_managed_trade_fill_report(

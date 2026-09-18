@@ -5,11 +5,11 @@ use super::*;
 fn project_order_state_fills(
     context: &TbankOrderStreamContext,
     report: &OrderStatusReport,
-    raw_fills: Vec<FillReport>,
+    raw_fills: Vec<TbankFillReport>,
 ) -> anyhow::Result<Vec<FillReport>> {
     let raw_filled_quantity = raw_fills
         .iter()
-        .map(|fill| fill.last_qty.as_decimal())
+        .map(|fill| fill.report.last_qty.as_decimal())
         .sum::<Decimal>();
 
     // `state.trades` may be only a partial view of the cumulative execution. In that case the
@@ -26,9 +26,10 @@ fn project_order_state_fills(
             report.venue_order_id.as_str(),
             cumulative_filled_quantity,
         );
-        return context
+        let sender = context.query_client.current_data_event_sender();
+        let fill = context
             .query_client
-            .project_order_status_fill_report(
+            .project_order_status_fill_report_and_publish(
                 report,
                 report.venue_order_id.as_str(),
                 synthetic_trade_id.as_str(),
@@ -39,8 +40,17 @@ fn project_order_state_fills(
                     .map(ToString::to_string)
                     .as_deref(),
                 None,
-            )
-            .map(|fill| fill.into_iter().collect());
+                TbankFillCommissionSource::OrderStateStream,
+                sender.as_ref(),
+            )?;
+        let Some(fill) = fill else {
+            return Ok(Vec::new());
+        };
+        return Ok(context
+            .query_client
+            .finish_order_status_fill_report(fill)
+            .into_iter()
+            .collect());
     }
 
     let mut fills = Vec::new();
@@ -49,6 +59,7 @@ fn project_order_state_fills(
             &context.broker_order_index,
             &context.fill_projection,
             raw_fill,
+            context.query_client.current_data_event_sender().as_ref(),
         )? {
             fills.push(fill);
         }
@@ -58,7 +69,7 @@ fn project_order_state_fills(
 
 fn publish_order_state_trade_fills(
     context: &TbankOrderStreamContext,
-    raw_fills: Vec<FillReport>,
+    raw_fills: Vec<TbankFillReport>,
 ) -> Option<anyhow::Result<()>> {
     context.run_if_active(|| {
         for raw_fill in raw_fills {
@@ -66,6 +77,7 @@ fn publish_order_state_trade_fills(
                 &context.broker_order_index,
                 &context.fill_projection,
                 raw_fill,
+                context.query_client.current_data_event_sender().as_ref(),
             )? {
                 mark_pending_submit_fill_report(&context.pending_submits, &fill);
                 context.emitter.send_fill_report(fill);
@@ -78,7 +90,7 @@ fn publish_order_state_trade_fills(
 pub(super) fn publish_order_state_report_or_fills(
     context: &TbankOrderStreamContext,
     report: Option<OrderStatusReport>,
-    raw_fills: Vec<FillReport>,
+    raw_fills: Vec<TbankFillReport>,
 ) -> Option<anyhow::Result<()>> {
     match report {
         Some(report) => publish_order_state_report_with_fills(context, report, raw_fills),
@@ -107,7 +119,7 @@ fn emit_order_state_report_with_fills(
 pub(super) fn publish_order_state_report_with_fills(
     context: &TbankOrderStreamContext,
     report: OrderStatusReport,
-    raw_fills: Vec<FillReport>,
+    raw_fills: Vec<TbankFillReport>,
 ) -> Option<anyhow::Result<()>> {
     context.run_if_active(|| {
         // The fill ledger and the Nautilus publication must share one lifecycle gate. Otherwise
@@ -260,6 +272,18 @@ pub(super) async fn publish_order_state_stream(
                         let venue_order_id = resolved_identity.venue_order_id;
                         let current_broker_order_id = state.order_id.clone();
                         let ts_init = current_unix_nanos();
+                        {
+                            let mut index = context
+                                .broker_order_index
+                                .lock()
+                                .expect("broker_order_index lock");
+                            for trade in &state.trades {
+                                index.record_trade_order_mapping(
+                                    trade.trade_id.as_str(),
+                                    venue_order_id.as_str(),
+                                );
+                            }
+                        }
                         let raw_fill_reports = fill_reports_from_order_state_stream(
                             &state,
                             venue_order_id.as_str(),
@@ -352,6 +376,7 @@ pub(super) async fn publish_order_state_stream(
                                 &context.pending_submits,
                                 &context.unresolved_trade_fills,
                                 &context.lifecycle_active,
+                                context.query_client.current_data_event_sender().as_ref(),
                             )
                         {
                             tracing::warn!(
@@ -433,7 +458,7 @@ pub(super) async fn publish_trades_stream(
     fill_projection: Arc<Mutex<TbankFillProjection>>,
     broker_order_index: Arc<Mutex<TbankBrokerOrderIndex>>,
     pending_submits: Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
-    unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     last_observed_unix_nanos: Arc<AtomicU64>,
     order_context: TbankOrderStreamContext,
 ) -> anyhow::Result<()> {
@@ -479,7 +504,14 @@ pub(super) async fn publish_trades_stream(
                             if !order_context.is_active() {
                                 return Ok(());
                             }
-                            let venue_order_id = report.venue_order_id.to_string();
+                            let venue_order_id = report.report.venue_order_id.to_string();
+                            broker_order_index
+                                .lock()
+                                .expect("broker_order_index lock")
+                                .record_trade_order_mapping(
+                                    report.report.trade_id.as_str(),
+                                    venue_order_id.as_str(),
+                                );
                             let known_order = broker_order_index
                                 .lock()
                                 .expect("broker_order_index lock")
@@ -507,6 +539,10 @@ pub(super) async fn publish_trades_stream(
                                     &broker_order_index,
                                     &fill_projection,
                                     report,
+                                    order_context
+                                        .query_client
+                                        .current_data_event_sender()
+                                        .as_ref(),
                                 )? {
                                     mark_pending_submit_fill_report(&pending_submits, &report);
                                     emitter.send_fill_report(report);

@@ -47,6 +47,11 @@ use crate::{
     instruments::TbankInstrumentMetadata,
 };
 
+use crate::execution::events::{
+    TbankDataEventSender, TbankFillCommission, TbankFillCommissionSource, TbankFillReport,
+    fill_report_commission,
+};
+
 use async_trait::async_trait;
 use chrono::Utc;
 use nautilus_common::{
@@ -71,7 +76,7 @@ use nautilus_model::{
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
+    types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use tokio::{sync::watch, task::JoinHandle};
@@ -169,6 +174,7 @@ struct TbankExecutionRuntime {
     account_id: AccountId,
     pub config: TbankExecutionClientConfig,
     clients: Option<TbankGrpcClients<TbankAuthInterceptor>>,
+    data_event_sender: Arc<Mutex<Option<TbankDataEventSender>>>,
     instruments: Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
     futures_margin_refreshed_at: Arc<Mutex<HashMap<String, Instant>>>,
     futures_margin_inflight: TbankFuturesMarginFlights,
@@ -179,7 +185,7 @@ struct TbankExecutionRuntime {
     order_status_projection: Arc<Mutex<HashMap<String, TbankProjectedOrderStatus>>>,
     position_projection: Arc<Mutex<HashMap<String, TbankProjectedPosition>>>,
     pending_submits: Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
-    unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     unresolved_cancellations: Arc<Mutex<HashSet<TbankBrokerOrderIdentity>>>,
     stream_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     reconciliation_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -274,6 +280,7 @@ impl TbankExecutionClient {
     /// Creates a new instance.
     #[must_use]
     pub fn new(core: ExecutionClientCore, config: TbankExecutionClientConfig) -> Self {
+        crate::execution::events::register_tbank_execution_custom_data();
         let emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
             core.trader_id,
@@ -393,7 +400,7 @@ struct TbankOrderStreamContext {
     query_client: TbankExecutionRuntime,
     lifecycle_active: Arc<TbankLifecycleToken>,
     pending_submits: Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
-    unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     unresolved_cancellations: Arc<Mutex<HashSet<TbankBrokerOrderIdentity>>>,
     broker_order_index: Arc<Mutex<TbankBrokerOrderIndex>>,
     fill_projection: Arc<Mutex<TbankFillProjection>>,
@@ -434,19 +441,19 @@ impl TbankLifecycleToken {
     }
 
     fn store(&self, active: bool, ordering: Ordering) {
+        self.with_publication_gate(|| self.active.store(active, ordering));
+    }
+
+    fn with_publication_gate<R>(&self, action: impl FnOnce() -> R) -> R {
         let _guard = self
             .publication_gate
             .lock()
             .expect("lifecycle publication gate");
-        self.active.store(active, ordering);
+        action()
     }
 
     fn run_if_active<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
-        let _guard = self
-            .publication_gate
-            .lock()
-            .expect("lifecycle publication gate");
-        self.active.load(Ordering::Acquire).then(action)
+        self.with_publication_gate(|| self.active.load(Ordering::Acquire).then(action))
     }
 }
 
@@ -457,15 +464,15 @@ use super::broker_order_index::{
 };
 
 #[cfg(test)]
-use super::projections::project_trade_fill_report;
-#[cfg(test)]
 use super::projections::record_position_projection_from_source;
 use super::projections::{
     TbankFillProjection, TbankPositionProjectionSource, TbankProjectedOrderStatus,
-    TbankProjectedPosition, apply_position_snapshot, merge_fill_projection_alias,
-    project_cumulative_order_fill, project_order_status_report, project_trade_fill_report_locked,
-    record_position_projection,
+    TbankProjectedPosition, apply_position_snapshot, apply_snapshot_fill_provenance,
+    merge_fill_projection_alias, project_cumulative_order_fill_with_publication,
+    project_order_status_report, record_position_projection,
 };
+#[cfg(test)]
+use super::projections::{project_cumulative_order_fill, project_trade_fill_report};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TbankPendingSubmitStage {
@@ -656,6 +663,7 @@ impl TbankExecutionRuntime {
             account_id,
             config,
             clients: None,
+            data_event_sender: Arc::new(Mutex::new(try_get_data_event_sender())),
             instruments: Arc::new(Mutex::new(HashMap::new())),
             futures_margin_refreshed_at: Arc::new(Mutex::new(HashMap::new())),
             futures_margin_inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -684,6 +692,59 @@ impl TbankExecutionRuntime {
                 "T-Bank execution client is disconnected".to_string(),
             ))
         }
+    }
+
+    fn refresh_data_event_sender(&self) {
+        // Nautilus binds this sender in thread-local runner state. The adapter can be constructed
+        // before that binding (notably through a bridge), so resolve it at the lifecycle boundary
+        // where the runner has initialized its channels. The shared slot is deliberately updated
+        // so already-created worker contexts observe the same channel.
+        if let Some(sender) = try_get_data_event_sender() {
+            *self
+                .data_event_sender
+                .lock()
+                .expect("data_event_sender lock") = Some(sender);
+        }
+    }
+
+    fn current_data_event_sender(&self) -> Option<TbankDataEventSender> {
+        if let Some(sender) = try_get_data_event_sender() {
+            *self
+                .data_event_sender
+                .lock()
+                .expect("data_event_sender lock") = Some(sender.clone());
+            return Some(sender);
+        }
+        self.data_event_sender
+            .lock()
+            .expect("data_event_sender lock")
+            .clone()
+    }
+
+    fn publish_snapshot_fill_provenance(&self, fills: &[TbankFillReport]) {
+        if fills.is_empty() {
+            return;
+        }
+
+        self.lifecycle_active.run_if_active(|| {
+            let mut projection = self.fill_projection.lock().expect("fill_projection lock");
+            // Resolve the runner channel only after the snapshot's RPCs and metadata lookups have
+            // finished. The lifecycle gate serializes this provenance update and event with
+            // teardown and live publication. Only the commission ledger advances here; execution
+            // quantities and deduplication state remain owned by fill projection.
+            let sender = self.current_data_event_sender();
+            for fill in fills {
+                if apply_snapshot_fill_provenance(
+                    &mut projection,
+                    fill.venue_order_id.as_str(),
+                    fill.trade_id.as_str(),
+                    fill.report.last_qty.as_decimal(),
+                    fill.provenance_commission(),
+                ) {
+                    fill.publish_provenance_best_effort(sender.as_ref());
+                }
+            }
+        });
     }
 
     fn spawn_read_only_command_task<F>(&self, future: F) -> Result<()>
@@ -852,6 +913,7 @@ impl TbankExecutionRuntime {
 
     /// Connects the client to the configured T-Bank endpoint.
     pub async fn connect(&mut self) -> Result<()> {
+        self.refresh_data_event_sender();
         if self.is_connected() {
             return Ok(());
         }
@@ -888,6 +950,7 @@ impl TbankExecutionRuntime {
 
     /// Connects only the query services required for reconciliation.
     pub async fn connect_for_queries(&mut self) -> Result<()> {
+        self.refresh_data_event_sender();
         if self.is_connected() {
             return Ok(());
         }
@@ -1654,6 +1717,23 @@ impl TbankExecutionRuntime {
         mark_pending_submit_fill_report(&self.pending_submits, report);
     }
 
+    fn record_trade_order_mappings_from_order_state(
+        &self,
+        state: &OrderState,
+        venue_order_id: &str,
+    ) {
+        if venue_order_id.is_empty() {
+            return;
+        }
+        let mut index = self
+            .broker_order_index
+            .lock()
+            .expect("broker_order_index lock");
+        for stage in &state.stages {
+            index.record_trade_order_mapping(stage.trade_id.as_str(), venue_order_id);
+        }
+    }
+
     fn spawn_submit_outcome_recovery(
         &self,
         order: TbankSubmitOrder,
@@ -2199,6 +2279,14 @@ impl TbankExecutionRuntime {
     }
 
     async fn query_orders_since(&mut self, from_unix_nanos: i128) -> Result<GetOrdersResponse> {
+        let (today, _) = current_utc_day_bounds();
+        let today_unix_nanos = i128::from(today.seconds) * 1_000_000_000;
+        if from_unix_nanos < today_unix_nanos {
+            return Err(TbankAdapterError::ConfigError(
+                "T-Bank order identity recovery starts before the broker's current-day order-history window; refusing incomplete recovery"
+                    .to_string(),
+            ));
+        }
         let to_unix_nanos = i128::from(current_unix_nanos().as_u64());
         let mut windows = VecDeque::from(order_filter_windows(from_unix_nanos, to_unix_nanos)?);
         let mut orders = Vec::new();
@@ -2737,17 +2825,34 @@ impl TbankExecutionRuntime {
         };
         let trade_id =
             synthetic_fill_trade_id("reconciled", order_id, report.filled_qty.as_decimal());
-        self.project_order_status_fill_report(
-            report,
-            order_id,
-            trade_id.as_str(),
-            ts_init,
-            Some(state.order_request_id.as_str()),
-            commission_from_money_value(state.executed_commission.as_ref())?,
-        )
-        .map(|report| report.into_iter().collect())
+        let cumulative_commission =
+            commission_from_money_value(state.executed_commission.as_ref())?;
+        match self.lifecycle_active.run_if_active(|| {
+            let sender = self.current_data_event_sender();
+            let Some(fill) = self.project_order_status_fill_report_and_publish(
+                report,
+                order_id,
+                trade_id.as_str(),
+                ts_init,
+                Some(state.order_request_id.as_str()),
+                cumulative_commission,
+                TbankFillCommissionSource::OrderStateQuery,
+                sender.as_ref(),
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            Ok(self
+                .finish_order_status_fill_report(fill)
+                .into_iter()
+                .collect())
+        }) {
+            Some(result) => result,
+            None => Ok(Vec::new()),
+        }
     }
 
+    #[cfg(test)]
     fn project_order_status_fill_report(
         &self,
         report: &OrderStatusReport,
@@ -2756,7 +2861,57 @@ impl TbankExecutionRuntime {
         ts_init: UnixNanos,
         order_request_id: Option<&str>,
         cumulative_commission: Option<Money>,
-    ) -> anyhow::Result<Option<FillReport>> {
+        source: TbankFillCommissionSource,
+    ) -> anyhow::Result<Option<TbankFillReport>> {
+        self.project_order_status_fill_report_with_publisher(
+            report,
+            order_id,
+            trade_id,
+            ts_init,
+            order_request_id,
+            cumulative_commission,
+            source,
+            |_| Ok(()),
+        )
+    }
+
+    fn project_order_status_fill_report_and_publish(
+        &self,
+        report: &OrderStatusReport,
+        order_id: &str,
+        trade_id: &str,
+        ts_init: UnixNanos,
+        order_request_id: Option<&str>,
+        cumulative_commission: Option<Money>,
+        source: TbankFillCommissionSource,
+        sender: Option<&TbankDataEventSender>,
+    ) -> anyhow::Result<Option<TbankFillReport>> {
+        self.project_order_status_fill_report_with_publisher(
+            report,
+            order_id,
+            trade_id,
+            ts_init,
+            order_request_id,
+            cumulative_commission,
+            source,
+            |fill| {
+                fill.publish_provenance_best_effort(sender);
+                Ok(())
+            },
+        )
+    }
+
+    fn project_order_status_fill_report_with_publisher(
+        &self,
+        report: &OrderStatusReport,
+        order_id: &str,
+        trade_id: &str,
+        ts_init: UnixNanos,
+        order_request_id: Option<&str>,
+        cumulative_commission: Option<Money>,
+        source: TbankFillCommissionSource,
+        publish: impl FnOnce(&TbankFillReport) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<TbankFillReport>> {
         let cumulative_quantity = report.filled_qty.as_decimal();
         if cumulative_quantity <= Decimal::ZERO {
             return Ok(None);
@@ -2778,44 +2933,84 @@ impl TbankExecutionRuntime {
             return Ok(None);
         };
         let cumulative_notional = cumulative_avg_px * cumulative_quantity;
-        let Some(projected) = project_cumulative_order_fill(
+        let mut fill_report = None;
+        project_cumulative_order_fill_with_publication(
             &self.fill_projection,
             order_id,
+            trade_id,
             cumulative_quantity,
             cumulative_notional,
             cumulative_commission,
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(FillReport::new(
-            report.account_id,
-            report.instrument_id,
-            report.venue_order_id,
-            trade_id.into(),
-            order_side,
-            projected.quantity,
-            projected.price,
-            projected.commission,
-            LiquiditySide::NoLiquiditySide,
-            report.client_order_id,
-            None,
-            report.ts_last,
-            ts_init,
-            Some(UUID4::new()),
-        )))
+            |projected| {
+                let Some(projected) = projected else {
+                    return Ok(());
+                };
+                let report = FillReport::new(
+                    report.account_id,
+                    report.instrument_id,
+                    report.venue_order_id,
+                    projected.trade_id.as_deref().unwrap_or(trade_id).into(),
+                    order_side,
+                    projected.quantity,
+                    projected.price,
+                    fill_report_commission(projected.commission),
+                    LiquiditySide::NoLiquiditySide,
+                    report.client_order_id,
+                    None,
+                    report.ts_last,
+                    ts_init,
+                    Some(UUID4::new()),
+                );
+                let report =
+                    canonicalize_managed_trade_fill_report(&self.broker_order_index, report);
+                let fill = if projected.provenance_only {
+                    TbankFillReport::commission_correction(report, projected.commission, source)
+                } else {
+                    TbankFillReport::new(report, projected.commission, source)
+                };
+                publish(&fill)?;
+                fill_report = Some(fill);
+                Ok(())
+            },
+        )?;
+        Ok(fill_report)
     }
 
-    fn project_trade_fill_report(&self, report: FillReport) -> anyhow::Result<Option<FillReport>> {
+    fn project_trade_fill_report(
+        &self,
+        report: TbankFillReport,
+    ) -> anyhow::Result<Option<FillReport>> {
         let report = project_managed_trade_fill_report(
             &self.broker_order_index,
             &self.fill_projection,
             report,
+            self.current_data_event_sender().as_ref(),
         )?;
         if let Some(report) = report.as_ref() {
             self.mark_pending_submit_fill_report(report);
         }
         Ok(report)
+    }
+
+    fn finish_order_status_fill_report(&self, fill: TbankFillReport) -> Option<FillReport> {
+        if fill.provenance_only {
+            return None;
+        }
+        let report = fill.report;
+        self.mark_pending_submit_fill_report(&report);
+        Some(report)
+    }
+
+    #[cfg(test)]
+    fn publish_order_status_fill_report(&self, mut fill: TbankFillReport) -> Option<FillReport> {
+        fill.report = canonicalize_managed_trade_fill_report(&self.broker_order_index, fill.report);
+        let report = fill.report.clone();
+        fill.publish_provenance_best_effort(self.current_data_event_sender().as_ref());
+        if fill.provenance_only {
+            return None;
+        }
+        self.mark_pending_submit_fill_report(&report);
+        Some(report)
     }
 
     fn clients_mut(&mut self) -> Result<&mut TbankGrpcClients<TbankAuthInterceptor>> {
@@ -2830,6 +3025,10 @@ impl TbankExecutionRuntime {
             account_id: self.account_id,
             config: self.config.clone(),
             clients: self.clients.clone(),
+            // Detached clones share the refreshable sender slot. Worker threads do not have
+            // Nautilus' thread-local runner state, so snapshotting an Option here would make
+            // late sender initialization or replacement invisible to already-running streams.
+            data_event_sender: self.data_event_sender.clone(),
             instruments: self.instruments.clone(),
             futures_margin_refreshed_at: self.futures_margin_refreshed_at.clone(),
             futures_margin_inflight: self.futures_margin_inflight.clone(),
@@ -2851,6 +3050,7 @@ impl TbankExecutionRuntime {
     }
 
     fn spawn_execution_streams(&mut self) -> anyhow::Result<()> {
+        self.refresh_data_event_sender();
         if !self.emitter.is_initialized() {
             tracing::debug!("Nautilus execution event sender not initialized; skipping streams");
             return Ok(());
@@ -3955,6 +4155,9 @@ impl TbankExecutionRuntime {
                 state.order_id.as_str(),
             );
         }
+        if let Some(venue_order_id) = canonical_order_id.as_deref() {
+            self.record_trade_order_mappings_from_order_state(&state, venue_order_id);
+        }
         if let Some(stop_order_id) = activated_stop_order_id.as_deref() {
             let stop = self
                 .query_stop_orders_for_reconciliation(None)
@@ -4119,6 +4322,10 @@ impl TbankExecutionRuntime {
                     self.record_activated_stop_child_mapping(
                         client_order_id.as_ref().map(|id| id.as_str()).unwrap_or(""),
                         stop.stop_order_id.as_str(),
+                        state.order_id.as_str(),
+                    );
+                    self.record_trade_order_mappings_from_order_state(
+                        &state,
                         state.order_id.as_str(),
                     );
                     let managed_order_type = self.managed_order_type_for_client_order_id(

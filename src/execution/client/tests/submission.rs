@@ -1686,6 +1686,7 @@ async fn submit_response_partial_fill_returns_fallback_reports_without_polling()
         allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
+    let _data_event_receiver = bind_test_data_event_sender(&client.runtime);
     let mut metadata = sber_metadata();
     metadata.instrument_uid = "sber-uid".to_string();
     metadata.lot = 10;
