@@ -4,8 +4,13 @@ use super::{
     TBANK_CONFIRM_MARGIN_TRADE_PARAM, TbankFillProjection,
     activated_stop_child_status_report_with_context, buffer_unresolved_trade_fill,
     canonicalize_reconciled_stop_fill,
-    current_utc_day_bounds, order_filter_windows, project_and_settle_reconciled_trade_fill,
-    project_managed_trade_fill_report, project_trade_fill_report, tbank_account_id,
+    current_utc_day_bounds, order_filter_windows, project_cumulative_order_fill,
+    project_managed_trade_fill_report, project_trade_fill_report, publish_reconnect_snapshot,
+    tbank_account_id,
+};
+use crate::execution::{
+    TbankFillCommission, TbankFillCommissionSource,
+    events::TbankFillReport,
 };
 use std::{
     cell::RefCell,
@@ -89,6 +94,14 @@ use crate::{
     },
     testing::fixtures::sber_metadata,
 };
+
+fn unknown_fill_report(report: FillReport) -> TbankFillReport {
+    TbankFillReport::new(
+        report,
+        TbankFillCommission::Unknown,
+        TbankFillCommissionSource::OrderStateStream,
+    )
+}
 
 #[test]
 fn execution_client_subscribes_to_each_supported_public_venue() {
@@ -491,7 +504,12 @@ fn inactive_order_state_does_not_commit_fill_projection() {
         Some(UUID4::new()),
     );
 
-    assert!(super::publish_order_state_report_with_fills(&context, report, vec![fill]).is_none());
+    assert!(super::publish_order_state_report_with_fills(
+        &context,
+        report,
+        vec![unknown_fill_report(fill)],
+    )
+    .is_none());
     assert!(context.fill_projection.lock().unwrap().orders.is_empty());
     assert!(context
         .order_status_projection
@@ -504,6 +522,7 @@ fn inactive_order_state_does_not_commit_fill_projection() {
 #[test]
 fn partial_order_state_trades_use_cumulative_fill_without_mixing_prices() {
     let client = test_client(TbankExecutionClientConfig::default());
+    let _data_event_receiver = bind_test_data_event_sender(&client.runtime);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let context = order_stream_context(
         &client,
@@ -546,7 +565,11 @@ fn partial_order_state_trades_use_cumulative_fill_without_mixing_prices() {
     );
 
     assert!(matches!(
-        super::publish_order_state_report_with_fills(&context, report, vec![raw_fill]),
+        super::publish_order_state_report_with_fills(
+            &context,
+            report,
+            vec![unknown_fill_report(raw_fill)],
+        ),
         Some(Ok(()))
     ));
     let ExecutionEvent::Report(ExecutionReport::OrderWithFills(order, fills)) =
@@ -565,6 +588,7 @@ fn partial_order_state_trades_use_cumulative_fill_without_mixing_prices() {
 fn valid_order_state_trade_survives_status_mapping_error() {
     let mut client = test_client(TbankExecutionClientConfig::default());
     seed_sber_metadata(&mut client);
+    let _data_event_receiver = bind_test_data_event_sender(&client.runtime);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let context = order_stream_context(
         &client,
@@ -1003,7 +1027,7 @@ fn reset_refuses_to_discard_buffered_broker_fill() {
         .unresolved_trade_fills
         .lock()
         .unwrap()
-        .insert("venue-1".to_string(), vec![fill]);
+        .insert("venue-1".to_string(), vec![unknown_fill_report(fill)]);
 
     assert!(ExecutionClient::reset(&mut client).is_err());
     assert_eq!(
@@ -1095,7 +1119,7 @@ fn terminal_order_report_settles_submit_and_ambiguous_cancel_state() {
 fn reconnect_fill_removes_only_the_authoritative_buffered_trade() {
     let ts = UnixNanos::from(1_u64);
     let fill = |trade_id: &str| {
-        FillReport::new(
+        unknown_fill_report(FillReport::new(
             AccountId::from("TBANK-account-1"),
             InstrumentId::from("SBER_TQBR.MOEX"),
             VenueOrderId::from("venue-order-1"),
@@ -1110,7 +1134,7 @@ fn reconnect_fill_removes_only_the_authoritative_buffered_trade() {
             ts,
             ts,
             Some(UUID4::new()),
-        )
+        ))
     };
     let buffered = Arc::new(Mutex::new(HashMap::from([(
         "venue-order-1".to_string(),
@@ -1129,7 +1153,7 @@ fn reconnect_fill_removes_only_the_authoritative_buffered_trade() {
 fn unresolved_fill_pressure_preserves_every_unique_trade() {
     let ts = UnixNanos::from(1_u64);
     let fill = |trade_id: String| {
-        FillReport::new(
+        unknown_fill_report(FillReport::new(
             AccountId::from("TBANK-account-1"),
             InstrumentId::from("SBER_TQBR.MOEX"),
             VenueOrderId::from("venue-order-1"),
@@ -1144,7 +1168,7 @@ fn unresolved_fill_pressure_preserves_every_unique_trade() {
             ts,
             ts,
             Some(UUID4::new()),
-        )
+        ))
     };
     let buffered = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1173,7 +1197,7 @@ fn unresolved_fill_pressure_preserves_every_unique_trade() {
 }
 
 #[test]
-fn stale_reconnect_fill_cannot_settle_the_active_buffer() {
+fn disconnected_reconnect_snapshot_does_not_project_or_settle_fills() {
     let client = test_client(TbankExecutionClientConfig::default());
     let report = FillReport::new(
         AccountId::from("TBANK-account-1"),
@@ -1196,17 +1220,25 @@ fn stale_reconnect_fill_cannot_settle_the_active_buffer() {
         .unresolved_trade_fills
         .lock()
         .unwrap()
-        .insert("venue-order-1".to_string(), vec![report.clone()]);
+        .insert(
+            "venue-order-1".to_string(),
+            vec![unknown_fill_report(report.clone())],
+        );
 
-    let error = project_and_settle_reconciled_trade_fill(
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    publish_reconnect_snapshot(
         &client.runtime,
-        report,
-        "venue-order-1",
-        "trade-1",
+        &test_emitter(sender),
+        Vec::new(),
+        vec![(
+            unknown_fill_report(report),
+            "venue-order-1".to_string(),
+            "trade-1".to_string(),
+        )],
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("lifecycle"));
+    assert!(client.runtime.fill_projection.lock().unwrap().orders.is_empty());
     assert_eq!(
         client
             .runtime
@@ -1218,6 +1250,75 @@ fn stale_reconnect_fill_cannot_settle_the_active_buffer() {
             .len(),
         1
     );
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn cumulative_commission_deltas_keep_allocated_provenance() {
+    let projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let first = project_cumulative_order_fill(
+        &projection,
+        "broker-order-1",
+        "state-fill-1",
+        Decimal::ONE,
+        Decimal::from(100),
+        Some(Money::from("1.00 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        first.commission,
+        TbankFillCommission::Allocated(Money::from("1.00 RUB"))
+    );
+    assert!(first.commission.reported().is_none());
+
+    let second = project_cumulative_order_fill(
+        &projection,
+        "broker-order-1",
+        "state-fill-2",
+        Decimal::from(2),
+        Decimal::from(201),
+        Some(Money::from("2.75 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        second.commission,
+        TbankFillCommission::Allocated(Money::from("1.75 RUB"))
+    );
+    assert!(second.commission.reported().is_none());
+}
+
+#[test]
+fn cumulative_commission_correction_keeps_allocated_provenance() {
+    let projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    project_cumulative_order_fill(
+        &projection,
+        "broker-order-1",
+        "state-fill-1",
+        Decimal::ONE,
+        Decimal::from(100),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    let correction = project_cumulative_order_fill(
+        &projection,
+        "broker-order-1",
+        "state-fill-2",
+        Decimal::ONE,
+        Decimal::from(100),
+        Some(Money::from("1.00 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(correction.provenance_only);
+    assert_eq!(
+        correction.commission,
+        TbankFillCommission::Allocated(Money::from("1.00 RUB"))
+    );
+    assert!(correction.commission.reported().is_none());
 }
 
 #[test]
@@ -1934,6 +2035,7 @@ struct MockOrdersService {
     state_error: Arc<Mutex<Option<(Code, String)>>>,
     state_response: Arc<Mutex<Option<OrderState>>>,
     get_orders_calls: Arc<AtomicU64>,
+    get_orders_requests: Arc<Mutex<Vec<GetOrdersRequest>>>,
     get_orders_response: Arc<Mutex<Option<GetOrdersResponse>>>,
 }
 
@@ -1962,6 +2064,8 @@ struct MockOperationsService {
     pages: Arc<Mutex<VecDeque<GetOperationsByCursorResponse>>>,
     portfolio_calls: Arc<AtomicU64>,
     portfolio_response: Arc<Mutex<Option<PortfolioResponse>>>,
+    positions_response: Arc<Mutex<Option<PositionsResponse>>>,
+    cursor_gate: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
 }
 
 #[derive(Clone)]

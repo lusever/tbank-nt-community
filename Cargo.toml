@@ -74,3 +74,6 @@ tonic = { version = "0.14.6", default-features = false, features = ["router", "s
 [build-dependencies]
 protoc-bin-vendored = "3"
 tonic-prost-build = "0.14.6"
+
+[profile.dev]
+debug = 1

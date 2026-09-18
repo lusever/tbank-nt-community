@@ -15,6 +15,8 @@ pub(super) struct TbankReconnectReconciliationCounts {
     fills: usize,
 }
 
+pub(super) type TbankReconciledTradeFill = (TbankFillReport, String, String);
+
 #[derive(Debug, thiserror::Error)]
 #[error("invalid T-Bank reconciliation fill event: {0}")]
 struct TbankReconciliationEventError(#[source] anyhow::Error);
@@ -364,6 +366,12 @@ pub(super) async fn publish_reconnect_reconciliation(
                     stop.stop_order_id.as_str(),
                     state.order_id.as_str(),
                 );
+                // Reconnect reconciliation handles activated stop children in a separate branch
+                // from regular orders. Preserve every embedded trade identity before translating
+                // later OperationsService fills; canonicalization then maps the child back to the
+                // stop parent through the alias recorded above.
+                query_client
+                    .record_trade_order_mappings_from_order_state(&state, state.order_id.as_str());
             }
             let managed_order_type = query_client.managed_order_type_for_client_order_id(
                 stop_client_order_ids
@@ -454,7 +462,7 @@ pub(super) async fn publish_reconnect_reconciliation(
         .query_fills(None, Some(from_unix_nanos), None)
         .await?;
     query_client.ensure_lifecycle_active()?;
-    let mut fill_reports = Vec::new();
+    let mut reconciled_trade_fills = Vec::new();
     for item in &operations.items {
         if fill_side_from_operation_type(item.r#type).is_none() {
             continue;
@@ -489,35 +497,27 @@ pub(super) async fn publish_reconnect_reconciliation(
             item,
             ts_init,
             Some(&query_client.instruments),
+            Some(&query_client.broker_order_index),
         ) {
             let report = report
                 .map_err(TbankReconciliationEventError)
                 .map_err(anyhow::Error::from)
-                .map(|report| {
+                .map(|mut report| {
                     let source_identity = (
-                        report.venue_order_id.to_string(),
-                        report.trade_id.to_string(),
+                        report.report.venue_order_id.to_string(),
+                        report.report.trade_id.to_string(),
                     );
-                    let report = canonicalize_reconciled_stop_fill(
+                    report.report = canonicalize_reconciled_stop_fill(
                         &query_client,
-                        report,
+                        report.report,
                         &stop_id_by_exchange_order_id,
                         &stop_client_order_ids,
                     );
                     (source_identity, report)
                 });
-            match report.and_then(|(source_identity, report)| {
-                project_and_settle_reconciled_trade_fill(
-                    &query_client,
-                    report,
-                    &source_identity.0,
-                    &source_identity.1,
-                )
-            }) {
-                Ok(report) => {
-                    if let Some(report) = report {
-                        fill_reports.push(report);
-                    }
+            match report {
+                Ok((source_identity, report)) => {
+                    reconciled_trade_fills.push((report, source_identity.0, source_identity.1))
                 }
                 Err(error) if reconnect_reconciliation_error_is_safe_to_skip(&error) => {
                     tracing::warn!(%error, "skipping malformed T-Bank fill during reconnect reconciliation");
@@ -527,91 +527,127 @@ pub(super) async fn publish_reconnect_reconciliation(
         }
     }
 
-    let mut fills_by_order_id = HashMap::<String, Vec<FillReport>>::new();
-    for report in fill_reports {
-        fills_by_order_id
-            .entry(report.venue_order_id.to_string())
-            .or_default()
-            .push(report);
-    }
+    publish_reconnect_snapshot(
+        &query_client,
+        emitter,
+        order_reports,
+        reconciled_trade_fills,
+    )
+}
 
-    let mut counts = TbankReconnectReconciliationCounts::default();
-    for report in order_reports {
-        let fills = fills_by_order_id
-            .remove(report.venue_order_id.as_str())
-            .unwrap_or_default();
-        if query_client
-            .lifecycle_active
-            .run_if_active(|| {
-                settle_order_report_mutation_state(
-                    &query_client.pending_submits,
-                    &query_client.unresolved_cancellations,
-                    &query_client.broker_order_index,
-                    &report,
-                );
-                if let Some(report) =
-                    project_order_status_report(&query_client.order_status_projection, report)
-                {
-                    if fills.is_empty() {
-                        emitter.send_order_status_report(report);
-                    } else {
-                        counts.fills += fills.len();
-                        emitter.send_order_with_fills(report, fills);
-                    }
-                    counts.orders += 1;
-                } else {
-                    for report in fills {
-                        emitter.send_fill_report(report);
-                        counts.fills += 1;
-                    }
+/// Projects and publishes a fully prepared reconnect snapshot as one lifecycle transaction.
+/// Call only after every RPC and metadata lookup for the snapshot has succeeded.
+pub(super) fn publish_reconnect_snapshot(
+    query_client: &TbankExecutionRuntime,
+    emitter: &ExecutionEventEmitter,
+    order_reports: Vec<OrderStatusReport>,
+    reconciled_trade_fills: Vec<TbankReconciledTradeFill>,
+) -> anyhow::Result<TbankReconnectReconciliationCounts> {
+    // Stage every fill on a fresh candidate while holding the same gate as publication. Any
+    // fallible projection work happens before the shared ledger, deduplication, or provenance is
+    // committed.
+    match query_client.lifecycle_active.run_if_active(|| {
+        let staged_fill_projection = Arc::new(Mutex::new(
+            query_client
+                .fill_projection
+                .lock()
+                .expect("fill_projection lock")
+                .clone(),
+        ));
+        let mut fills_by_order_id = HashMap::<String, Vec<FillReport>>::new();
+        let mut provenance = Vec::new();
+        let mut settled_trade_fills = Vec::new();
+        for (report, source_venue_order_id, source_trade_id) in reconciled_trade_fills {
+            let (projected, pending_provenance) = match project_managed_trade_fill_report_deferred(
+                &query_client.broker_order_index,
+                &staged_fill_projection,
+                report,
+            ) {
+                Ok(projected) => projected,
+                Err(error) => {
+                    // A failed candidate is never committed. Skip the malformed individual fill.
+                    let error = anyhow::Error::new(TbankReconciliationEventError(error));
+                    tracing::warn!(%error, "skipping malformed T-Bank fill during reconnect reconciliation");
+                    continue;
                 }
-            })
-            .is_none()
-        {
-            return Ok(counts);
+            };
+            if let Some(report) = projected {
+                fills_by_order_id
+                    .entry(report.venue_order_id.to_string())
+                    .or_default()
+                    .push(report);
+            }
+            provenance.extend(pending_provenance);
+            settled_trade_fills.push((source_venue_order_id, source_trade_id));
         }
-    }
-    for reports in fills_by_order_id.into_values() {
-        if query_client
-            .lifecycle_active
-            .run_if_active(|| {
-                for report in reports {
+
+        *query_client
+            .fill_projection
+            .lock()
+            .expect("fill_projection lock") = staged_fill_projection
+            .lock()
+            .expect("staged fill_projection lock")
+            .clone();
+        for (venue_order_id, trade_id) in settled_trade_fills {
+            settle_reconciled_buffered_trade_fill(
+                &query_client.unresolved_trade_fills,
+                &venue_order_id,
+                &trade_id,
+            );
+        }
+        let data_event_sender = query_client.current_data_event_sender();
+        for fill in provenance {
+            fill.publish_provenance_best_effort(data_event_sender.as_ref());
+        }
+
+        let mut counts = TbankReconnectReconciliationCounts::default();
+        for report in order_reports {
+            let fills = fills_by_order_id
+                .remove(report.venue_order_id.as_str())
+                .unwrap_or_default();
+            settle_order_report_mutation_state(
+                &query_client.pending_submits,
+                &query_client.unresolved_cancellations,
+                &query_client.broker_order_index,
+                &report,
+            );
+            if let Some(report) =
+                project_order_status_report(&query_client.order_status_projection, report)
+            {
+                if fills.is_empty() {
+                    emitter.send_order_status_report(report);
+                } else {
+                    counts.fills += fills.len();
+                    for fill in &fills {
+                        mark_pending_submit_fill_report(&query_client.pending_submits, fill);
+                    }
+                    emitter.send_order_with_fills(report, fills);
+                }
+                counts.orders += 1;
+            } else {
+                for report in fills {
+                    mark_pending_submit_fill_report(&query_client.pending_submits, &report);
                     emitter.send_fill_report(report);
                     counts.fills += 1;
                 }
-            })
-            .is_none()
-        {
-            return Ok(counts);
+            }
         }
+        for reports in fills_by_order_id.into_values() {
+            for report in reports {
+                mark_pending_submit_fill_report(&query_client.pending_submits, &report);
+                emitter.send_fill_report(report);
+                counts.fills += 1;
+            }
+        }
+        Ok(counts)
+    }) {
+        Some(result) => result,
+        None => Ok(TbankReconnectReconciliationCounts::default()),
     }
-    Ok(counts)
-}
-
-pub(super) fn project_and_settle_reconciled_trade_fill(
-    query_client: &TbankExecutionRuntime,
-    report: FillReport,
-    source_venue_order_id: &str,
-    source_trade_id: &str,
-) -> anyhow::Result<Option<FillReport>> {
-    query_client
-        .lifecycle_active
-        .run_if_active(|| {
-            let report = query_client
-                .project_trade_fill_report(report)
-                .map_err(TbankReconciliationEventError)?;
-            settle_reconciled_buffered_trade_fill(
-                &query_client.unresolved_trade_fills,
-                source_venue_order_id,
-                source_trade_id,
-            );
-            Ok(report)
-        })
-        .ok_or_else(|| anyhow::anyhow!("T-Bank execution lifecycle is no longer active"))?
 }
 
 pub(super) fn settle_reconciled_buffered_trade_fill(
-    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     venue_order_id: &str,
     trade_id: &str,
 ) {
@@ -619,7 +655,7 @@ pub(super) fn settle_reconciled_buffered_trade_fill(
         .lock()
         .expect("unresolved_trade_fills lock");
     let should_remove = if let Some(reports) = buffered.get_mut(venue_order_id) {
-        reports.retain(|report| report.trade_id.to_string() != trade_id);
+        reports.retain(|report| report.report.trade_id.to_string() != trade_id);
         reports.is_empty()
     } else {
         false
@@ -724,6 +760,7 @@ pub(super) fn schedule_regular_order_reconciliation(
                         &context.pending_submits,
                         &context.unresolved_trade_fills,
                         &context.lifecycle_active,
+                        context.query_client.current_data_event_sender().as_ref(),
                     ) {
                         tracing::warn!(
                             %error,
@@ -926,6 +963,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                                 &context.pending_submits,
                                 &context.unresolved_trade_fills,
                                 &context.lifecycle_active,
+                                context.query_client.current_data_event_sender().as_ref(),
                             ) {
                                 Ok(_) => {
                                     if finish_unresolved_trade_reconciliation_if_idle(
@@ -1090,6 +1128,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                     &context.pending_submits,
                     &context.unresolved_trade_fills,
                     &context.lifecycle_active,
+                    context.query_client.current_data_event_sender().as_ref(),
                 ) {
                     Ok(_) => {
                         if finish_unresolved_trade_reconciliation_if_idle(
@@ -1120,7 +1159,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
 }
 
 pub(super) fn finish_unresolved_trade_reconciliation_if_idle(
-    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     regular_order_reconciliations: &Arc<Mutex<HashSet<String>>>,
     reconciliation_key: &str,
     venue_order_id: &str,
@@ -1202,6 +1241,7 @@ pub(super) fn schedule_activated_stop_child_reconciliation(
                             &context.pending_submits,
                             &context.unresolved_trade_fills,
                             &context.lifecycle_active,
+                            context.query_client.current_data_event_sender().as_ref(),
                         ) {
                             tracing::warn!(
                                 %error,
@@ -1262,8 +1302,9 @@ pub(super) fn publish_buffered_trade_fills_for_venue(
     broker_order_index: &Arc<Mutex<TbankBrokerOrderIndex>>,
     fill_projection: &Arc<Mutex<TbankFillProjection>>,
     pending_submits: &Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
-    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     lifecycle_active: &Arc<TbankLifecycleToken>,
+    sender: Option<&TbankDataEventSender>,
 ) -> anyhow::Result<usize> {
     lifecycle_active
         .run_if_active(|| {
@@ -1279,6 +1320,7 @@ pub(super) fn publish_buffered_trade_fills_for_venue(
                     broker_order_index,
                     fill_projection,
                     raw_report.clone(),
+                    sender,
                 ) {
                     Ok(projected) => projected,
                     Err(error) => {
@@ -1304,9 +1346,9 @@ pub(super) fn publish_buffered_trade_fills_for_venue(
 }
 
 pub(super) fn restore_unprocessed_trade_fills(
-    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     venue_order_id: &str,
-    mut unprocessed: Vec<FillReport>,
+    mut unprocessed: Vec<TbankFillReport>,
 ) {
     let mut pending = unresolved_trade_fills
         .lock()
@@ -1318,18 +1360,18 @@ pub(super) fn restore_unprocessed_trade_fills(
 }
 
 pub(super) fn buffer_unresolved_trade_fill(
-    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<FillReport>>>>,
+    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     venue_order_id: String,
-    report: FillReport,
+    report: TbankFillReport,
 ) -> bool {
     let mut pending = unresolved_trade_fills
         .lock()
         .expect("unresolved_trade_fills lock");
-    let trade_id = report.trade_id.to_string();
+    let trade_id = report.report.trade_id.to_string();
     let reports = pending.entry(venue_order_id.clone()).or_default();
     if reports
         .iter()
-        .any(|buffered| buffered.trade_id.to_string() == trade_id)
+        .any(|buffered| buffered.report.trade_id.to_string() == trade_id)
     {
         return false;
     }

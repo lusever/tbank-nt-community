@@ -1,8 +1,66 @@
 //! NautilusTrader [`ExecutionClient`] boundary for the T-Bank client.
 
+use std::sync::{Arc, Mutex};
+
 use super::*;
 use crate::common::venue::TbankVenue;
 use anyhow::Context;
+
+#[derive(Clone, Copy)]
+struct ExecutionMassStatusWindow {
+    order_start: Option<UnixNanos>,
+    report_start: UnixNanos,
+    complete: bool,
+}
+
+struct PreparedFillReports {
+    reports: Vec<FillReport>,
+    provenance: Vec<TbankFillReport>,
+}
+
+impl PreparedFillReports {
+    fn publish_provenance(&self, client: &TbankExecutionRuntime) {
+        client.publish_snapshot_fill_provenance(&self.provenance);
+    }
+}
+
+fn execution_mass_status_window(
+    requested_start: Option<UnixNanos>,
+    current_day_start: UnixNanos,
+) -> ExecutionMassStatusWindow {
+    let order_start = requested_start.map(|start| start.max(current_day_start));
+    let report_start = order_start.unwrap_or(current_day_start);
+    // An absent lookback is unbounded at the Nautilus API boundary, but T-Bank history still
+    // starts today. Never present that clamped response as a complete account snapshot.
+    let complete = requested_start.is_some_and(|start| start >= current_day_start);
+
+    ExecutionMassStatusWindow {
+        order_start,
+        report_start,
+        complete,
+    }
+}
+
+fn utc_day_start(timestamp: UnixNanos) -> UnixNanos {
+    const NANOS_PER_DAY: u64 = 86_400 * 1_000_000_000;
+    UnixNanos::from(timestamp.as_u64() / NANOS_PER_DAY * NANOS_PER_DAY)
+}
+
+#[cfg(test)]
+mod mass_status_window_tests {
+    use super::*;
+
+    #[test]
+    fn unbounded_mass_status_marks_day_limited_coverage_incomplete() {
+        let current_day_start = UnixNanos::from(86_400_000_000_000_u64);
+
+        let window = execution_mass_status_window(None, current_day_start);
+
+        assert_eq!(window.order_start, None);
+        assert_eq!(window.report_start, current_day_start);
+        assert!(!window.complete);
+    }
+}
 
 pub(super) fn order_report_matches_command(
     report: &OrderStatusReport,
@@ -26,6 +84,106 @@ pub(super) fn fill_report_matches_command(
             .is_none_or(|venue_order_id| report.venue_order_id == venue_order_id)
         && cmd.start.is_none_or(|start| report.ts_event >= start)
         && cmd.end.is_none_or(|end| report.ts_event <= end)
+}
+
+pub(super) fn report_instrument_matches_identity(
+    instrument_id: InstrumentId,
+    ticker: &str,
+    class_code: &str,
+) -> bool {
+    if ticker.is_empty() || class_code.is_empty() {
+        return false;
+    }
+    let Ok(parts) = instrument_id
+        .to_string()
+        .parse::<crate::common::ids::TbankInstrumentIdParts>()
+    else {
+        return false;
+    };
+    parts.ticker.eq_ignore_ascii_case(ticker) && parts.class_code.eq_ignore_ascii_case(class_code)
+}
+
+fn report_time_matches_command(
+    ts_last: UnixNanos,
+    cmd: &nautilus_common::messages::execution::GenerateOrderStatusReports,
+) -> bool {
+    cmd.start.is_none_or(|start| ts_last >= start) && cmd.end.is_none_or(|end| ts_last <= end)
+}
+
+pub(super) fn order_state_matches_report_command(
+    state: &OrderState,
+    cmd: &nautilus_common::messages::execution::GenerateOrderStatusReports,
+) -> anyhow::Result<bool> {
+    if cmd.instrument_id.is_some_and(|id| {
+        !state.ticker.is_empty()
+            && !state.class_code.is_empty()
+            && !report_instrument_matches_identity(id, &state.ticker, &state.class_code)
+    }) {
+        return Ok(false);
+    }
+    if cmd.open_only
+        && !nautilus_order_status(
+            state.execution_report_status,
+            state.lots_requested,
+            state.lots_executed,
+        )
+        .is_open()
+    {
+        return Ok(false);
+    }
+    let ts_last = state
+        .order_date
+        .as_ref()
+        .map(super::timestamp_to_unix_nanos)
+        .transpose()?
+        .unwrap_or(cmd.ts_init);
+    Ok(report_time_matches_command(ts_last, cmd))
+}
+
+pub(super) fn stop_order_links_to_state(stop: &StopOrder, state: &OrderState) -> bool {
+    (!state.order_request_id.is_empty() && stop.stop_order_id == state.order_request_id)
+        || stop.exchange_order_id.as_deref() == Some(state.order_id.as_str())
+}
+
+pub(super) fn stop_order_matches_report_command(
+    stop: &StopOrder,
+    cmd: &nautilus_common::messages::execution::GenerateOrderStatusReports,
+    linked_state: Option<&OrderState>,
+) -> anyhow::Result<bool> {
+    if let Some(instrument_id) = cmd.instrument_id {
+        let identity_matches = if !stop.ticker.is_empty() && !stop.class_code.is_empty() {
+            report_instrument_matches_identity(instrument_id, &stop.ticker, &stop.class_code)
+        } else {
+            linked_state.is_none_or(|state| {
+                state.ticker.is_empty()
+                    || state.class_code.is_empty()
+                    || report_instrument_matches_identity(
+                        instrument_id,
+                        &state.ticker,
+                        &state.class_code,
+                    )
+            })
+        };
+        if !identity_matches {
+            return Ok(false);
+        }
+    }
+
+    let active = StopOrderStatusOption::try_from(stop.status).ok()
+        == Some(StopOrderStatusOption::StopOrderStatusActive);
+    if cmd.open_only && !active && linked_state.is_none() {
+        return Ok(false);
+    }
+
+    // Activated stops report the child's latest order timestamp while retaining the parent
+    // stop's venue identity. Preserve that parent when the linked child falls inside the query.
+    let ts_last = linked_state
+        .and_then(|state| state.order_date.as_ref())
+        .or(stop.create_date.as_ref())
+        .map(super::timestamp_to_unix_nanos)
+        .transpose()?
+        .unwrap_or(cmd.ts_init);
+    Ok(report_time_matches_command(ts_last, cmd))
 }
 
 pub(super) fn position_report_matches_command(
@@ -60,6 +218,180 @@ pub(super) fn submit_commands_from_list(
             order_cmd
         })
         .collect()
+}
+
+async fn prepare_fill_reports(
+    execution_client: &TbankExecutionClient,
+    cmd: nautilus_common::messages::execution::GenerateFillReports,
+) -> anyhow::Result<PreparedFillReports> {
+    let mut client = execution_client.runtime.clone();
+    // T-Bank exposes terminal order states only through the current-day GetOrders filters, whose
+    // from/to fields are explicitly limited to orders created today. Operation history contains
+    // trade IDs but no broker order IDs, so it cannot produce canonical fill identities outside
+    // that order window. An omitted start means unbounded history in the Nautilus report
+    // contract; fail closed instead of silently returning only today's fills.
+    let (today, _) = current_utc_day_bounds();
+    let today_start = i128::from(today.seconds) * 1_000_000_000;
+    let operations_from = cmd
+        .start
+        .map(|value| i128::from(value.as_u64()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "T-Bank fill report generation requires an explicit start; unbounded fill history cannot be mapped to broker order identities"
+            )
+        })?;
+    if cmd
+        .end
+        .is_some_and(|value| i128::from(value.as_u64()) < operations_from)
+    {
+        return Ok(PreparedFillReports {
+            reports: Vec::new(),
+            provenance: Vec::new(),
+        });
+    }
+    // The order endpoint is the identity authority for operation trades and only exposes
+    // terminal orders from the current UTC day. Warm it from day start even when the caller asks
+    // for a later operation window; otherwise a fill whose order was created earlier today is
+    // returned without a venue_order_id and is lost at the identity boundary.
+    let order_warmup_from = if operations_from < today_start {
+        // Preserve the explicit fail-closed error for unsupported historical ranges.
+        operations_from
+    } else {
+        today_start
+    };
+    let mut order_states = client.query_orders_since(order_warmup_from).await?.orders;
+    // A direct fill snapshot can be the first request after restart. Rebuild the same
+    // activated-stop aliases that order-status generation/reconciliation normally creates;
+    // otherwise OperationsService trades are left under the exchange child ID and cannot be
+    // canonicalized to the stop parent.
+    let stops = client
+        .query_stop_orders_for_reconciliation(None)
+        .await?
+        .stop_orders;
+    client
+        .append_missing_activated_stop_children(&mut order_states, &stops)
+        .await?;
+    let stop_id_by_exchange_order_id = stops
+        .iter()
+        .filter_map(|stop| {
+            stop.exchange_order_id
+                .as_ref()
+                .filter(|order_id| !order_id.is_empty())
+                .map(|order_id| (order_id.clone(), stop.stop_order_id.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let stop_ids = stops
+        .iter()
+        .map(|stop| (stop.stop_order_id.clone(), stop.stop_order_id.clone()))
+        .collect::<HashMap<_, _>>();
+    for stop in &stops {
+        client.record_broker_order_id(
+            TbankBrokerOrderRoute::StopOrder,
+            stop.stop_order_id.as_str(),
+        );
+    }
+    for order in &order_states {
+        client.record_trade_order_mappings_from_order_state(order, order.order_id.as_str());
+        if order.order_id.is_empty() {
+            continue;
+        }
+        let activated_stop_id = stop_ids
+            .get(order.order_request_id.as_str())
+            .map(String::as_str)
+            .or_else(|| {
+                stop_id_by_exchange_order_id
+                    .get(order.order_id.as_str())
+                    .map(String::as_str)
+            });
+        if let Some(stop_order_id) = activated_stop_id {
+            client.record_activated_stop_child_alias(stop_order_id, order.order_id.as_str());
+        }
+    }
+    // A generated report is a repeatable venue snapshot, not a live execution event. Its
+    // projection must therefore not consume seen_trade_ids from streams or an earlier snapshot.
+    let snapshot_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let instrument_uid = match cmd.instrument_id {
+        Some(id) => {
+            let instrument_id = id.to_string();
+            Some(
+                client
+                    .load_instrument_metadata(&instrument_id)
+                    .await?
+                    .instrument_uid,
+            )
+        }
+        None => None,
+    };
+    let response = client
+        .query_fills(
+            instrument_uid,
+            Some(operations_from),
+            cmd.end.map(|value| i128::from(value.as_u64())),
+        )
+        .await?;
+    let mut reports = Vec::new();
+    let mut provenance = Vec::new();
+    for item in &response.items {
+        if fill_side_from_operation_type(item.r#type).is_none() {
+            continue;
+        }
+        match client
+            .load_supported_metadata_for_identity(
+                &item.instrument_uid,
+                &item.figi,
+                &item.ticker,
+                &item.class_code,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(TbankAdapterError::InstrumentOutOfScope(_)) => {
+                tracing::debug!(
+                    "ignoring T-Bank fill operation outside the supported adapter scope"
+                );
+                continue;
+            }
+            Err(error) if TbankExecutionRuntime::metadata_error_is_event_rejection(&error) => {
+                tracing::warn!(
+                    %error,
+                    "skipping malformed T-Bank fill operation with invalid instrument identity"
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        for report in fill_reports_from_cursor_operation_with_instruments(
+            client.account_id(),
+            item,
+            cmd.ts_init,
+            Some(&client.instruments),
+            Some(&client.broker_order_index),
+        ) {
+            let mut report = report?;
+            // Nautilus requires a Money value on FillReport. Preserve the fill for snapshot
+            // reconciliation even when that value is only the zero placeholder; its typed
+            // provenance event distinguishes unknown from zero after the full snapshot succeeds.
+            report.report =
+                canonicalize_managed_trade_fill_report(&client.broker_order_index, report.report);
+            if !fill_report_matches_command(&report.report, &cmd) {
+                continue;
+            }
+            let (projected, pending_provenance) = project_managed_trade_fill_report_deferred(
+                &client.broker_order_index,
+                &snapshot_projection,
+                report,
+            )?;
+            provenance.extend(pending_provenance);
+            if let Some(report) = projected {
+                reports.push(report);
+            }
+        }
+    }
+    reports.retain(|report| fill_report_matches_command(report, &cmd));
+    Ok(PreparedFillReports {
+        reports,
+        provenance,
+    })
 }
 
 #[async_trait(?Send)]
@@ -540,7 +872,7 @@ impl ExecutionClient for TbankExecutionClient {
         cmd: &nautilus_common::messages::execution::GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         let mut client = self.runtime.clone();
-        let mut order_states = if cmd.open_only {
+        let mut queried_order_states = if cmd.open_only {
             client.query_orders(false).await?.orders
         } else if let Some(start) = cmd.start {
             client
@@ -550,17 +882,57 @@ impl ExecutionClient for TbankExecutionClient {
         } else {
             client.query_orders(true).await?.orders
         };
-        // Active stop orders alone are insufficient here: after activation T-Bank
-        // exposes the child as a regular order and the parent only in stop-order
-        // history. Keep that parent metadata available for identity correlation.
-        let stops = client
+        let queried_stops = client
             .query_stop_orders_for_reconciliation(None)
             .await?
             .stop_orders;
+
+        // Activated children can fall inside the requested time range even when the parent
+        // stop was created earlier and the broker's order-history query omitted the child.
+        // Recover those children before applying time filters. A complete, mismatching stop
+        // instrument identity is enough to avoid an unnecessary child query; incomplete parent
+        // identities must be resolved from the child state.
         if !cmd.open_only {
+            let stops_for_child_recovery = queried_stops
+                .iter()
+                .filter(|stop| {
+                    cmd.instrument_id.is_none_or(|instrument_id| {
+                        stop.ticker.is_empty()
+                            || stop.class_code.is_empty()
+                            || report_instrument_matches_identity(
+                                instrument_id,
+                                &stop.ticker,
+                                &stop.class_code,
+                            )
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             client
-                .append_missing_activated_stop_children(&mut order_states, &stops)
+                .append_missing_activated_stop_children(
+                    &mut queried_order_states,
+                    &stops_for_child_recovery,
+                )
                 .await?;
+        }
+
+        let mut order_states = Vec::with_capacity(queried_order_states.len());
+        for state in &queried_order_states {
+            if order_state_matches_report_command(state, cmd)? {
+                order_states.push(state.clone());
+            }
+        }
+
+        // Keep stop parents available for identity correlation, then apply report scopes using
+        // the recovered child timestamp when one exists.
+        let mut stops = Vec::with_capacity(queried_stops.len());
+        for stop in queried_stops {
+            let linked_state = queried_order_states
+                .iter()
+                .find(|state| stop_order_links_to_state(&stop, state));
+            if stop_order_matches_report_command(&stop, cmd, linked_state)? {
+                stops.push(stop);
+            }
         }
         let stop_by_id = stops
             .iter()
@@ -728,69 +1100,9 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         cmd: nautilus_common::messages::execution::GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let mut client = self.runtime.clone();
-        let instrument_uid = match cmd.instrument_id {
-            Some(id) => {
-                let instrument_id = id.to_string();
-                Some(
-                    client
-                        .load_instrument_metadata(&instrument_id)
-                        .await?
-                        .instrument_uid,
-                )
-            }
-            None => None,
-        };
-        let response = client
-            .query_fills(
-                instrument_uid,
-                cmd.start.map(|value| i128::from(value.as_u64())),
-                cmd.end.map(|value| i128::from(value.as_u64())),
-            )
-            .await?;
-        let mut reports = Vec::new();
-        for item in &response.items {
-            if fill_side_from_operation_type(item.r#type).is_none() {
-                continue;
-            }
-            match client
-                .load_supported_metadata_for_identity(
-                    &item.instrument_uid,
-                    &item.figi,
-                    &item.ticker,
-                    &item.class_code,
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(TbankAdapterError::InstrumentOutOfScope(_)) => {
-                    tracing::debug!(
-                        "ignoring T-Bank fill operation outside the supported adapter scope"
-                    );
-                    continue;
-                }
-                Err(error) if TbankExecutionRuntime::metadata_error_is_event_rejection(&error) => {
-                    tracing::warn!(
-                        %error,
-                        "skipping malformed T-Bank fill operation with invalid instrument identity"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            }
-            for report in fill_reports_from_cursor_operation_with_instruments(
-                client.account_id(),
-                item,
-                cmd.ts_init,
-                Some(&client.instruments),
-            ) {
-                reports.push(report.map(|report| {
-                    canonicalize_managed_trade_fill_report(&self.runtime.broker_order_index, report)
-                })?);
-            }
-        }
-        reports.retain(|report| fill_report_matches_command(report, &cmd));
-        Ok(reports)
+        let prepared = prepare_fill_reports(self, cmd).await?;
+        prepared.publish_provenance(&self.runtime);
+        Ok(prepared.reports)
     }
 
     async fn generate_position_status_reports(
@@ -900,7 +1212,7 @@ impl ExecutionClient for TbankExecutionClient {
             ts_init,
             Some(UUID4::new()),
         );
-        let start = lookback_mins
+        let requested_start = lookback_mins
             .map(|mins| {
                 let lookback_nanos = nautilus_core::datetime::checked_mins_to_nanos(mins)
                     .context("execution mass-status lookback exceeds nanosecond range")?;
@@ -909,12 +1221,16 @@ impl ExecutionClient for TbankExecutionClient {
                 ))
             })
             .transpose()?;
+        // GetOrders only exposes terminal orders created during the current UTC day, and fill
+        // identities depend on that order history. Clamp both historical sources to the same
+        // boundary and report incomplete coverage when the caller requested an earlier start.
+        let window = execution_mass_status_window(requested_start, utc_day_start(ts_init));
         let order_cmd = nautilus_common::messages::execution::GenerateOrderStatusReports::new(
             UUID4::new(),
             ts_init,
             false,
             None,
-            start,
+            window.order_start,
             None,
             None,
             None,
@@ -924,7 +1240,7 @@ impl ExecutionClient for TbankExecutionClient {
             ts_init,
             None,
             None,
-            start,
+            Some(window.report_start),
             None,
             None,
             None,
@@ -940,8 +1256,38 @@ impl ExecutionClient for TbankExecutionClient {
         );
 
         status.add_order_reports(self.generate_order_status_reports(&order_cmd).await?);
-        status.add_fill_reports(self.generate_fill_reports(fill_cmd).await?);
+        let mut reports_complete = window.complete;
+        let mut pending_fill_provenance = Vec::new();
+        let fill_reports = match prepare_fill_reports(self, fill_cmd).await {
+            Ok(prepared) => {
+                pending_fill_provenance = prepared.provenance;
+                prepared.reports
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<super::TbankFillIdentityUnresolved>()
+                    .is_some() =>
+            {
+                // Mass status is an explicitly completeness-aware snapshot. Preserve its
+                // independently recoverable order/position reports, but never publish a partial
+                // fill set when a broker operation cannot be linked to an order.
+                tracing::warn!(
+                    %error,
+                    "T-Bank mass status omits fills because broker order identity is unresolved"
+                );
+                reports_complete = false;
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
+        status.add_fill_reports(fill_reports);
         status.add_position_reports(self.generate_position_status_reports(&position_cmd).await?);
+        status.set_report_window(Some(window.report_start), reports_complete);
+        // Commission events are part of the mass-status snapshot. Publish them only after all
+        // fallible order, fill, and position report generation has completed successfully. The
+        // runtime resolves the current sender and serializes provenance with live publication.
+        self.runtime
+            .publish_snapshot_fill_provenance(&pending_fill_provenance);
         Ok(Some(status))
     }
 

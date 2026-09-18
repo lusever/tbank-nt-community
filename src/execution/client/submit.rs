@@ -445,17 +445,17 @@ pub(super) fn submit_response_execution_reports(
                 response.order_id.as_str(),
                 order_report.filled_qty.as_decimal(),
             );
-            let fill_reports = client
-                .project_order_status_fill_report(
-                    &order_report,
-                    response.order_id.as_str(),
-                    trade_id.as_str(),
-                    ts_init,
-                    Some(cmd.client_order_id.as_str()),
-                    commission_from_money_value(response.executed_commission.as_ref())?,
-                )?
-                .into_iter()
-                .collect();
+            let fill_reports = project_submit_response_fill_report(
+                client,
+                &order_report,
+                response.order_id.as_str(),
+                trade_id.as_str(),
+                ts_init,
+                Some(cmd.client_order_id.as_str()),
+                commission_from_money_value(response.executed_commission.as_ref())?,
+            )?
+            .into_iter()
+            .collect();
             (order_report, fill_reports)
         }
         TbankSubmitResponse::StopOrder(response) => (
@@ -470,6 +470,38 @@ pub(super) fn submit_response_execution_reports(
     };
     client.mark_pending_submit_report(&order_report);
     Ok(order_status_execution_reports(order_report, fill_reports))
+}
+
+/// Projects and publishes a submit fill under the shared lifecycle publication gate.
+///
+/// Stream and reconciliation fills already use this gate, so taking it here makes the
+/// projection transition and its provenance event one ordered operation across all sources.
+pub(super) fn project_submit_response_fill_report(
+    client: &TbankExecutionRuntime,
+    report: &OrderStatusReport,
+    order_id: &str,
+    trade_id: &str,
+    ts_init: UnixNanos,
+    order_request_id: Option<&str>,
+    cumulative_commission: Option<Money>,
+) -> anyhow::Result<Option<FillReport>> {
+    let Some(result) = client.lifecycle_active.run_if_active(|| {
+        let sender = client.current_data_event_sender();
+        let fill = client.project_order_status_fill_report_and_publish(
+            report,
+            order_id,
+            trade_id,
+            ts_init,
+            order_request_id,
+            cumulative_commission,
+            TbankFillCommissionSource::SubmitResponse,
+            sender.as_ref(),
+        )?;
+        Ok(fill.and_then(|fill| client.finish_order_status_fill_report(fill)))
+    }) else {
+        return Ok(None);
+    };
+    result
 }
 
 pub(super) fn confirm_margin_trade_for_submit(default: bool, params: Option<&Params>) -> bool {

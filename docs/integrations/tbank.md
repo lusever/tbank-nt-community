@@ -65,6 +65,26 @@ currency-valued execution averages and the legacy `GetOperations`/`GetSandboxOpe
 are converted through the current tick amount.
 FOK is rejected locally for futures until the broker provides equivalent semantics.
 
+### Fill commission provenance
+
+| Nautilus surface | Status | Notes |
+| --- | --- | --- |
+| `FillReport.commission` | Limited | Not optional in Nautilus, so a fill whose venue commission is unknown carries a zero RUB placeholder — a placeholder, never a measurement |
+| `TbankExecutionEvent::FillCommission` | Supported | Typed custom data carrying `status` (`reported`, `allocated`, or `unknown`), the exact decimal amount and currency when known, the fill identity, and the adapter path that produced the fill |
+| Commission in the order-state / trades streams | Not supported | `OrderStateStreamResponse.OrderState` and `OrderTrade` carry no commission field; only `OrderState.executed_commission` and `OperationItem.commission` do |
+
+Consumers must take commission provenance from `TbankExecutionEvent::FillCommission` and must not
+infer it from `FillReport.commission`. An unknown commission is also logged at `WARN` with the
+broker order ID, trade ID and source path. Register the custom data with
+`register_tbank_custom_data()` before replaying persisted data;
+`register_tbank_market_data_custom_data()` and `register_tbank_execution_custom_data()` register the
+two halves individually.
+
+`reported` means the venue supplied the fee for that fill. `allocated` means the venue supplied an
+operation-level fee and the adapter distributed it across multiple fills using operation notional
+or matched execution quantity as weights; the total is venue-reported, but the per-fill shares are
+calculated.
+
 ### T-Invest API 1.51 additions
 
 The vendored contracts are pinned to T-Invest API 1.51. Generated responses expose the broker's

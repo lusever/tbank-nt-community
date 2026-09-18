@@ -239,11 +239,14 @@ pub enum TbankCandleReadinessState {
     Failed,
 }
 
-/// Registers T-Bank custom data types for Nautilus JSON deserialization.
+/// Registers T-Bank market-data custom data types for Nautilus JSON deserialization.
 ///
 /// Call this during process initialization before replaying persisted [`CustomData`]. The
 /// registration is idempotent and remains process-local, matching Nautilus custom-data contracts.
-pub fn register_tbank_custom_data() {
+/// Execution custom data is registered separately by
+/// [`register_tbank_execution_custom_data`](crate::execution::register_tbank_execution_custom_data);
+/// [`register_tbank_custom_data`](crate::register_tbank_custom_data) covers both.
+pub fn register_tbank_market_data_custom_data() {
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<TbankMarketDataEvent>();
 }
 
@@ -253,7 +256,7 @@ mod tests {
 
     #[test]
     fn lifecycle_event_uses_the_nautilus_custom_data_contract() {
-        register_tbank_custom_data();
+        register_tbank_market_data_custom_data();
         let event = TbankMarketDataEvent::stream_state(
             "bars:group:0:1m".to_string(),
             TbankMarketDataStreamState::Connected,

@@ -535,9 +535,16 @@ fn activated_stop_child_keeps_stop_identity_and_uses_regular_cancel_route() {
     )
     .unwrap();
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
-    let fill = project_managed_trade_fill_report(&broker_order_index, &fill_projection, fill)
-        .unwrap()
-        .unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let fill = project_managed_trade_fill_report(
+        &broker_order_index,
+        &fill_projection,
+        fill,
+        Some(&sender),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(receiver.try_recv().is_ok());
     assert_eq!(fill.venue_order_id.to_string(), "stop-order-1");
     assert_eq!(
         fill.client_order_id.map(|id| id.to_string()),
@@ -566,7 +573,7 @@ fn activated_stop_child_keeps_stop_identity_and_uses_regular_cancel_route() {
     )
     .unwrap();
     assert!(
-        project_trade_fill_report(&race_projection, unresolved_fill)
+        project_trade_fill_report(&race_projection, unresolved_fill.report)
             .unwrap()
             .is_some()
     );
@@ -597,10 +604,16 @@ fn activated_stop_child_keeps_stop_identity_and_uses_regular_cancel_route() {
     )
     .unwrap();
     assert!(
-        project_managed_trade_fill_report(&race_index, &race_projection, duplicate_fill)
+        project_managed_trade_fill_report(
+            &race_index,
+            &race_projection,
+            duplicate_fill,
+            Some(&sender),
+        )
             .unwrap()
             .is_none()
     );
+    assert!(receiver.try_recv().is_err());
     let projection = race_projection.lock().unwrap();
     assert!(!projection.orders.contains_key("exchange-child-race"));
     assert!(projection.orders.contains_key("stop-order-race"));
@@ -628,7 +641,7 @@ fn activated_stop_child_keeps_stop_identity_and_uses_regular_cancel_route() {
     .unwrap();
     let recovery_fill = canonicalize_reconciled_stop_fill(
         &recovery_client.runtime,
-        recovery_fill,
+        recovery_fill.report,
         &HashMap::from([("exchange-child-1".to_string(), "stop-order-1".to_string())]),
         &HashMap::from([("stop-order-1".to_string(), "client-stop-1".to_string())]),
     );
@@ -720,6 +733,18 @@ async fn external_activated_stop_initial_ack_recovers_confirmed_child_in_backgro
         instrument_uid: "sber-uid".to_string(),
         ticker: "SBER".to_string(),
         class_code: "TQBR".to_string(),
+        stages: vec![
+            crate::grpc::generated::OrderStage {
+                trade_id: "stop-child-trade-1".to_string(),
+                quantity: 1,
+                ..crate::grpc::generated::OrderStage::default()
+            },
+            crate::grpc::generated::OrderStage {
+                trade_id: "stop-child-trade-2".to_string(),
+                quantity: 1,
+                ..crate::grpc::generated::OrderStage::default()
+            },
+        ],
         ..OrderState::default()
     });
     let stop_orders_service = MockStopOrdersService::default();
@@ -808,6 +833,15 @@ async fn external_activated_stop_initial_ack_recovers_confirmed_child_in_backgro
             .unwrap()
             .canonical_venue_order_identity("exchange-child-1"),
         Some(("stop-order-1".to_string(), None))
+    );
+    let index = client.runtime.broker_order_index.lock().unwrap();
+    assert_eq!(
+        index.venue_order_id_for_trade_id("stop-child-trade-1"),
+        Some("stop-order-1".to_string())
+    );
+    assert_eq!(
+        index.venue_order_id_for_trade_id("stop-child-trade-2"),
+        Some("stop-order-1".to_string())
     );
 }
 
@@ -1312,6 +1346,1431 @@ fn operation_fill_allowlist_excludes_funding_and_unknown_operations() {
 }
 
 #[tokio::test]
+async fn duplicate_reported_commission_updates_provenance_without_replaying_fill() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    broker_order_index.lock().unwrap().record_mapping(
+        TbankBrokerOrderRoute::RegularOrder,
+        "client-order-1",
+        "broker-order-1",
+    );
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let make_fill = |commission: TbankFillCommission, source: TbankFillCommissionSource| {
+        let report = FillReport::new(
+            "TBANK-001".into(),
+            "SBER_TQBR.MOEX".parse().unwrap(),
+            "broker-order-1".into(),
+            "trade-1".into(),
+            OrderSide::Buy,
+            Quantity::from(10),
+            Price::from("275"),
+            commission
+                .amount()
+                .unwrap_or_else(|| Money::from("0 RUB")),
+            LiquiditySide::NoLiquiditySide,
+            Some("client-order-1".into()),
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            Some(UUID4::new()),
+        );
+        TbankFillReport::new(report, commission, source)
+    };
+
+    let first = project_managed_trade_fill_report(
+        &broker_order_index,
+        &fill_projection,
+        make_fill(
+            TbankFillCommission::Unknown,
+            TbankFillCommissionSource::OrderStateStream,
+        ),
+        Some(&sender),
+    )
+    .unwrap();
+    assert!(first.is_some());
+    let first_event = receiver.try_recv().unwrap();
+    let first_event = match first_event {
+        nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) => {
+            data.data
+                .as_any()
+                .downcast_ref::<crate::execution::events::TbankExecutionEvent>()
+                .unwrap()
+                .clone()
+        }
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert!(matches!(
+        first_event,
+        crate::execution::events::TbankExecutionEvent::FillCommission {
+            status: crate::execution::events::TbankFillCommissionStatus::Unknown,
+            ..
+        }
+    ));
+
+    let second = project_managed_trade_fill_report(
+        &broker_order_index,
+        &fill_projection,
+        make_fill(
+            TbankFillCommission::Reported(Money::from("1.25 RUB")),
+            TbankFillCommissionSource::OperationsCursor,
+        ),
+        Some(&sender),
+    )
+    .unwrap();
+    assert!(second.is_none());
+    let second_event = receiver.try_recv().unwrap();
+    let second_event = match second_event {
+        nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) => {
+            data.data
+                .as_any()
+                .downcast_ref::<crate::execution::events::TbankExecutionEvent>()
+                .unwrap()
+                .clone()
+        }
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert!(matches!(
+        second_event,
+        crate::execution::events::TbankExecutionEvent::FillCommission {
+            status: crate::execution::events::TbankFillCommissionStatus::Reported,
+            amount: Some(amount),
+            source: TbankFillCommissionSource::OperationsCursor,
+            ..
+        } if amount == "1.25"
+    ));
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn unavailable_trade_provenance_channel_does_not_block_fill_projection() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let fill = TbankFillReport::new(
+        FillReport::new(
+            "TBANK-001".into(),
+            "SBER_TQBR.MOEX".parse().unwrap(),
+            "broker-order-1".into(),
+            "trade-1".into(),
+            OrderSide::Buy,
+            Quantity::from(10),
+            Price::from("275"),
+            Money::from("0 RUB"),
+            LiquiditySide::NoLiquiditySide,
+            None,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            Some(UUID4::new()),
+        ),
+        TbankFillCommission::Unknown,
+        TbankFillCommissionSource::TradesStream,
+    );
+
+    let projected = project_managed_trade_fill_report(
+        &broker_order_index,
+        &fill_projection,
+        fill.clone(),
+        None,
+    )
+    .unwrap();
+    assert!(
+        projected.is_some(),
+        "missing custom-data sender must not drop FillReport"
+    );
+    assert_eq!(fill_projection.lock().unwrap().orders.len(), 1);
+
+    let (closed_sender, closed_receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(closed_receiver);
+    let separate_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let projected = project_managed_trade_fill_report(
+        &broker_order_index,
+        &separate_projection,
+        fill,
+        Some(&closed_sender),
+    )
+    .unwrap();
+    assert!(
+        projected.is_some(),
+        "closed custom-data sender must not drop FillReport"
+    );
+    assert_eq!(separate_projection.lock().unwrap().orders.len(), 1);
+}
+
+#[test]
+fn detached_clone_captures_runner_sender_after_client_creation() {
+    let (initial_sender, mut initial_receiver) = tokio::sync::mpsc::unbounded_channel();
+    nautilus_common::live::runner::replace_data_event_sender(initial_sender);
+    let client = test_client(TbankExecutionClientConfig::default());
+
+    let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+    nautilus_common::live::runner::replace_data_event_sender(runner_sender);
+    let detached = client.runtime.detached_query_clone();
+    let projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("275"),
+        Money::from("0 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+
+    assert!(
+        project_managed_trade_fill_report(
+            &detached.broker_order_index,
+            &projection,
+            unknown_fill_report(report),
+            detached.current_data_event_sender().as_ref(),
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert!(initial_receiver.try_recv().is_err());
+    assert!(runner_receiver.try_recv().is_ok());
+}
+
+#[test]
+fn existing_detached_clone_observes_a_refreshed_sender_on_worker_thread() {
+    let (initial_sender, mut initial_receiver) = tokio::sync::mpsc::unbounded_channel();
+    nautilus_common::live::runner::replace_data_event_sender(initial_sender);
+    let client = test_client(TbankExecutionClientConfig::default());
+    let detached = client.runtime.detached_query_clone();
+
+    let (runner_sender, mut runner_receiver) = tokio::sync::mpsc::unbounded_channel();
+    nautilus_common::live::runner::replace_data_event_sender(runner_sender);
+    client.runtime.refresh_data_event_sender();
+
+    let projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("275"),
+        Money::from("0 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    let result = std::thread::spawn(move || {
+        let sender = detached.current_data_event_sender();
+        project_managed_trade_fill_report(
+            &detached.broker_order_index,
+            &projection,
+            unknown_fill_report(report),
+            sender.as_ref(),
+        )
+    })
+    .join()
+    .expect("worker publication must not panic")
+    .unwrap();
+
+    assert!(result.is_some());
+    assert!(initial_receiver.try_recv().is_err());
+    assert!(runner_receiver.try_recv().is_ok());
+}
+
+#[test]
+fn cumulative_commission_stays_unknown_when_an_earlier_fill_has_unknown_provenance() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let stream_fill = TbankFillReport::new(
+        FillReport::new(
+            "TBANK-001".into(),
+            "SBER_TQBR.MOEX".parse().unwrap(),
+            "broker-order-1".into(),
+            "trade-1".into(),
+            OrderSide::Buy,
+            Quantity::from(10),
+            Price::from("275"),
+            Money::from("0 RUB"),
+            LiquiditySide::NoLiquiditySide,
+            None,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            Some(UUID4::new()),
+        ),
+        TbankFillCommission::Unknown,
+        TbankFillCommissionSource::OrderStateStream,
+    );
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    assert!(
+        project_managed_trade_fill_report(
+            &broker_order_index,
+            &fill_projection,
+            stream_fill,
+            Some(&sender),
+        )
+        .unwrap()
+        .is_some()
+    );
+
+    let projected = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-20",
+        Decimal::from(20),
+        Decimal::from(5_500),
+        Some(Money::from("10 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(projected.quantity.as_decimal(), Decimal::from(10));
+    assert_eq!(projected.commission, TbankFillCommission::Unknown);
+}
+
+#[test]
+fn repeated_cumulative_snapshot_does_not_charge_ambiguous_total_to_last_delta() {
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+
+    let first = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-5",
+        Decimal::from(5),
+        Decimal::from(1_375),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.commission, TbankFillCommission::Unknown);
+
+    let second = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("10 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.commission, TbankFillCommission::Unknown);
+
+    assert!(
+        project_cumulative_order_fill(
+            &fill_projection,
+            "broker-order-1",
+            "synthetic-order-state-10",
+            Decimal::from(10),
+            Decimal::from(2_750),
+            Some(Money::from("10 RUB")),
+        )
+        .unwrap()
+        .is_none(),
+        "an ambiguous cumulative total must not become a provenance correction"
+    );
+}
+
+#[test]
+fn stale_cumulative_snapshot_cannot_correct_a_newer_fill_commission() {
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+
+    let initial = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(initial.commission, TbankFillCommission::Unknown);
+
+    assert!(project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "stale-order-state-5",
+        Decimal::from(5),
+        Decimal::from(1_375),
+        Some(Money::from("0.5 RUB")),
+    )
+    .unwrap()
+    .is_none());
+
+    let correction = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "fresh-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("1 RUB")),
+    )
+    .unwrap()
+    .expect("fresh cumulative commission corrects the unknown fill");
+    assert!(correction.provenance_only);
+    assert_eq!(correction.trade_id.as_deref(), Some("synthetic-order-state-10"));
+    assert_eq!(
+        correction.commission,
+        TbankFillCommission::Allocated(Money::from("1 RUB"))
+    );
+}
+
+#[test]
+fn repeated_cumulative_snapshot_reports_only_incremental_commission() {
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+
+    let first = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("1 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        first.commission,
+        TbankFillCommission::Allocated(Money::from("1 RUB"))
+    );
+
+    let second = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-20",
+        Decimal::from(20),
+        Decimal::from(5_500),
+        Some(Money::from("2 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.quantity.as_decimal(), Decimal::from(10));
+    assert_eq!(
+        second.commission,
+        TbankFillCommission::Allocated(Money::from("1 RUB"))
+    );
+}
+
+#[test]
+fn stale_cumulative_commission_does_not_resolve_a_larger_stream_fill() {
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let stream_fill = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "stream-trade-10".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("275"),
+        Money::from("0 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    crate::execution::projections::project_trade_fill_report_locked(
+        &mut fill_projection.lock().unwrap(),
+        stream_fill,
+        TbankFillCommission::Unknown,
+    )
+    .unwrap()
+    .expect("the stream trade emits the ten-lot fill");
+
+    assert!(project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "stale-order-state-5",
+        Decimal::from(5),
+        Decimal::from(1_375),
+        Some(Money::from("0.5 RUB")),
+    )
+    .unwrap()
+    .is_none());
+
+    let correction = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "fresh-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("1 RUB")),
+    )
+    .unwrap()
+    .expect("the fresh cumulative commission resolves the stream fill");
+
+    assert!(correction.provenance_only);
+    assert_eq!(correction.trade_id.as_deref(), Some("stream-trade-10"));
+    assert_eq!(correction.quantity.as_decimal(), Decimal::from(10));
+    assert_eq!(
+        correction.commission,
+        TbankFillCommission::Allocated(Money::from("1 RUB"))
+    );
+}
+
+#[test]
+fn alias_projection_deduplicates_cumulative_queue_before_real_trade() {
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "canonical-order-1",
+        "canonical-synthetic-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    project_cumulative_order_fill(
+        &fill_projection,
+        "alias-order-1",
+        "alias-synthetic-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    super::merge_fill_projection_alias(
+        &mut fill_projection.lock().unwrap(),
+        "alias-order-1",
+        "canonical-order-1",
+    );
+
+    let real_trade = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "canonical-order-1".into(),
+        "real-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(20),
+        Price::from("275"),
+        Money::from("0 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    let projected = project_trade_fill_report(&fill_projection, real_trade)
+        .unwrap()
+        .expect("the real trade must retain its non-cumulative remainder");
+
+    assert_eq!(projected.last_qty.as_decimal(), Decimal::from(10));
+}
+
+#[test]
+fn alias_projection_transfers_equal_sized_fill_commissions_one_to_one() {
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+
+    for (order_id, trade_prefix, cumulative_commission) in [
+        ("canonical-order-1", "canonical", None),
+        ("alias-order-1", "alias", Some(Money::from("0.01 RUB"))),
+    ] {
+        project_cumulative_order_fill(
+            &fill_projection,
+            order_id,
+            &format!("{trade_prefix}-synthetic-1"),
+            Decimal::ONE,
+            Decimal::from(275),
+            cumulative_commission,
+        )
+        .unwrap()
+        .unwrap();
+        project_cumulative_order_fill(
+            &fill_projection,
+            order_id,
+            &format!("{trade_prefix}-synthetic-2"),
+            Decimal::from(2),
+            Decimal::from(550),
+            cumulative_commission.map(|_| Money::from("0.02 RUB")),
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    super::merge_fill_projection_alias(
+        &mut fill_projection.lock().unwrap(),
+        "alias-order-1",
+        "canonical-order-1",
+    );
+
+    let next_fill = project_cumulative_order_fill(
+        &fill_projection,
+        "canonical-order-1",
+        "canonical-synthetic-3",
+        Decimal::from(3),
+        Decimal::from(825),
+        Some(Money::from("0.03 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        next_fill.commission,
+        TbankFillCommission::Allocated(Money::from("0.01 RUB"))
+    );
+}
+
+#[test]
+fn partial_alias_merge_resizes_commission_before_trade_reconciliation() {
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "canonical-order-1",
+        "canonical-synthetic-5",
+        Decimal::from(5),
+        Decimal::from(1_375),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    project_cumulative_order_fill(
+        &fill_projection,
+        "alias-order-1",
+        "alias-synthetic-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("1 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+
+    super::merge_fill_projection_alias(
+        &mut fill_projection.lock().unwrap(),
+        "alias-order-1",
+        "canonical-order-1",
+    );
+
+    let real_trade = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "canonical-order-1".into(),
+        "real-trade-10".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("275"),
+        Money::from("1 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    {
+        let mut projection = fill_projection.lock().unwrap();
+        assert!(crate::execution::projections::project_trade_fill_report_locked(
+            &mut projection,
+            real_trade.clone(),
+            TbankFillCommission::Reported(Money::from("1 RUB")),
+        )
+        .unwrap()
+        .is_none());
+        let (corrections, residual) =
+            crate::execution::projections::update_duplicate_fill_provenance(
+                &mut projection,
+                &real_trade,
+                TbankFillCommission::Reported(Money::from("1 RUB")),
+            )
+            .unwrap();
+        assert_eq!(
+            corrections,
+            vec![(
+                "canonical-synthetic-5".to_string(),
+                TbankFillCommission::Allocated(Money::from("0.50 RUB")),
+            )]
+        );
+        assert_eq!(residual, None);
+    }
+
+    let next_fill = project_cumulative_order_fill(
+        &fill_projection,
+        "canonical-order-1",
+        "canonical-synthetic-15",
+        Decimal::from(15),
+        Decimal::from(4_125),
+        Some(Money::from("1.50 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(next_fill.quantity.as_decimal(), Decimal::from(5));
+    assert_eq!(
+        next_fill.commission,
+        TbankFillCommission::Allocated(Money::from("0.50 RUB"))
+    );
+}
+
+#[test]
+fn reported_operation_commission_corrects_an_emitted_synthetic_fill() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "operations-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("275"),
+        Money::from("1.25 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    let projected = project_managed_trade_fill_report(
+        &broker_order_index,
+        &fill_projection,
+        TbankFillReport::new(
+            report,
+            TbankFillCommission::Reported(Money::from("1.25 RUB")),
+            TbankFillCommissionSource::OperationsCursor,
+        ),
+        Some(&sender),
+    )
+    .unwrap();
+
+    assert!(projected.is_none());
+    let event = receiver.try_recv().unwrap();
+    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) = event
+    else {
+        panic!("expected custom execution event");
+    };
+    assert!(matches!(
+        data.data
+            .as_any()
+            .downcast_ref::<crate::execution::events::TbankExecutionEvent>(),
+        Some(crate::execution::events::TbankExecutionEvent::FillCommission {
+            trade_id,
+            status: crate::execution::events::TbankFillCommissionStatus::Reported,
+            amount: Some(amount),
+            source: TbankFillCommissionSource::OperationsCursor,
+            ..
+        }) if trade_id == "synthetic-order-state-10" && amount == "1.25"
+    ));
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn partially_matched_operation_commission_allocates_the_published_residual() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-1",
+        Decimal::from(1),
+        Decimal::from(275),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "operations-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(2),
+        Price::from("275"),
+        Money::from("0.03 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    let projected = project_managed_trade_fill_report(
+        &broker_order_index,
+        &fill_projection,
+        TbankFillReport::new(
+            report,
+            TbankFillCommission::Reported(Money::from("0.03 RUB")),
+            TbankFillCommissionSource::OperationsCursor,
+        ),
+        Some(&sender),
+    )
+    .unwrap()
+    .expect("the unmatched operation quantity must remain a real fill");
+
+    assert_eq!(projected.last_qty.as_decimal(), Decimal::ONE);
+    assert_eq!(projected.commission, Money::from("0.01 RUB"));
+
+    let mut provenance = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) =
+            event
+        else {
+            panic!("expected custom execution event");
+        };
+        let Some(crate::execution::events::TbankExecutionEvent::FillCommission {
+            trade_id,
+            status,
+            amount: Some(amount),
+            source: TbankFillCommissionSource::OperationsCursor,
+            ..
+        }) = data
+            .data
+            .as_any()
+            .downcast_ref::<crate::execution::events::TbankExecutionEvent>()
+        else {
+            panic!("expected commission provenance");
+        };
+        provenance.push((
+            trade_id.to_string(),
+            *status,
+            amount.to_string().parse::<Decimal>().unwrap(),
+        ));
+    }
+    assert!(provenance.contains(&(
+        "synthetic-order-state-1".to_string(),
+        crate::execution::events::TbankFillCommissionStatus::Allocated,
+        Decimal::new(2, 2),
+    )));
+    assert!(provenance.contains(&(
+        "operations-trade-1".to_string(),
+        crate::execution::events::TbankFillCommissionStatus::Allocated,
+        Decimal::new(1, 2),
+    )));
+    assert_eq!(
+        provenance
+            .iter()
+            .map(|(_, _, amount)| *amount)
+            .sum::<Decimal>(),
+        Decimal::new(3, 2)
+    );
+}
+
+#[test]
+fn partially_matched_operation_commission_reserves_known_synthetic_fee() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let known_synthetic_commission = Money::from("0.01 RUB");
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-1",
+        Decimal::ONE,
+        Decimal::from(275),
+        Some(known_synthetic_commission),
+    )
+    .unwrap()
+    .unwrap();
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "operations-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(2),
+        Price::from("275"),
+        Money::from("0.03 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    let projected = project_managed_trade_fill_report(
+        &broker_order_index,
+        &fill_projection,
+        TbankFillReport::new(
+            report,
+            TbankFillCommission::Reported(Money::from("0.03 RUB")),
+            TbankFillCommissionSource::OperationsCursor,
+        ),
+        Some(&sender),
+    )
+    .unwrap()
+    .expect("the unmatched operation quantity must remain a real fill");
+
+    assert_eq!(projected.last_qty.as_decimal(), Decimal::ONE);
+    assert_eq!(projected.commission, Money::from("0.02 RUB"));
+    assert_eq!(
+        known_synthetic_commission.as_decimal() + projected.commission.as_decimal(),
+        Decimal::new(3, 2)
+    );
+
+    let event = receiver.try_recv().unwrap();
+    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) = event
+    else {
+        panic!("expected custom execution event");
+    };
+    assert!(matches!(
+        data.data
+            .as_any()
+            .downcast_ref::<crate::execution::events::TbankExecutionEvent>(),
+        Some(crate::execution::events::TbankExecutionEvent::FillCommission {
+            trade_id,
+            status: crate::execution::events::TbankFillCommissionStatus::Allocated,
+            amount: Some(amount),
+            source: TbankFillCommissionSource::OperationsCursor,
+            ..
+        }) if trade_id == "operations-trade-1" && amount == "0.02"
+    ));
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn synthetic_commission_correction_allocates_minor_units_without_negative_residual() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    for quantity in 1..=5 {
+        project_cumulative_order_fill(
+            &fill_projection,
+            "broker-order-1",
+            &format!("synthetic-order-state-{quantity}"),
+            Decimal::from(quantity),
+            Decimal::from(quantity * 275),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "operations-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(5),
+        Price::from("275"),
+        Money::from("0.03 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    assert!(
+        project_managed_trade_fill_report(
+            &broker_order_index,
+            &fill_projection,
+            TbankFillReport::new(
+                report,
+                TbankFillCommission::Reported(Money::from("0.03 RUB")),
+                TbankFillCommissionSource::OperationsCursor,
+            ),
+            Some(&sender),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let mut amounts = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) =
+            event
+        else {
+            panic!("expected custom execution event");
+        };
+        let Some(crate::execution::events::TbankExecutionEvent::FillCommission {
+            status: crate::execution::events::TbankFillCommissionStatus::Allocated,
+            amount: Some(amount),
+            ..
+        }) = data
+            .data
+            .as_any()
+            .downcast_ref::<crate::execution::events::TbankExecutionEvent>()
+        else {
+            panic!("expected allocated commission provenance");
+        };
+        amounts.push(amount.to_string().parse::<Decimal>().unwrap());
+    }
+
+    assert_eq!(amounts.len(), 5);
+    assert!(amounts.iter().all(|amount| *amount >= Decimal::ZERO));
+    assert_eq!(amounts.into_iter().sum::<Decimal>(), Decimal::new(3, 2));
+}
+
+#[test]
+fn fully_matched_unknown_trade_does_not_block_later_cumulative_commission() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("1.25 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "trades-stream-1".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("275"),
+        Money::from("0 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    assert!(
+        project_managed_trade_fill_report(
+            &broker_order_index,
+            &fill_projection,
+            TbankFillReport::new(
+                report,
+                TbankFillCommission::Unknown,
+                TbankFillCommissionSource::TradesStream,
+            ),
+            None,
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let next = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-20",
+        Decimal::from(20),
+        Decimal::from(5_500),
+        Some(Money::from("2.50 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(next.commission, TbankFillCommission::Allocated(Money::from("1.25 RUB")));
+}
+
+#[test]
+fn allocated_operation_commissions_resolve_later_cumulative_fill() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let allocated_commissions = super::allocate_operation_commission(
+        TbankFillCommission::Reported(Money::from("1 RUB")),
+        &[Decimal::ONE, Decimal::ONE],
+    )
+    .unwrap();
+
+    for (index, commission) in allocated_commissions.into_iter().enumerate() {
+        assert!(matches!(commission, TbankFillCommission::Allocated(_)));
+        let report = FillReport::new(
+            "TBANK-001".into(),
+            "SBER_TQBR.MOEX".parse().unwrap(),
+            "broker-order-1".into(),
+            format!("operation-trade-{index}").into(),
+            OrderSide::Buy,
+            Quantity::from(1),
+            Price::from("100"),
+            commission.amount().expect("allocated commission is known"),
+            LiquiditySide::NoLiquiditySide,
+            None,
+            None,
+            UnixNanos::from(index as u64 + 1),
+            UnixNanos::from(index as u64 + 1),
+            Some(UUID4::new()),
+        );
+        assert!(
+            project_managed_trade_fill_report(
+                &broker_order_index,
+                &fill_projection,
+                TbankFillReport::new(
+                    report,
+                    commission,
+                    TbankFillCommissionSource::OperationsCursor,
+                ),
+                Some(&sender),
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    let next = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-3",
+        Decimal::from(3),
+        Decimal::from(300),
+        Some(Money::from("1.50 RUB")),
+    )
+    .unwrap()
+    .expect("the later cumulative fill adds one lot");
+
+    assert_eq!(next.quantity, Quantity::from(1));
+    assert_eq!(
+        next.commission,
+        TbankFillCommission::Allocated(Money::from("0.50 RUB"))
+    );
+}
+
+#[test]
+fn reported_operation_commission_upgrades_exact_allocated_synthetic_fill() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let synthetic = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("1 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        synthetic.commission,
+        TbankFillCommission::Allocated(Money::from("1 RUB"))
+    );
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "operations-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(10),
+        Price::from("275"),
+        Money::from("1.25 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    assert!(
+        project_managed_trade_fill_report(
+            &broker_order_index,
+            &fill_projection,
+            TbankFillReport::new(
+                report,
+                TbankFillCommission::Reported(Money::from("1.25 RUB")),
+                TbankFillCommissionSource::OperationsCursor,
+            ),
+            Some(&sender),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let event = receiver.try_recv().unwrap();
+    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) = event
+    else {
+        panic!("expected custom execution event");
+    };
+    assert!(matches!(
+        data.data
+            .as_any()
+            .downcast_ref::<crate::execution::events::TbankExecutionEvent>(),
+        Some(crate::execution::events::TbankExecutionEvent::FillCommission {
+            trade_id,
+            status: crate::execution::events::TbankFillCommissionStatus::Reported,
+            amount: Some(amount),
+            source: TbankFillCommissionSource::OperationsCursor,
+            ..
+        }) if trade_id == "synthetic-order-state-10" && amount == "1.25"
+    ));
+    assert!(receiver.try_recv().is_err());
+
+    let next = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-20",
+        Decimal::from(20),
+        Decimal::from(5_500),
+        Some(Money::from("2 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        next.commission,
+        TbankFillCommission::Allocated(Money::from("0.75 RUB"))
+    );
+}
+
+#[test]
+fn split_operation_commissions_accumulate_on_one_synthetic_fill() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    let make_report = |trade_id: &str, quantity: u64, commission: &str| {
+        FillReport::new(
+            "TBANK-001".into(),
+            "SBER_TQBR.MOEX".parse().unwrap(),
+            "broker-order-1".into(),
+            trade_id.into(),
+            OrderSide::Buy,
+            Quantity::from(quantity),
+            Price::from("275"),
+            Money::from(commission),
+            LiquiditySide::NoLiquiditySide,
+            None,
+            None,
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+            Some(UUID4::new()),
+        )
+    };
+
+    for (index, (trade_id, quantity, commission)) in [
+        ("operations-trade-1", 6, "0.75 RUB"),
+        ("operations-trade-2", 4, "0.50 RUB"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            project_managed_trade_fill_report(
+                &broker_order_index,
+                &fill_projection,
+                TbankFillReport::new(
+                    make_report(trade_id, quantity, commission),
+                    TbankFillCommission::Reported(Money::from(commission)),
+                    TbankFillCommissionSource::OperationsCursor,
+                ),
+                Some(&sender),
+            )
+            .unwrap()
+            .is_none()
+        );
+        if index == 0 {
+            assert!(
+                receiver.try_recv().is_err(),
+                "partial synthetic-fill commission must stay internal"
+            );
+        }
+    }
+
+    let event = receiver.try_recv().unwrap();
+    let event_amount = |event| {
+        let nautilus_common::messages::DataEvent::Data(
+            nautilus_model::data::Data::Custom(data),
+        ) = event
+        else {
+            panic!("expected custom execution event");
+        };
+        let Some(crate::execution::events::TbankExecutionEvent::FillCommission {
+            trade_id,
+            status: crate::execution::events::TbankFillCommissionStatus::Reported,
+            amount: Some(amount),
+            source: TbankFillCommissionSource::OperationsCursor,
+            ..
+        }) = data
+            .data
+            .as_any()
+            .downcast_ref::<crate::execution::events::TbankExecutionEvent>()
+        else {
+            panic!("expected reported commission provenance");
+        };
+        (trade_id.to_string(), amount.to_string())
+    };
+
+    assert_eq!(
+        event_amount(event),
+        ("synthetic-order-state-10".to_string(), "1.25".to_string())
+    );
+    assert!(receiver.try_recv().is_err());
+}
+#[test]
+fn partially_matched_operation_commission_keeps_residual_unknown_for_later_snapshot() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "operations-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(2),
+        Price::from("275"),
+        Money::from("0.02 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    assert!(
+        project_managed_trade_fill_report(
+            &broker_order_index,
+            &fill_projection,
+            TbankFillReport::new(
+                report,
+                TbankFillCommission::Reported(Money::from("0.02 RUB")),
+                TbankFillCommissionSource::OperationsCursor,
+            ),
+            Some(&sender),
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(receiver.try_recv().is_err());
+
+    // The partial 2-lot match stays internal because the event has no coverage field.
+    // The next cumulative snapshot must not charge the unresolved remainder of the first fill
+    // to the new delta: the fee split between the eight unresolved lots and the new fill is
+    // still unknown, so the new fill stays fail-closed.
+    let next = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-12",
+        Decimal::from(12),
+        Decimal::from(3_300),
+        Some(Money::from("0.04 RUB")),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(next.quantity, Quantity::from(2));
+    assert_eq!(next.commission, TbankFillCommission::Unknown);
+}
+
+#[test]
+fn repeated_cumulative_snapshot_resolves_a_partially_matched_operation_commission() {
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+
+    let report = FillReport::new(
+        "TBANK-001".into(),
+        "SBER_TQBR.MOEX".parse().unwrap(),
+        "broker-order-1".into(),
+        "operations-trade-1".into(),
+        OrderSide::Buy,
+        Quantity::from(2),
+        Price::from("275"),
+        Money::from("0.02 RUB"),
+        LiquiditySide::NoLiquiditySide,
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+        Some(UUID4::new()),
+    );
+    assert!(
+        project_managed_trade_fill_report(
+            &broker_order_index,
+            &fill_projection,
+                TbankFillReport::new(
+                report,
+                TbankFillCommission::Reported(Money::from("0.02 RUB")),
+                    TbankFillCommissionSource::OperationsCursor,
+                ),
+                Some(&sender),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    // A repeated snapshot at the same quantity carries the full cumulative commission. The
+    // partially resolved synthetic fill is the sole unresolved entry, so the residual for its
+    // eight unresolved lots completes the record instead of being dropped.
+    let correction = project_cumulative_order_fill(
+        &fill_projection,
+        "broker-order-1",
+        "synthetic-order-state-10",
+        Decimal::from(10),
+        Decimal::from(2_750),
+        Some(Money::from("0.04 RUB")),
+    )
+    .unwrap()
+    .expect("the cumulative snapshot corrects the partially resolved fill");
+    assert!(correction.provenance_only);
+    assert_eq!(
+        correction.trade_id.as_deref(),
+        Some("synthetic-order-state-10")
+    );
+    assert_eq!(correction.quantity, Quantity::from(10));
+    assert_eq!(
+        correction.commission,
+        TbankFillCommission::Allocated(Money::from("0.04 RUB"))
+    );
+}
+
+
+
+#[tokio::test]
 async fn submit_reconciliation_partial_fill_bundles_status_and_fill_reports() {
     let service = MockOrdersService::default();
     *service.post_error.lock().unwrap() =
@@ -1355,6 +2814,7 @@ async fn submit_reconciliation_partial_fill_bundles_status_and_fill_reports() {
         allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
+    let _data_event_receiver = bind_test_data_event_sender(&client.runtime);
     let mut metadata = sber_metadata();
     metadata.instrument_uid = "sber-uid".to_string();
     metadata.lot = 10;
@@ -1796,6 +3256,7 @@ async fn submit_unresolved_reconciliation_keeps_unknown_pending() {
         allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
+    let _data_event_receiver = bind_test_data_event_sender(&client.runtime);
     seed_sber_metadata(&mut client);
     client.connect_for_queries().await.unwrap();
 

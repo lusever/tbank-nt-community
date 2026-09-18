@@ -66,6 +66,7 @@ pub(super) struct TbankBrokerOrderIndex {
     by_venue_order_id: HashMap<String, TbankBrokerOrderRoute>,
     stop_broker_order_ids: HashSet<String>,
     client_order_id_by_venue_order_id: HashMap<String, String>,
+    venue_order_id_by_trade_id: HashMap<String, String>,
     canonical_venue_order_id_by_alias: HashMap<String, String>,
     managed_context_by_client_order_id: HashMap<String, TbankManagedOrderContext>,
     pending_cancel_client_order_ids: HashSet<String>,
@@ -256,6 +257,20 @@ impl TbankBrokerOrderIndex {
                     .insert(venue_order_id.to_string());
             }
         }
+    }
+
+    pub(super) fn record_trade_order_mapping(&mut self, trade_id: &str, venue_order_id: &str) {
+        if trade_id.is_empty() || venue_order_id.is_empty() {
+            return;
+        }
+        self.venue_order_id_by_trade_id
+            .insert(trade_id.to_string(), venue_order_id.to_string());
+    }
+
+    pub(super) fn venue_order_id_for_trade_id(&self, trade_id: &str) -> Option<String> {
+        self.venue_order_id_by_trade_id
+            .get(trade_id)
+            .map(|venue_order_id| self.canonical_venue_order_id_or_self(venue_order_id))
     }
 
     pub(super) fn identity_for(

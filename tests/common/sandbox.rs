@@ -8,9 +8,9 @@ use futures_util::{FutureExt, StreamExt};
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    live::runner::replace_exec_event_sender,
+    live::runner::{replace_data_event_sender, replace_exec_event_sender},
     messages::{
-        ExecutionEvent,
+        DataEvent, ExecutionEvent,
         execution::{
             CancelOrder, ExecutionReport, GenerateFillReports, GenerateOrderStatusReport,
             GenerateOrderStatusReports, GeneratePositionStatusReports, SubmitOrder,
@@ -29,6 +29,8 @@ use nautilus_model::{
 };
 use prost_types::Timestamp;
 use rust_decimal::Decimal;
+#[cfg(feature = "sandbox-futures-tests")]
+use tbank_nt_community::grpc::generated::{InstrumentStatus, InstrumentsRequest};
 use tbank_nt_community::{
     common::{
         consts::{
@@ -469,6 +471,8 @@ async fn sandbox_execution_client_with_trading(
 ) -> Result<SandboxExecutionHarness> {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     replace_exec_event_sender(sender);
+    let (data_sender, data_events) = tokio::sync::mpsc::unbounded_channel();
+    replace_data_event_sender(data_sender);
     let cache = Rc::new(RefCell::new(Cache::default()));
     let mut client = TbankExecutionClient::new(
         execution_core(account_id, cache.clone()),
@@ -508,6 +512,7 @@ async fn sandbox_execution_client_with_trading(
     Ok(SandboxExecutionHarness {
         client,
         events: receiver,
+        _data_events: data_events,
         initial_account_state,
     })
 }
@@ -515,6 +520,7 @@ async fn sandbox_execution_client_with_trading(
 struct SandboxExecutionHarness {
     client: TbankExecutionClient,
     events: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    _data_events: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     initial_account_state: AccountState,
 }
 
@@ -945,6 +951,16 @@ fn recent_history_start() -> UnixNanos {
         current_test_unix_nanos()
             .as_u64()
             .saturating_sub(60 * 60 * 1_000_000_000),
+    )
+}
+
+fn sandbox_fill_history_start() -> UnixNanos {
+    // Keep unrelated older sandbox operations without query-local order identity out of this
+    // round-trip report assertion.
+    UnixNanos::from(
+        current_test_unix_nanos()
+            .as_u64()
+            .saturating_sub(30 * 1_000_000_000),
     )
 }
 
@@ -2039,7 +2055,7 @@ async fn sandbox_market_fill() -> Result<()> {
         let mut execution = sandbox_execution_client(&env, &account_id)
             .await
             .context("connect execution client for market-fill buy")?;
-        let history_start = recent_history_start();
+        let history_start = sandbox_fill_history_start();
         cleanup.arm();
         let buy = submit_market_order_with_client(
             &mut execution,
@@ -2236,7 +2252,7 @@ async fn sandbox_futures_market_fill() -> Result<()> {
         let mut execution = sandbox_execution_client(&env, &account_id)
             .await
             .context("connect execution client for futures market-fill buy")?;
-        let history_start = recent_history_start();
+        let history_start = sandbox_fill_history_start();
         cleanup.arm();
         let buy = submit_market_order_with_client(
             &mut execution,
@@ -2259,11 +2275,10 @@ async fn sandbox_futures_market_fill() -> Result<()> {
             instrument.lot
         );
 
-        let mut sell_execution = sandbox_execution_client(&env, &account_id)
-            .await
-            .context("connect execution client for futures market-fill cleanup sell")?;
+        // Keep buy, sell, and history reconciliation on one client: operation trades omit broker
+        // order IDs, so fill reports rely on the client's observed trade-to-order index.
         let sell = submit_market_order_with_client(
-            &mut sell_execution,
+            &mut execution,
             &adapter_instrument,
             OrderDirection::Sell,
         )
@@ -2283,11 +2298,8 @@ async fn sandbox_futures_market_fill() -> Result<()> {
         );
         cleanup.disarm();
 
-        let reports_execution = sandbox_execution_client(&env, &account_id)
-            .await
-            .context("connect execution client for futures fill-report recovery")?;
         let reports = wait_for_fill_reports(
-            &reports_execution.client,
+            &execution.client,
             buy.instrument_id,
             history_start,
             |reports| {
