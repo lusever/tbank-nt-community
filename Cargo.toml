@@ -45,7 +45,7 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 dotenvy = { version = "0.15", optional = true }
 futures-util = "0.3"
 http = "1"
-jiff = { version = "=0.2.35", default-features = false, features = ["std"] }
+jiff = { version = "=0.2.37", default-features = false, features = ["std"] }
 nautilus-common = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4", features = ["live", "tracing-bridge"] }
 nautilus-core = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4" }
 nautilus-execution = { version = "=0.63.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc4" }
