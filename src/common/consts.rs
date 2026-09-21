@@ -7,6 +7,13 @@ use ustr::Ustr;
 pub const LIVE_ENDPOINT: &str = "https://invest-public-api.tbank.ru:443";
 /// T-Bank Invest API sandbox gRPC endpoint.
 pub const SANDBOX_ENDPOINT: &str = "https://sandbox-invest-public-api.tbank.ru:443";
+/// Version of this adapter crate, captured from `Cargo.toml` at compile time.
+pub const TBANK_ADAPTER_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Git commit of the adapter sources used for this build.
+///
+/// Uncommitted working-tree changes are intentionally not included; they still build and this
+/// value remains the checked-out `HEAD`.
+pub const TBANK_ADAPTER_GIT_REVISION: &str = env!("TBANK_ADAPTER_GIT_REVISION");
 /// Environment variable containing a production API token.
 pub const LIVE_TOKEN_ENV: &str = "TBANK_INVEST_TOKEN";
 /// Environment variable containing a sandbox API token.

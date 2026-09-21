@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
@@ -9,6 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let revision = git_revision(&manifest_dir);
+    println!("cargo:rustc-env=TBANK_ADAPTER_GIT_REVISION={revision}");
     let proto_root = manifest_dir.join("proto");
     let contracts_dir = proto_root.join("tinkoff/public/invest/api/contract/v1");
 
@@ -47,4 +53,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(&protos, &[contracts_dir, proto_root])?;
 
     Ok(())
+}
+
+fn git_revision(manifest_dir: &Path) -> String {
+    if let Some(git_dir) = git_output(manifest_dir, &["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    }
+
+    if let Some(common_dir) = git_output(manifest_dir, &["rev-parse", "--git-common-dir"])
+        .map(|path| resolve_path(manifest_dir, &path))
+    {
+        println!(
+            "cargo:rerun-if-changed={}",
+            common_dir.join("packed-refs").display()
+        );
+
+        if let Some(reference) = git_output(manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
+            println!(
+                "cargo:rerun-if-changed={}",
+                common_dir.join(reference).display()
+            );
+        }
+    }
+
+    git_output(manifest_dir, &["rev-parse", "HEAD"])
+        .filter(|revision| {
+            !revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .unwrap_or_else(|| {
+            println!(
+                "cargo:warning=adapter Git revision unavailable; using 'unknown' as provenance"
+            );
+            "unknown".to_string()
+        })
+}
+
+fn git_output(directory: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_path(directory: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        directory.join(path)
+    }
 }
