@@ -87,7 +87,15 @@ calculated.
 
 ### T-Invest API 1.51 additions
 
-The vendored contracts are pinned to T-Invest API 1.51. Generated responses expose the broker's
+The vendored contracts are pinned to T-Invest API 1.51. The crate root exports
+`TBANK_ADAPTER_CRATE_VERSION` (captured from `Cargo.toml` at compile time) and
+`TBANK_ADAPTER_GIT_REVISION` (the adapter repository's `HEAD` captured by `build.rs`). Consumers
+must bind run artifacts to the adapter revision through `TBANK_ADAPTER_GIT_REVISION` and must not
+read the adapter's manifests or lockfile. Uncommitted working-tree changes are intentionally not
+encoded in the revision; they remain buildable and report the checked-out `HEAD`. If Git metadata
+or the `git` executable is unavailable, the revision is reported as `unknown` and the build emits
+a warning.
+Generated responses expose the broker's
 `price_currency` fields, bond `ratings`, market-value interest statistics, and the additional
 account types from the contract. Portfolio account-state events copy `total_var_margin` and
 `total_var_margin_settled` into `AccountState.info` as exact decimal strings under
