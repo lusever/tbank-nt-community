@@ -194,6 +194,42 @@ pub(super) fn position_report_matches_command(
         .is_none_or(|instrument_id| report.instrument_id == instrument_id)
 }
 
+pub(super) async fn submit_prepared_nautilus_order_list(
+    client: &mut TbankExecutionRuntime,
+    prepared: Vec<(PreparedNautilusOrder, ClientOrderId)>,
+    orders: Vec<nautilus_model::orders::OrderAny>,
+    emitter: ExecutionEventEmitter,
+    recovery_deadline: tokio::time::Instant,
+) {
+    let mut remaining = prepared.into_iter().zip(orders);
+    while let Some(((prepared, client_order_id), order)) = remaining.next() {
+        if submit_outcome_submit_budget(
+            client.config.request_timeout,
+            recovery_deadline,
+            tokio::time::Instant::now(),
+        )
+        .is_none()
+        {
+            let reason = "order-list submit deadline leaves no dispatch window";
+            client.remove_unresolved_broker_order_route(client_order_id.as_str());
+            emitter.emit_order_denied(&order, reason);
+            for ((_, client_order_id), order) in remaining {
+                client.remove_unresolved_broker_order_route(client_order_id.as_str());
+                emitter.emit_order_denied(&order, reason);
+            }
+            return;
+        }
+
+        emitter.emit_order_submitted(&order);
+        if let Err(error) =
+            submit_prepared_nautilus_order(client, prepared, emitter.clone(), recovery_deadline)
+                .await
+        {
+            tracing::error!(%error, %client_order_id, "failed to submit order-list leg to T-Bank");
+        }
+    }
+}
+
 pub(super) fn submit_commands_from_list(
     cmd: nautilus_common::messages::execution::SubmitOrderList,
 ) -> Vec<nautilus_common::messages::execution::SubmitOrder> {
@@ -527,8 +563,16 @@ impl ExecutionClient for TbankExecutionClient {
         let emitter = self.runtime.emitter.clone();
         let route_runtime = self.runtime.clone();
         let route_client_order_id = client_order_id;
+        let recovery_deadline =
+            tokio::time::Instant::now() + submit_outcome_recovery_budget(&self.runtime.config);
         self.runtime.spawn_mutating_command_task_with(async move {
-            let prepared = match prepare_nautilus_order(&mut client, cmd).await {
+            let prepared = match prepare_nautilus_order_before_deadline(
+                &mut client,
+                cmd,
+                recovery_deadline,
+            )
+            .await
+            {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     tracing::warn!(%error, %client_order_id, "denying Nautilus order during local preflight");
@@ -538,7 +582,13 @@ impl ExecutionClient for TbankExecutionClient {
                 }
             };
             emitter.emit_order_submitted(&order);
-            if let Err(error) = submit_prepared_nautilus_order(&mut client, prepared, emitter).await
+            if let Err(error) = submit_prepared_nautilus_order(
+                &mut client,
+                prepared,
+                emitter,
+                recovery_deadline,
+            )
+            .await
             {
                 tracing::error!(%error, "failed to submit Nautilus order to T-Bank");
             }
@@ -559,6 +609,10 @@ impl ExecutionClient for TbankExecutionClient {
         if !self.runtime.emitter.is_initialized() {
             anyhow::bail!("Nautilus execution event emitter is not initialized");
         }
+        // LiveNode tracks every leg from this command as in-flight. Keep preparation, dispatch,
+        // and recovery for the whole list inside the same window.
+        let recovery_deadline =
+            tokio::time::Instant::now() + submit_outcome_recovery_budget(&self.runtime.config);
         let commands = submit_commands_from_list(cmd);
         let mut orders = Vec::with_capacity(commands.len());
         for command in &commands {
@@ -589,58 +643,61 @@ impl ExecutionClient for TbankExecutionClient {
         };
         let submit_routes_for_cleanup = submit_routes.clone();
         let route_runtime = self.runtime.clone();
-        self.runtime.spawn_mutating_command_task_with(async move {
-            if commands
-                .iter()
-                .any(|command| {
-                    command
-                        .order_init
-                        .contingency_type
-                        .is_some()
-                })
-            {
-                let reason = "T-Bank adapter does not support contingent order lists";
-                for order in &orders {
-                    emitter.emit_order_denied(order, reason);
+        self.runtime.spawn_mutating_command_task_with(
+            async move {
+                if commands
+                    .iter()
+                    .any(|command| command.order_init.contingency_type.is_some())
+                {
+                    let reason = "T-Bank adapter does not support contingent order lists";
+                    for order in &orders {
+                        emitter.emit_order_denied(order, reason);
+                    }
+                    return;
                 }
-                return;
-            }
 
-            let mut prepared = Vec::with_capacity(commands.len());
-            for command in commands {
-                let client_order_id = command.client_order_id;
-                match prepare_nautilus_order(&mut client, command).await {
-                    Ok(order) => prepared.push((order, client_order_id)),
-                    Err(error) => {
-                        let reason = format!("order list preflight failed: {error}");
-                        for (client_order_id, _) in &submit_routes_for_cleanup {
-                            client.remove_unresolved_broker_order_route(client_order_id.as_str());
+                let mut prepared = Vec::with_capacity(commands.len());
+                for command in commands {
+                    let client_order_id = command.client_order_id;
+                    match prepare_nautilus_order_before_deadline(
+                        &mut client,
+                        command,
+                        recovery_deadline,
+                    )
+                    .await
+                    {
+                        Ok(order) => prepared.push((order, client_order_id)),
+                        Err(error) => {
+                            let reason = format!("order list preflight failed: {error}");
+                            for (client_order_id, _) in &submit_routes_for_cleanup {
+                                client
+                                    .remove_unresolved_broker_order_route(client_order_id.as_str());
+                            }
+                            for order in &orders {
+                                emitter.emit_order_denied(order, &reason);
+                            }
+                            return;
                         }
-                        for order in &orders {
-                            emitter.emit_order_denied(order, &reason);
-                        }
-                        return;
                     }
                 }
-            }
 
-            for ((prepared, client_order_id), order) in
-                prepared.into_iter().zip(orders)
-            {
-                emitter.emit_order_submitted(&order);
-                if let Err(error) =
-                    submit_prepared_nautilus_order(&mut client, prepared, emitter.clone()).await
-                {
-                    tracing::error!(%error, %client_order_id, "failed to submit order-list leg to T-Bank");
+                submit_prepared_nautilus_order_list(
+                    &mut client,
+                    prepared,
+                    orders,
+                    emitter,
+                    recovery_deadline,
+                )
+                .await;
+            },
+            move || {
+                // Register every list-leg route while the mutating task is already
+                // visible, before its first metadata preflight await.
+                for (client_order_id, order_type) in submit_routes {
+                    route_runtime.prepare_submit_route(&client_order_id, order_type);
                 }
-            }
-        }, move || {
-            // Register every list-leg route while the mutating task is already
-            // visible, before its first metadata preflight await.
-            for (client_order_id, order_type) in submit_routes {
-                route_runtime.prepare_submit_route(&client_order_id, order_type);
-            }
-        })?;
+            },
+        )?;
         Ok(())
     }
 

@@ -1,5 +1,8 @@
 #![allow(deprecated)]
-#![cfg_attr(feature = "sandbox-futures-tests", allow(dead_code, unused_imports))]
+#![cfg_attr(
+    any(feature = "sandbox-futures-tests", feature = "sandbox-repair-tests"),
+    allow(dead_code, unused_imports)
+)]
 
 use std::{cell::RefCell, env, future::Future, panic::AssertUnwindSafe, rc::Rc, time::Duration};
 
@@ -40,7 +43,9 @@ use tbank_nt_community::{
         decimal::{decimal_to_money_value, money_value_to_decimal, quotation_to_decimal},
     },
     config::{TbankEnvironment, TbankExecutionClientConfig},
-    execution::{TbankExecutionClient, tbank_account_id},
+    execution::{
+        TbankExecutionClient, TbankPendingSubmitStage, TbankUnresolvedSubmit, tbank_account_id,
+    },
     grpc::{
         clients::TbankGrpcClients,
         connect_channel,
@@ -70,6 +75,11 @@ use tbank_nt_community::common::decimal::futures_currency_to_points_without_tick
 const SANDBOX_ACCOUNT_ID_ENV: &str = "TBANK_SANDBOX_ACCOUNT_ID";
 const SANDBOX_PAY_IN_RUB_ENV: &str = "TBANK_SANDBOX_PAY_IN_RUB";
 const SANDBOX_TEST_INSTRUMENT_ENV: &str = "TBANK_SANDBOX_TEST_INSTRUMENT";
+#[cfg(all(
+    feature = "sandbox-repair-tests",
+    not(feature = "sandbox-futures-tests")
+))]
+const SANDBOX_REPAIR_EXPECTED_RESIDUAL_ENV: &str = "TBANK_SANDBOX_REPAIR_EXPECTED_RESIDUAL";
 #[cfg(feature = "sandbox-futures-tests")]
 const SANDBOX_FUTURES_INSTRUMENT_ENV: &str = "TBANK_SANDBOX_FUTURES_INSTRUMENT";
 const DEFAULT_TEST_INSTRUMENT: &str = "SBER_TQBR.MOEX";
@@ -178,19 +188,30 @@ impl InstrumentSpec {
 
     #[cfg(feature = "sandbox-futures-tests")]
     fn from_futures_env() -> Result<Self> {
-        let env_value = env::var(SANDBOX_FUTURES_INSTRUMENT_ENV)
+        let Some(env_value) = env::var(SANDBOX_FUTURES_INSTRUMENT_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .with_context(|| {
-                format!(
-                    "{SANDBOX_FUTURES_INSTRUMENT_ENV} is required for MOEX futures sandbox acceptance"
-                )
-            })?;
-        let (ticker, class_code) = parse_futures_ticker_class(&env_value)?;
+            .map(|value| value.trim().to_string())
+        else {
+            bail!(
+                "{SANDBOX_FUTURES_INSTRUMENT_ENV} is required as the futures search instrument (for example: Si)"
+            );
+        };
+        ensure!(
+            env_value
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic())
+                && env_value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()),
+            "{SANDBOX_FUTURES_INSTRUMENT_ENV} must be a base ticker such as Si, got {env_value}"
+        );
+        let ticker = env_value.clone();
         Ok(Self {
             env_value,
             ticker,
-            class_code,
+            class_code: SPBFUT_CLASS_CODE.to_string(),
         })
     }
 }
@@ -229,16 +250,6 @@ fn parse_ticker_class(value: &str) -> Result<(String, String)> {
     Ok((ticker, class_code))
 }
 
-#[cfg(feature = "sandbox-futures-tests")]
-fn parse_futures_ticker_class(value: &str) -> Result<(String, String)> {
-    let (ticker, class_code) = split_ticker_class(value)?;
-    ensure!(
-        class_code.eq_ignore_ascii_case(SPBFUT_CLASS_CODE),
-        "MOEX futures sandbox acceptance requires class {SPBFUT_CLASS_CODE}; got {value}"
-    );
-    Ok((ticker, class_code))
-}
-
 fn split_ticker_class(value: &str) -> Result<(String, String)> {
     let without_suffix = value.strip_suffix(".MOEX").unwrap_or(value);
     let mut parts = without_suffix.split('_');
@@ -264,6 +275,7 @@ async fn connect_sandbox_channel() -> Result<Channel> {
 }
 
 async fn sandbox_context() -> Result<(SandboxEnv, Clients)> {
+    init_sandbox_tracing();
     let env = SandboxEnv::from_env()?;
     let clients = sandbox_clients(&env).await?;
     Ok((env, clients))
@@ -272,18 +284,141 @@ async fn sandbox_context() -> Result<(SandboxEnv, Clients)> {
 #[cfg(feature = "sandbox-futures-tests")]
 async fn sandbox_futures_context() -> Result<(SandboxEnv, Clients)> {
     init_sandbox_tracing();
-    let env = SandboxEnv::from_futures_env()?;
-    let clients = sandbox_clients(&env).await?;
+    let mut env = SandboxEnv::from_futures_env()?;
+    let mut clients = sandbox_clients(&env).await?;
+    let search_ticker = env.instrument.ticker.clone();
+    let instrument = discover_active_future(&env, &mut clients, &search_ticker).await?;
+    eprintln!(
+        "selected futures sandbox instrument: query={search_ticker} instrument={}",
+        instrument.env_value
+    );
+    env.instrument = instrument;
     Ok((env, clients))
 }
 
 #[cfg(feature = "sandbox-futures-tests")]
+fn select_active_future<'a>(
+    futures: &'a [generated::Future],
+    search_ticker: &str,
+    now_unix_seconds: i64,
+) -> Option<&'a generated::Future> {
+    futures
+        .iter()
+        .filter(|future| {
+            matches_futures_search_ticker(search_ticker, &future.ticker)
+                && future.class_code.eq_ignore_ascii_case(SPBFUT_CLASS_CODE)
+                && future.currency.eq_ignore_ascii_case(RUB_CURRENCY)
+                && future
+                    .last_trade_date
+                    .as_ref()
+                    .is_some_and(|date| date.seconds > now_unix_seconds)
+        })
+        .min_by_key(|future| {
+            future
+                .last_trade_date
+                .as_ref()
+                .map(|date| (date.seconds, date.nanos))
+        })
+}
+
+#[cfg(feature = "sandbox-futures-tests")]
+fn matches_futures_search_ticker(search_ticker: &str, ticker: &str) -> bool {
+    let ticker = ticker.to_ascii_uppercase();
+    let search_ticker = search_ticker.to_ascii_uppercase();
+    if ticker == search_ticker {
+        return true;
+    }
+
+    let Some(suffix) = ticker.strip_prefix(&search_ticker) else {
+        return false;
+    };
+
+    let mut short_suffix = suffix.chars();
+    let is_short_contract = matches!(
+        short_suffix.next(),
+        Some('F' | 'G' | 'H' | 'J' | 'K' | 'M' | 'N' | 'Q' | 'U' | 'V' | 'X' | 'Z')
+    ) && short_suffix
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+        && short_suffix.all(|character| character.is_ascii_digit());
+
+    let is_dated_contract = suffix
+        .strip_prefix('-')
+        .and_then(|expiry| expiry.split_once('.'))
+        .is_some_and(|(month, year)| {
+            month
+                .parse::<u8>()
+                .is_ok_and(|month| (1..=12).contains(&month))
+                && (year.len() == 2 || year.len() == 4)
+                && year.chars().all(|character| character.is_ascii_digit())
+        });
+
+    is_short_contract || is_dated_contract
+}
+
+#[cfg(feature = "sandbox-futures-tests")]
+async fn discover_active_future(
+    env: &SandboxEnv,
+    clients: &mut Clients,
+    search_ticker: &str,
+) -> Result<InstrumentSpec> {
+    let now_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs()
+        .try_into()
+        .context("current Unix timestamp does not fit in i64")?;
+    let response = call(
+        "InstrumentsService.Futures",
+        env,
+        clients.instruments.futures(with_timeout(
+            InstrumentsRequest {
+                instrument_status: Some(InstrumentStatus::All as i32),
+                ..InstrumentsRequest::default()
+            },
+            DEFAULT_REQUEST_TIMEOUT,
+        )),
+    )
+    .await?;
+    let matching_count = response
+        .instruments
+        .iter()
+        .filter(|future| {
+            matches_futures_search_ticker(search_ticker, &future.ticker)
+                && future.class_code.eq_ignore_ascii_case(SPBFUT_CLASS_CODE)
+                && future.currency.eq_ignore_ascii_case(RUB_CURRENCY)
+        })
+        .count();
+    let future = select_active_future(&response.instruments, search_ticker, now_unix_seconds)
+        .with_context(|| {
+            format!(
+                "T-Bank returned no unexpired RUB futures matching {search_ticker} in SPBFUT: catalogue_size={} matching_contracts={matching_count}",
+                response.instruments.len()
+            )
+        })?;
+    let ticker = future.ticker.clone();
+    let class_code = future.class_code.clone();
+    Ok(InstrumentSpec {
+        env_value: format!("{ticker}_{class_code}.MOEX (auto-selected)"),
+        ticker,
+        class_code,
+    })
+}
+
+/// Installs one test-wide subscriber so a failing case shows the real adapter diagnostics.
+///
+/// Without it the adapter's RPC failures and reconciliation warnings are dropped, leaving only
+/// the harness's own assertion message. `RUST_LOG` overrides the default filter.
 fn init_sandbox_tracing() {
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INIT.get_or_init(|| {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("tbank.rpc=warn"))
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("tbank_nt_community=warn,tbank.rpc=warn")
+                }),
+            )
             .try_init();
     });
 }
@@ -341,6 +476,16 @@ async fn load_instrument(env: &SandboxEnv, clients: &mut Clients) -> Result<Inst
             future.currency
         );
         let mut metadata = TbankInstrumentMetadata::from_future(&future)?;
+        ensure!(
+            metadata
+                .initial_margin_rate_on_buy
+                .is_some_and(|rate| rate > Decimal::ZERO)
+                && metadata
+                    .initial_margin_rate_on_sell
+                    .is_some_and(|rate| rate > Decimal::ZERO),
+            "FutureBy returned no positive initial-margin risk rates for {}",
+            metadata.instrument_id
+        );
         let margin = call(
             "InstrumentsService.GetFuturesMargin",
             env,
@@ -469,6 +614,7 @@ async fn sandbox_execution_client_with_trading(
     account_id: &str,
     enable_trading: bool,
 ) -> Result<SandboxExecutionHarness> {
+    init_sandbox_tracing();
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     replace_exec_event_sender(sender);
     let (data_sender, data_events) = tokio::sync::mpsc::unbounded_channel();
@@ -525,7 +671,7 @@ struct SandboxExecutionHarness {
 }
 
 impl SandboxExecutionHarness {
-    async fn submit(&mut self, command: SubmitOrder) -> Result<OrderStatusReport> {
+    async fn submit(&mut self, command: SubmitOrder) -> Result<NautilusSubmitOutcome> {
         submit_through_nautilus(&self.client, &mut self.events, command).await
     }
 
@@ -541,6 +687,7 @@ fn submit_command(
     time_in_force: TimeInForce,
     price: Option<Decimal>,
     trigger_price: Option<Decimal>,
+    lots: i64,
 ) -> Result<SubmitOrder> {
     let ts_init = UnixNanos::from(
         std::time::SystemTime::now()
@@ -558,7 +705,9 @@ fn submit_command(
         .instrument_id(instrument_id)
         .client_order_id(client_order_id)
         .side(side)
-        .quantity(Quantity::from_decimal(Decimal::from(instrument.lot))?)
+        .quantity(Quantity::from_decimal(
+            Decimal::from(instrument.lot) * Decimal::from(lots),
+        )?)
         .time_in_force(time_in_force)
         .ts_init(ts_init);
     if let Some(price) = price {
@@ -621,11 +770,82 @@ where
     }
 }
 
+/// Contract-correct result of submitting an order through the Nautilus client.
+///
+/// An ambiguous submit must never emit a terminal event, so the adapter settles it as unresolved
+/// or definitively absent and keeps the request identity for reconciliation. The harness treats
+/// that as a legitimate outcome instead of waiting for an event the contract forbids. A transient
+/// stage is not an outcome: it only means the adapter is still reconciling. A venue rejection is a
+/// definitive answer and is surfaced with the venue's own reason.
+enum NautilusSubmitOutcome {
+    Report(Box<OrderStatusReport>),
+    Settled(TbankUnresolvedSubmit),
+    Rejected(String),
+}
+
+impl NautilusSubmitOutcome {
+    fn expect_report(self, context: &str) -> Result<OrderStatusReport> {
+        match self {
+            Self::Report(report) => Ok(*report),
+            Self::Settled(pending) => bail!(
+                "{context}: T-Bank submit settled without a broker report (stage={:?}, \
+                 attempts={}) and the adapter keeps the request identity for reconciliation",
+                pending.stage,
+                pending.attempts
+            ),
+            Self::Rejected(reason) => bail!("{context}: Nautilus submit was rejected: {reason}"),
+        }
+    }
+}
+
+/// Fails a mutating sandbox case if the submit has no broker-confirmed outcome.
+fn settled_submit_error(context: &str, pending: &TbankUnresolvedSubmit) -> anyhow::Error {
+    let outcome_detail = match pending.stage {
+        TbankPendingSubmitStage::Unresolved => "the broker may still have an active order",
+        TbankPendingSubmitStage::DefinitivelyAbsent => {
+            "the broker guarantees this request cannot later resolve to an accepted order"
+        }
+        _ => "the submit has no terminal broker report",
+    };
+    anyhow!(
+        "{context}: T-Bank submit settled without a broker report (client_order_id={}, \
+         instrument_id={}, stage={:?}, attempts={}); {outcome_detail}",
+        pending.client_order_id,
+        pending.instrument_id,
+        pending.stage,
+        pending.attempts
+    )
+}
+
+/// Classifies an execution event for `client_order_id` as a terminal submit outcome.
+///
+/// A venue rejection can arrive after `Submitted`, so the wait must keep watching for it: it is a
+/// real outcome, and reporting it as a timeout would hide the venue's reason.
+fn submit_outcome_from_event(
+    event: ExecutionEvent,
+    client_order_id: ClientOrderId,
+) -> Option<NautilusSubmitOutcome> {
+    match event {
+        ExecutionEvent::Report(ExecutionReport::Order(report))
+        | ExecutionEvent::Report(ExecutionReport::OrderWithFills(report, _))
+            if report.client_order_id == Some(client_order_id) =>
+        {
+            Some(NautilusSubmitOutcome::Report(report))
+        }
+        ExecutionEvent::Order(OrderEventAny::Rejected(rejected))
+            if rejected.client_order_id == client_order_id =>
+        {
+            Some(NautilusSubmitOutcome::Rejected(rejected.reason.to_string()))
+        }
+        _ => None,
+    }
+}
+
 async fn submit_through_nautilus(
     client: &TbankExecutionClient,
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     command: SubmitOrder,
-) -> Result<OrderStatusReport> {
+) -> Result<NautilusSubmitOutcome> {
     let client_order_id = command.client_order_id;
     ExecutionClient::submit_order(client, command)?;
     let submitted = recv_execution_event_matching(receiver, "Nautilus submit outcome", |event| {
@@ -644,21 +864,42 @@ async fn submit_through_nautilus(
         bail!("Nautilus submit was rejected: {}", event.reason);
     }
 
-    let report =
-        recv_execution_event_matching(receiver, "matching Nautilus order report", |event| {
-            match event {
-                ExecutionEvent::Report(ExecutionReport::Order(report))
-                | ExecutionEvent::Report(ExecutionReport::OrderWithFills(report, _)) => {
-                    report.client_order_id == Some(client_order_id)
-                }
-                _ => false,
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        // A queued broker report wins over the snapshot: it resolves the same submit and clears the
+        // adapter's unresolved stage.
+        while let Ok(event) = receiver.try_recv() {
+            if let Some(outcome) = submit_outcome_from_event(event, client_order_id) {
+                return Ok(outcome);
             }
-        })
-        .await?;
-    match report {
-        ExecutionEvent::Report(ExecutionReport::Order(report))
-        | ExecutionEvent::Report(ExecutionReport::OrderWithFills(report, _)) => Ok(*report),
-        _ => unreachable!("predicate only accepts matching order reports"),
+        }
+        // Only a settled stage is an outcome: `Submitted`/`Unknown` still mean the adapter is
+        // reconciling, so keep waiting for the broker report or the terminal transition.
+        if let Some(pending) = client.unresolved_submits().into_iter().find(|pending| {
+            pending.client_order_id == client_order_id.as_str()
+                && matches!(
+                    pending.stage,
+                    TbankPendingSubmitStage::Unresolved
+                        | TbankPendingSubmitStage::DefinitivelyAbsent
+                )
+        }) {
+            return Ok(NautilusSubmitOutcome::Settled(pending));
+        }
+        tokio::select! {
+            event = receiver.recv() => {
+                let event = event.context("Nautilus execution event channel closed")?;
+                if let Some(outcome) = submit_outcome_from_event(event, client_order_id) {
+                    return Ok(outcome);
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                bail!(
+                    "timed out waiting for a Nautilus order report, a venue rejection, or an \
+                     unresolved submit transition for {client_order_id}"
+                );
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
     }
 }
 
@@ -1294,6 +1535,16 @@ impl CleanupGuard {
     }
 }
 
+/// How long the market-fill cleanup waits for an armed submit to show up as a position.
+///
+/// Matches the harness submit deadline: the adapter settles an ambiguous submit inside the node's
+/// in-flight window, so a position it caused is expected to appear within the same order of time.
+/// The loop only spins when the position did not move, which is the case the wait exists for; a
+/// full window costs up to 60 position reads against the venue quota.
+const MARKET_FILL_CLEANUP_SETTLE_WINDOW: Duration = Duration::from_secs(30);
+
+const MARKET_FILL_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 struct MarketFillCleanupGuard {
     env: SandboxEnv,
     clients: Clients,
@@ -1346,20 +1597,41 @@ impl MarketFillCleanupGuard {
         }
         let instrument = position.instrument.clone();
         let instrument_uid = instrument.instrument_uid.clone();
-        let lot = instrument.lot;
+        let lot = i64::from(instrument.lot);
         let baseline_quantity = position.baseline_quantity;
-        let current =
+        // A submit left ambiguous can be applied by the venue after the client gave up on it, so a
+        // single immediate read would conclude "nothing to clean" and leave the position behind.
+        let deadline = tokio::time::Instant::now() + MARKET_FILL_CLEANUP_SETTLE_WINDOW;
+        let mut current =
             sandbox_position_quantity(&self.env, &mut self.clients, &self.account_id, &instrument)
                 .await?;
+        while current <= baseline_quantity && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(MARKET_FILL_CLEANUP_POLL_INTERVAL).await;
+            current = sandbox_position_quantity(
+                &self.env,
+                &mut self.clients,
+                &self.account_id,
+                &instrument,
+            )
+            .await?;
+        }
         if current <= baseline_quantity {
             return Ok(());
         }
 
+        // Sell the observed delta, not one lot: a partial venue application would otherwise leave
+        // an oversold position behind.
+        let delta = current - baseline_quantity;
+        ensure!(
+            lot > 0 && delta % lot == 0,
+            "market-fill cleanup cannot sell {delta} share(s) in lots of {lot}: baseline={baseline_quantity} current={current} instrument_uid={instrument_uid}"
+        );
         let sell = post_market_order(
             &self.env,
             &self.account_id,
             &instrument,
             OrderDirection::Sell,
+            delta / lot,
         )
         .await?;
         ensure!(
@@ -1585,18 +1857,20 @@ async fn post_market_order(
     account_id: &str,
     instrument: &InstrumentMeta,
     direction: OrderDirection,
+    lots: i64,
 ) -> Result<OrderStatusReport> {
     let metadata = adapter_instrument(instrument)?;
     let mut execution = sandbox_execution_client(env, account_id)
         .await
         .context("connect execution client for sandbox market order")?;
-    submit_market_order_with_client(&mut execution, &metadata, direction).await
+    submit_market_order_with_client(&mut execution, &metadata, direction, lots).await
 }
 
 async fn submit_market_order_with_client(
     execution: &mut SandboxExecutionHarness,
     instrument: &TbankInstrumentMetadata,
     direction: OrderDirection,
+    lots: i64,
 ) -> Result<OrderStatusReport> {
     let side = match direction {
         OrderDirection::Buy => OrderSide::Buy,
@@ -1611,8 +1885,10 @@ async fn submit_market_order_with_client(
             TimeInForce::Ioc,
             None,
             None,
+            lots,
         )?)
-        .await
+        .await?
+        .expect_report("submit sandbox market order through Nautilus")
 }
 
 #[cfg(all(feature = "sandbox-tests", not(feature = "sandbox-futures-tests")))]
@@ -1906,15 +2182,18 @@ async fn sandbox_order_lifecycle() -> Result<()> {
             .await
             .context("connect initial execution client for limit order")?;
         let last_price = last_price(&env, &mut clients, &instrument.instrument_uid).await?;
+        // Just below the market: a buy far below it is refused with broker code 30099 (price
+        // outside the instrument's limits), while a buy at or above it would trade instead of
+        // resting in the book.
         let buy_limit_price = floor_to_tick(
-            last_price * Decimal::new(50, 2),
+            last_price * Decimal::new(99, 2),
             instrument.min_price_increment,
         )?;
         let required_cash = buy_limit_price * Decimal::from(instrument.lot);
         ensure_rub_balance(&env, &mut clients, &account_id, required_cash).await?;
         let history_start = recent_history_start();
 
-        let order = execution
+        let order = match execution
             .submit(submit_command(
                 &adapter_instrument,
                 OrderSide::Buy,
@@ -1922,8 +2201,21 @@ async fn sandbox_order_lifecycle() -> Result<()> {
                 TimeInForce::Day,
                 Some(buy_limit_price),
                 None,
+                1,
             )?)
-            .await?;
+            .await?
+        {
+            NautilusSubmitOutcome::Report(report) => *report,
+            NautilusSubmitOutcome::Settled(pending) => {
+                return Err(settled_submit_error(
+                    "sandbox order-lifecycle limit order",
+                    &pending,
+                ));
+            }
+            NautilusSubmitOutcome::Rejected(reason) => {
+                bail!("sandbox order-lifecycle limit order was rejected by the venue: {reason}")
+            }
+        };
         cleanup.track_order(order.venue_order_id.to_string());
         ensure!(
             matches!(
@@ -1972,7 +2264,7 @@ async fn sandbox_order_lifecycle() -> Result<()> {
             last_price * Decimal::from(2),
             instrument.min_price_increment,
         )?;
-        let stop_order = execution
+        let stop_order = match execution
             .submit(submit_command(
                 &adapter_instrument,
                 OrderSide::Buy,
@@ -1980,8 +2272,21 @@ async fn sandbox_order_lifecycle() -> Result<()> {
                 TimeInForce::Gtc,
                 None,
                 Some(stop_price),
+                1,
             )?)
-            .await?;
+            .await?
+        {
+            NautilusSubmitOutcome::Report(report) => *report,
+            NautilusSubmitOutcome::Settled(pending) => {
+                return Err(settled_submit_error(
+                    "sandbox order-lifecycle stop order",
+                    &pending,
+                ));
+            }
+            NautilusSubmitOutcome::Rejected(reason) => {
+                bail!("sandbox order-lifecycle stop order was rejected by the venue: {reason}")
+            }
+        };
         cleanup.track_stop_order(stop_order.venue_order_id.to_string());
         let stopped = cancel_through_nautilus(&execution.client, &stop_order).await?;
         ensure!(stopped.order_status == OrderStatus::Canceled);
@@ -2061,6 +2366,7 @@ async fn sandbox_market_fill() -> Result<()> {
             &mut execution,
             &adapter_instrument,
             OrderDirection::Buy,
+            1,
         )
         .await?;
         ensure!(
@@ -2078,13 +2384,14 @@ async fn sandbox_market_fill() -> Result<()> {
         instrument.lot
     );
 
-    let mut sell_execution = sandbox_execution_client(&env, &account_id)
-        .await
-        .context("connect execution client for market-fill cleanup sell")?;
+    // Buy and sell go through one client on purpose: a fill report needs a venue order id, and the
+    // adapter resolves that id only for trades the querying client observed itself. A separate
+    // reporting client skips every operation it never saw, so the assertion below could not pass.
     let sell = submit_market_order_with_client(
-        &mut sell_execution,
+        &mut execution,
         &adapter_instrument,
         OrderDirection::Sell,
+        1,
     )
     .await?;
     ensure!(
@@ -2102,11 +2409,8 @@ async fn sandbox_market_fill() -> Result<()> {
     );
     cleanup.disarm();
 
-    let reports_execution = sandbox_execution_client(&env, &account_id)
-        .await
-        .context("connect execution client for market-fill report recovery")?;
     wait_for_fill_reports(
-        &reports_execution.client,
+        &execution.client,
         buy.instrument_id,
         history_start,
         |reports| {
@@ -2150,6 +2454,87 @@ async fn sandbox_market_fill() -> Result<()> {
     finish_with_cleanup(body, cleanup_result).await
 }
 
+/// Reconciles an explicitly confirmed position left behind by an interrupted market-fill run.
+///
+/// The venue can apply an ambiguous submit after the client gave up on it, so an aborted run can
+/// leave a residual no cleanup guard ever saw. This sells the observed residual back to flat and
+/// reports both quantities. Run it only through the separate `sandbox-repair` target and provide
+/// `TBANK_SANDBOX_REPAIR_EXPECTED_RESIDUAL` with the exact positive quantity expected from the
+/// interrupted test. The observed account position must match before any order is submitted.
+#[cfg(all(
+    feature = "sandbox-repair-tests",
+    not(feature = "sandbox-futures-tests")
+))]
+#[tokio::test]
+#[ignore]
+async fn sandbox_reconcile_residual_position() -> Result<()> {
+    require_sandbox_preflight().await?;
+    let (env, mut clients) = sandbox_context().await?;
+    let account_id = env
+        .account_id
+        .clone()
+        .context("account id required for residual reconciliation")?;
+    require_existing_sandbox_account(&env, &mut clients, &account_id).await?;
+
+    let instrument = load_instrument(&env, &mut clients).await?;
+    let residual = sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
+    if residual == 0 {
+        println!("no residual position for {}", instrument.instrument_uid);
+        return Ok(());
+    }
+    let expected_residual = env::var(SANDBOX_REPAIR_EXPECTED_RESIDUAL_ENV)
+        .context("expected residual quantity is required for the explicit sandbox repair target")?
+        .parse::<i64>()
+        .context("expected residual quantity must be an integer")?;
+    ensure!(
+        expected_residual > 0 && residual == expected_residual,
+        "refusing to repair an unexpected position: expected={expected_residual} actual={residual} instrument_uid={}",
+        instrument.instrument_uid
+    );
+    let lot = i64::from(instrument.lot);
+    ensure!(
+        residual > 0 && residual % lot == 0,
+        "residual position is not a whole number of lots to sell: residual={residual} lot={lot} instrument_uid={}",
+        instrument.instrument_uid
+    );
+
+    let mut execution = sandbox_execution_client(&env, &account_id)
+        .await
+        .context("connect execution client for residual reconciliation")?;
+    let current_residual =
+        sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
+    ensure!(
+        current_residual == expected_residual,
+        "refusing to repair a position that changed during preflight: expected={expected_residual} actual={current_residual} instrument_uid={}",
+        instrument.instrument_uid
+    );
+    let sell = submit_market_order_with_client(
+        &mut execution,
+        &adapter_instrument(&instrument)?,
+        OrderDirection::Sell,
+        residual / lot,
+    )
+    .await?;
+    ensure!(
+        sell.order_status == OrderStatus::Filled,
+        "residual reconciliation sell did not fill: status={} residual={residual} instrument_uid={}",
+        sell.order_status,
+        instrument.instrument_uid
+    );
+
+    let after = sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
+    println!(
+        "reconciled {}: residual {residual} -> {after}",
+        instrument.instrument_uid
+    );
+    ensure!(
+        after == 0,
+        "residual reconciliation left a position behind: before={residual} after={after} instrument_uid={}",
+        instrument.instrument_uid
+    );
+    Ok(())
+}
+
 #[cfg(all(feature = "sandbox-futures-tests", not(feature = "sandbox-tests")))]
 #[tokio::test]
 #[ignore]
@@ -2168,13 +2553,27 @@ async fn sandbox_futures_readonly() -> Result<()> {
     );
     let position_quantity =
         sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
+    let active_orders = call(
+        "SandboxService.GetSandboxOrders",
+        &env,
+        clients.sandbox.get_sandbox_orders(GetOrdersRequest {
+            account_id: account_id.clone(),
+            advanced_filters: None,
+        }),
+    )
+    .await?;
+    let instrument_order_count = active_orders
+        .orders
+        .iter()
+        .filter(|order| order.instrument_uid == instrument.instrument_uid)
+        .count();
     let active_stops = call(
         "SandboxService.GetSandboxStopOrders",
         &env,
         clients
             .sandbox
             .get_sandbox_stop_orders(GetStopOrdersRequest {
-                account_id,
+                account_id: account_id.clone(),
                 status: StopOrderStatusOption::StopOrderStatusActive as i32,
                 from: None,
                 to: None,
@@ -2188,16 +2587,30 @@ async fn sandbox_futures_readonly() -> Result<()> {
         .count();
 
     eprintln!(
-        "sandbox futures residual state: instrument_position={position_quantity} active_stop_orders={instrument_stop_count}"
+        "sandbox futures residual state: instrument={} position={position_quantity} active_orders={instrument_order_count} active_stop_orders={instrument_stop_count}",
+        instrument.ticker
     );
     ensure!(
         position_quantity == 0,
         "futures read-only probe found residual instrument position: quantity={position_quantity}"
     );
     ensure!(
+        instrument_order_count == 0,
+        "futures read-only probe found active instrument orders: count={instrument_order_count}"
+    );
+    ensure!(
         instrument_stop_count == 0,
         "futures read-only probe found active instrument stop orders: count={instrument_stop_count}"
     );
+    let mut execution = sandbox_execution_client_with_trading(&env, &account_id, false)
+        .await
+        .context("connect read-only futures execution client")?;
+    ensure!(
+        execution.initial_account_state.account_id
+            == ExecutionClient::account_id(&execution.client),
+        "futures read-only execution client account id mismatch"
+    );
+    execution.disconnect().await?;
     Ok(())
 }
 
@@ -2258,6 +2671,7 @@ async fn sandbox_futures_market_fill() -> Result<()> {
             &mut execution,
             &adapter_instrument,
             OrderDirection::Buy,
+            1,
         )
         .await?;
         ensure!(
@@ -2281,6 +2695,7 @@ async fn sandbox_futures_market_fill() -> Result<()> {
             &mut execution,
             &adapter_instrument,
             OrderDirection::Sell,
+            1,
         )
         .await?;
         ensure!(
@@ -2427,9 +2842,11 @@ async fn sandbox_futures_stop_lifecycle() -> Result<()> {
                 TimeInForce::Gtc,
                 None,
                 Some(stop_price),
+                1,
             )?)
             .await
-            .context("submit futures stop order through Nautilus")?;
+            .context("submit futures stop order through Nautilus")?
+            .expect_report("submit futures stop order through Nautilus")?;
         cleanup.track_stop_order(submitted.venue_order_id.to_string());
         ensure!(
             submitted.order_status == OrderStatus::Accepted,
@@ -2586,4 +3003,36 @@ fn sandbox_redaction_diagnostics_do_not_leak_token_or_metadata() -> Result<()> {
     ensure!(message.contains("account_id_present=true"));
     ensure!(message.contains("endpoint_host=sandbox-invest-public-api.tbank.ru"));
     Ok(())
+}
+
+#[cfg(feature = "sandbox-futures-tests")]
+#[test]
+fn futures_search_uses_nearest_unexpired_contract_matching_base_ticker() {
+    fn future(ticker: &str, class_code: &str, last_trade_seconds: i64) -> generated::Future {
+        generated::Future {
+            ticker: ticker.to_string(),
+            class_code: class_code.to_string(),
+            currency: RUB_CURRENCY.to_string(),
+            last_trade_date: Some(Timestamp {
+                seconds: last_trade_seconds,
+                nanos: 0,
+            }),
+            ..generated::Future::default()
+        }
+    }
+
+    let now = 1_000;
+    let futures = vec![
+        future("SiU6", "SPBFUT", 999),
+        future("SiZ6", "SPBFUT", 2_000),
+        future("Si-3.27", "SPBFUT", 3_000),
+        future("USDRUBF", "SPBFUT", 1_500),
+        future("SiH7", "TQBR", 5_000),
+    ];
+
+    let selected = select_active_future(&futures, "Si", now).expect("active Si should be found");
+    assert_eq!(selected.ticker, "SiZ6");
+    assert!(select_active_future(&futures[..1], "Si", now).is_none());
+    assert!(matches_futures_search_ticker("Si", "Si-12.26"));
+    assert!(!matches_futures_search_ticker("Si", "USDRUBF"));
 }

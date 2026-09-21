@@ -220,11 +220,8 @@ pub(super) async fn publish_reconnect_reconciliation(
                 known_order_ids.insert(state.order_id.clone());
                 order_states.push(state);
             }
-            Err(TbankAdapterError::GrpcStatus {
-                code: tonic::Code::NotFound,
-                message,
-            }) => tracing::debug!(
-                %message,
+            Err(error) if error.is_order_absent() => tracing::debug!(
+                %error,
                 %order_id,
                 "known T-Bank order was absent during reconnect reconciliation"
             ),
@@ -254,11 +251,8 @@ pub(super) async fn publish_reconnect_reconciliation(
                     .await;
                 order_states.push(state);
             }
-            Err(TbankAdapterError::GrpcStatus {
-                code: tonic::Code::NotFound,
-                message,
-            }) => tracing::debug!(
-                %message,
+            Err(error) if error.is_order_absent() => tracing::debug!(
+                %error,
                 %client_order_id,
                 %broker_request_id,
                 "persisted T-Bank request id was absent during reconnect reconciliation"
@@ -398,6 +392,8 @@ pub(super) async fn publish_reconnect_reconciliation(
             }
             continue;
         }
+        // The shared order-state path records embedded trade IDs against regular venue orders before
+        // metadata resolution, so the OperationsCursor pass can resolve their broker order IDs.
         match query_client
             .order_status_report_from_state_with_lots(query_client.account_id(), state, ts_init)
             .await
@@ -790,7 +786,7 @@ pub(super) fn schedule_regular_order_reconciliation(
                 ),
             }
             attempt = attempt.saturating_add(1);
-            if attempt >= SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
+            if attempt >= RECONCILIATION_RETRY_ATTEMPTS {
                 tracing::error!(
                     client_order_id = client_order_id.as_deref().unwrap_or(""),
                     %broker_request_id,
@@ -1014,10 +1010,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                         "transient unresolved T-Bank trade lookup failure"
                     );
                 }
-                Err(TbankAdapterError::GrpcStatus {
-                    code: tonic::Code::NotFound,
-                    ..
-                }) => {}
+                Err(error) if error.is_order_absent() => {}
                 Err(error) => {
                     tracing::error!(
                         %error,
@@ -1028,7 +1021,7 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                 }
             }
             attempt = attempt.saturating_add(1);
-            if permanently_unresolvable || attempt >= SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
+            if permanently_unresolvable || attempt >= RECONCILIATION_RETRY_ATTEMPTS {
                 tracing::error!(
                     %venue_order_id,
                     attempts = attempt,
@@ -1272,7 +1265,7 @@ pub(super) fn schedule_activated_stop_child_reconciliation(
                 ),
             }
             attempt = attempt.saturating_add(1);
-            if attempt >= SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
+            if attempt >= RECONCILIATION_RETRY_ATTEMPTS {
                 tracing::error!(
                     %stop_order_id,
                     client_order_id = client_order_id.as_deref().unwrap_or(""),

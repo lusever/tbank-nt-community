@@ -433,13 +433,19 @@ fn order_state_stream_average_is_bounded_to_nautilus_precision() {
             lots_executed: 3,
             trades: vec![
                 OrderTrade {
-                    price: Some(Quotation { units: 100, nano: 0 }),
+                    price: Some(Quotation {
+                        units: 100,
+                        nano: 0,
+                    }),
                     quantity: 1,
                     trade_id: "stream-trade-1".to_string(),
                     ..OrderTrade::default()
                 },
                 OrderTrade {
-                    price: Some(Quotation { units: 101, nano: 0 }),
+                    price: Some(Quotation {
+                        units: 101,
+                        nano: 0,
+                    }),
                     quantity: 2,
                     trade_id: "stream-trade-2".to_string(),
                     ..OrderTrade::default()
@@ -533,7 +539,10 @@ fn order_state_stream_average_uses_cumulative_fallback_for_incomplete_trades() {
             }),
             trades: vec![
                 OrderTrade {
-                    price: Some(Quotation { units: 100, nano: 0 }),
+                    price: Some(Quotation {
+                        units: 100,
+                        nano: 0,
+                    }),
                     quantity: 5,
                     trade_id: "stream-trade-3".to_string(),
                     ..OrderTrade::default()
@@ -583,7 +592,10 @@ fn order_state_stream_does_not_create_average_from_partial_trades() {
             }),
             trades: vec![
                 OrderTrade {
-                    price: Some(Quotation { units: 100, nano: 0 }),
+                    price: Some(Quotation {
+                        units: 100,
+                        nano: 0,
+                    }),
                     quantity: 5,
                     trade_id: "stream-trade-5".to_string(),
                     ..OrderTrade::default()
@@ -843,9 +855,7 @@ fn cached_identity_does_not_fallback_after_authoritative_identity_miss() {
     )
     .unwrap_err();
 
-    assert!(error
-        .to_string()
-        .contains("refusing to infer venue"));
+    assert!(error.to_string().contains("refusing to infer venue"));
 }
 
 #[test]
@@ -1041,7 +1051,10 @@ fn managed_market_if_touched_type_survives_stop_query_translation() {
     .unwrap();
 
     assert_eq!(report.order_type, OrderType::MarketIfTouched);
-    assert_eq!(report.trigger_price.unwrap().as_decimal(), Decimal::from(275));
+    assert_eq!(
+        report.trigger_price.unwrap().as_decimal(),
+        Decimal::from(275)
+    );
 }
 
 #[test]
@@ -1141,6 +1154,7 @@ fn futures_stop_stream_report_preserves_point_prices() {
             venue_order_id: Some("future-stop-stream-1".to_string()),
             last_reconciliation_ts: None,
             stage: TbankPendingSubmitStage::Submitted,
+            recovery_attempts: 0,
         },
     )])));
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
@@ -1301,10 +1315,7 @@ fn futures_trailing_stop_report_preserves_point_activation_and_offsets() {
                 nano: 0,
             }),
             trailing_data: Some(stop_order::TrailingData {
-                indent: Some(Quotation {
-                    units: 10,
-                    nano: 0,
-                }),
+                indent: Some(Quotation { units: 10, nano: 0 }),
                 indent_type: TrailingValueType::TrailingValueAbsolute as i32,
                 spread: Some(Quotation { units: 2, nano: 0 }),
                 spread_type: TrailingValueType::TrailingValueAbsolute as i32,
@@ -1429,10 +1440,7 @@ fn operation_cursor_allocates_operation_commission_across_trades() {
         Some(&broker_order_index),
     );
 
-    let reports = reports
-        .into_iter()
-        .map(Result::unwrap)
-        .collect::<Vec<_>>();
+    let reports = reports.into_iter().map(Result::unwrap).collect::<Vec<_>>();
     assert_eq!(reports.len(), 2);
     assert_eq!(reports[0].report.commission, Money::from("2.50 RUB"));
     assert_eq!(reports[1].report.commission, Money::from("7.50 RUB"));
@@ -1477,13 +1485,16 @@ fn operation_commission_rounding_stays_nonnegative_and_sums_minor_units() {
         crate::execution::events::TbankFillCommission::Allocated(_)
     )));
 
-    assert_eq!(amounts, vec![
-        Decimal::new(1, 2),
-        Decimal::new(1, 2),
-        Decimal::new(1, 2),
-        Decimal::ZERO,
-        Decimal::ZERO,
-    ]);
+    assert_eq!(
+        amounts,
+        vec![
+            Decimal::new(1, 2),
+            Decimal::new(1, 2),
+            Decimal::new(1, 2),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        ]
+    );
     assert!(amounts.iter().all(|amount| *amount >= Decimal::ZERO));
     assert_eq!(amounts.into_iter().sum::<Decimal>(), Decimal::new(3, 2));
 }
@@ -1743,20 +1754,30 @@ fn order_status_fill_projection_requires_execution_average_price() {
     )
     .with_price(Price::from("100"));
 
-    assert!(client
-        .runtime
-        .project_order_status_fill_report(
-            &report,
-            "venue-order-1",
-            "synthetic-trade-stream",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateQuery,
-        )
-        .unwrap()
-        .is_none());
-    assert!(client.runtime.fill_projection.lock().unwrap().orders.is_empty());
+    assert!(
+        client
+            .runtime
+            .project_order_status_fill_report(
+                &report,
+                "venue-order-1",
+                "synthetic-trade-stream",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateQuery,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client
+            .runtime
+            .fill_projection
+            .lock()
+            .unwrap()
+            .orders
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1894,10 +1915,12 @@ fn repeated_cumulative_snapshot_corrects_unknown_commission_provenance() {
         .unwrap()
         .expect("a later cumulative commission must produce a provenance correction");
     assert!(correction.provenance_only);
-    assert!(client
-        .runtime
-        .publish_order_status_fill_report(correction)
-        .is_none());
+    assert!(
+        client
+            .runtime
+            .publish_order_status_fill_report(correction)
+            .is_none()
+    );
 
     let _initial_event = receiver.try_recv().expect("initial provenance event");
     let correction_event = receiver.try_recv().expect("commission correction event");
@@ -2488,20 +2511,30 @@ fn unknown_order_side_does_not_advance_fill_projection() {
     )
     .with_avg_px(Decimal::from(100));
 
-    assert!(client
-        .runtime
-        .project_order_status_fill_report(
-            &unknown_side,
-            "venue-order-1",
-            "synthetic-trade-unknown-side",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateQuery,
-        )
-        .unwrap()
-        .is_none());
-    assert!(client.runtime.fill_projection.lock().unwrap().orders.is_empty());
+    assert!(
+        client
+            .runtime
+            .project_order_status_fill_report(
+                &unknown_side,
+                "venue-order-1",
+                "synthetic-trade-unknown-side",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateQuery,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client
+            .runtime
+            .fill_projection
+            .lock()
+            .unwrap()
+            .orders
+            .is_empty()
+    );
 
     let known_side = OrderStatusReport::new(
         "TBANK-001".into(),
@@ -2595,6 +2628,64 @@ async fn open_order_status_report_uses_cached_uid_metadata() {
     assert_eq!(report.instrument_id.to_string(), "SBER_TQBR.MOEX");
     assert_eq!(report.time_in_force, TimeInForce::Fok);
     assert_eq!(report.quantity.as_decimal(), Decimal::from(10));
+}
+
+#[tokio::test]
+async fn regular_order_state_registers_embedded_trade_ids_for_reconnect_fills() {
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert(metadata.instrument_id.clone(), metadata);
+    let request_id = "524b1a03-efdd-4cd0-bd56-7cc6570c7156";
+    client
+        .runtime
+        .broker_order_index
+        .lock()
+        .unwrap()
+        .get_or_allocate_request_mapping(request_id, Some(request_id))
+        .unwrap();
+
+    let report = client
+        .runtime
+        .order_status_report_from_state_with_lots(
+            "account-1".into(),
+            crate::grpc::generated::OrderState {
+                order_id: "regular-order-1".to_string(),
+                order_request_id: request_id.to_string(),
+                execution_report_status:
+                    crate::grpc::generated::OrderExecutionReportStatus::ExecutionReportStatusNew
+                        as i32,
+                direction: crate::grpc::generated::OrderDirection::Buy as i32,
+                order_type: crate::grpc::generated::OrderType::Limit as i32,
+                instrument_uid: "sber-uid".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                stages: vec![crate::grpc::generated::OrderStage {
+                    trade_id: "regular-trade-1".to_string(),
+                    ..crate::grpc::generated::OrderStage::default()
+                }],
+                ..crate::grpc::generated::OrderState::default()
+            },
+            current_unix_nanos(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.venue_order_id.to_string(), "regular-order-1");
+    assert_eq!(
+        client
+            .runtime
+            .broker_order_index
+            .lock()
+            .unwrap()
+            .venue_order_id_for_trade_id("regular-trade-1"),
+        Some("regular-order-1".to_string())
+    );
 }
 
 #[tokio::test]
@@ -2780,6 +2871,10 @@ impl OrdersService for MockOrdersService {
     ) -> std::result::Result<Response<OrderState>, Status> {
         let request = request.into_inner();
         self.state_calls.lock().unwrap().push(request.clone());
+        let state_delay = *self.state_delay.lock().unwrap();
+        if !state_delay.is_zero() {
+            tokio::time::sleep(state_delay).await;
+        }
         if let Some((code, message)) = self.state_error.lock().unwrap().clone() {
             return Err(Status::new(code, message));
         }
@@ -3000,7 +3095,7 @@ async fn submit_market_live_calls_orders_service() {
     let broker_request_id = tbank_broker_request_id_for_client_order_id(client_order_id);
     let response = client
         .runtime
-        .submit_order(
+        .submit_order_with_recovery_deadline(
             &TbankSubmitOrder {
                 instrument_id: "SBER_TQBR.MOEX".to_string(),
                 client_order_id: client_order_id.to_string(),
@@ -3015,6 +3110,7 @@ async fn submit_market_live_calls_orders_service() {
                 confirm_margin_trade: false,
             },
             &sber_metadata(),
+            tokio::time::Instant::now() + SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET,
         )
         .await
         .unwrap();
@@ -4214,10 +4310,7 @@ async fn activated_stop_recovery_uses_order_request_id_without_exchange_order_id
 
     let (stop, client_order_id) = client
         .runtime
-        .resolve_activated_stop_mapping(
-            "exchange-child-1",
-            Some("request-shaped-stop-id"),
-        )
+        .resolve_activated_stop_mapping("exchange-child-1", Some("request-shaped-stop-id"))
         .await
         .unwrap()
         .expect("order_request_id should recover the stop parent");
@@ -4439,14 +4532,9 @@ async fn generate_fill_reports_returns_operation_history_trades() {
     out_of_scope_metadata.figi = "unsupported-figi".to_string();
     out_of_scope_metadata.ticker = "BOND".to_string();
     out_of_scope_metadata.class_code = "TQTF".to_string();
-    client
-        .runtime
-        .instruments
-        .lock()
-        .unwrap()
-        .insert(
-            out_of_scope_metadata.instrument_id.clone(),
-            out_of_scope_metadata,
+    client.runtime.instruments.lock().unwrap().insert(
+        out_of_scope_metadata.instrument_id.clone(),
+        out_of_scope_metadata,
     );
     let (today, _) = super::current_utc_day_bounds();
     let today_start = UnixNanos::from(u64::try_from(today.seconds).unwrap() * 1_000_000_000);
@@ -4491,9 +4579,9 @@ async fn generate_fill_reports_returns_operation_history_trades() {
             GenerateFillReports::new(
                 UUID4::new(),
                 current_unix_nanos(),
+                None,
+                None,
                 Some(UnixNanos::from(requested_start)),
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -4600,24 +4688,24 @@ async fn generate_fill_reports_returns_operation_history_trades() {
     assert!(late_receiver.try_recv().is_err());
     assert!(stale_receiver.try_recv().is_err());
 
-    let before_today = UnixNanos::from(
-        u64::try_from(today.seconds - 86_400).unwrap() * 1_000_000_000,
-    );
-    let error = <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_fill_reports(
-        &client,
-        GenerateFillReports::new(
-            UUID4::new(),
-            current_unix_nanos(),
-            None,
-            None,
-            Some(before_today),
-            None,
-            None,
-            None,
-        ),
-    )
-    .await
-    .expect_err("historical identity recovery must fail closed before querying operations");
+    let before_today =
+        UnixNanos::from(u64::try_from(today.seconds - 86_400).unwrap() * 1_000_000_000);
+    let error =
+        <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_fill_reports(
+            &client,
+            GenerateFillReports::new(
+                UUID4::new(),
+                current_unix_nanos(),
+                None,
+                None,
+                Some(before_today),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect_err("historical identity recovery must fail closed before querying operations");
     assert!(error.to_string().contains("refusing incomplete recovery"));
 }
 
@@ -4633,9 +4721,7 @@ async fn order_identity_recovery_rejects_history_before_current_day() {
         .await
         .expect_err("historical identity recovery must fail closed");
 
-    assert!(error
-        .to_string()
-        .contains("refusing incomplete recovery"));
+    assert!(error.to_string().contains("refusing incomplete recovery"));
 }
 
 #[tokio::test]

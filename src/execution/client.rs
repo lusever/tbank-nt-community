@@ -185,6 +185,7 @@ struct TbankExecutionRuntime {
     order_status_projection: Arc<Mutex<HashMap<String, TbankProjectedOrderStatus>>>,
     position_projection: Arc<Mutex<HashMap<String, TbankProjectedPosition>>>,
     pending_submits: Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
+    recovery_rpc_deadline: Option<tokio::time::Instant>,
     unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     unresolved_cancellations: Arc<Mutex<HashSet<TbankBrokerOrderIdentity>>>,
     stream_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -392,6 +393,15 @@ impl TbankExecutionClient {
     pub fn is_connected(&self) -> bool {
         self.core.is_connected()
     }
+
+    /// Returns the pending submits whose outcome no broker order report has confirmed.
+    ///
+    /// Consumers gate live entries on this snapshot instead of scraping adapter logs. Order is
+    /// stable: oldest submit first.
+    #[must_use]
+    pub fn unresolved_submits(&self) -> Vec<TbankUnresolvedSubmit> {
+        self.runtime.unresolved_submits()
+    }
 }
 
 #[derive(Clone)]
@@ -474,14 +484,72 @@ use super::projections::{
 #[cfg(test)]
 use super::projections::{project_cumulative_order_fill, project_trade_fill_report};
 
+/// Reconciliation stage of a pending submit.
+///
+/// A broker order report confirms an order outcome. `DefinitivelyAbsent` requires an explicit
+/// broker guarantee that the request cannot later resolve; ordinary not-found lookups do not
+/// establish it. Unresolved stages retain the request identity until an authoritative outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TbankPendingSubmitStage {
+pub enum TbankPendingSubmitStage {
+    /// The broker accepted the submit but has not confirmed a terminal state.
     Submitted,
+    /// The submit reached the broker without a usable response and is being reconciled.
     Unknown,
+    /// A broker order report confirmed the order.
     Accepted,
+    /// A broker order report confirmed the rejection.
     Rejected,
+    /// A broker order report confirmed the fill.
     Filled,
+    /// A broker order report confirmed the cancellation or expiry.
     Cancelled,
+    /// The broker guarantees this request cannot later resolve to an accepted order.
+    ///
+    /// A `50005` lookup response does not provide this guarantee and must remain unresolved.
+    DefinitivelyAbsent,
+    /// The bounded reconciliation ladder ended without an authoritative broker answer.
+    Unresolved,
+}
+
+impl TbankPendingSubmitStage {
+    /// Whether a broker order report confirmed this submit outcome.
+    #[must_use]
+    fn is_broker_confirmed(self) -> bool {
+        matches!(
+            self,
+            Self::Accepted | Self::Rejected | Self::Filled | Self::Cancelled
+        )
+    }
+
+    /// Whether the request identity still has to be resolved before the lifecycle may be reset.
+    #[must_use]
+    fn blocks_lifecycle_reset(self) -> bool {
+        matches!(self, Self::Submitted | Self::Unknown | Self::Unresolved)
+    }
+}
+
+/// Read-only view of a pending submit whose outcome no broker order report has confirmed.
+///
+/// Consumers gate live entries on this snapshot instead of scraping adapter logs. A submit leaves
+/// the snapshot only when a broker order report or an explicit broker finality guarantee settles it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TbankUnresolvedSubmit {
+    /// Nautilus client order id of the pending submit.
+    pub client_order_id: String,
+    /// Instrument id of the pending submit.
+    pub instrument_id: String,
+    /// Order side sent to T-Bank.
+    pub side: crate::common::TbankOrderSide,
+    /// Order type sent to T-Bank.
+    pub order_type: crate::common::TbankOrderType,
+    /// Adapter timestamp of the broker submit attempt.
+    pub submitted_ts: UnixNanos,
+    /// Current reconciliation stage.
+    pub stage: TbankPendingSubmitStage,
+    /// Background reconciliation attempts performed so far.
+    pub attempts: u32,
+    /// Timestamp of the most recent reconciliation attempt.
+    pub last_reconciliation_ts: Option<UnixNanos>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,7 +558,24 @@ enum TbankCancelRecoveryOutcome {
     Active,
 }
 
-const SUBMIT_OUTCOME_RECOVERY_ATTEMPTS: u32 = 8;
+/// One bounded reconciliation step for a submit whose broker response was lost.
+enum TbankSubmitRecoveryStep {
+    /// The broker returned authoritative state for the submit.
+    Resolved(Box<TbankOrderReconciliationReports>),
+    /// One lookup did not find the request id; T-Bank may still be indexing an accepted order.
+    NotFound,
+    /// The broker answer was unavailable, ambiguous, or not attributable to this submit.
+    Inconclusive,
+}
+
+// Cap recovery even when a consumer configures an unusually long LiveNode in-flight window.
+const SUBMIT_OUTCOME_RECOVERY_ATTEMPTS: u32 = 5;
+const SUBMIT_OUTCOME_RECOVERY_DELAY_CAP: Duration = Duration::from_secs(5);
+const SUBMIT_OUTCOME_RECOVERY_MIN_DELAY: Duration = Duration::from_secs(1);
+const SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET: Duration = Duration::from_secs(20);
+// Bound a single regular-order lookup so a slow response cannot consume the retry window.
+const SUBMIT_OUTCOME_RECOVERY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+const RECONCILIATION_RETRY_ATTEMPTS: u32 = 8;
 const STOP_ORDER_SUBMIT_RECONCILIATION_WINDOW: Duration = Duration::from_secs(5 * 60);
 const RECONNECT_RECONCILIATION_MAX_ATTEMPTS: u32 = 5;
 const CANCEL_OUTCOME_RECOVERY_ATTEMPTS: u32 = 5;
@@ -606,6 +691,76 @@ struct TbankPendingSubmit {
     venue_order_id: Option<String>,
     last_reconciliation_ts: Option<UnixNanos>,
     stage: TbankPendingSubmitStage,
+    recovery_attempts: u32,
+}
+
+impl TbankPendingSubmit {
+    fn snapshot(&self, client_order_id: &str) -> TbankUnresolvedSubmit {
+        TbankUnresolvedSubmit {
+            client_order_id: client_order_id.to_string(),
+            instrument_id: self.instrument_id.clone(),
+            side: self.side,
+            order_type: self.order_type,
+            submitted_ts: self.submitted_ts,
+            stage: self.stage,
+            attempts: self.recovery_attempts,
+            last_reconciliation_ts: self.last_reconciliation_ts,
+        }
+    }
+}
+
+/// Returns the delay before the next bounded reconciliation attempt.
+///
+/// `None` stops the ladder while it can still finish inside the Nautilus in-flight window.
+fn next_submit_outcome_recovery_delay(
+    policy: &crate::config::TbankReconnectPolicy,
+    attempt: u32,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> Option<Duration> {
+    let delay = crate::grpc::retry::backoff_duration(policy, attempt)
+        .max(SUBMIT_OUTCOME_RECOVERY_MIN_DELAY)
+        .min(SUBMIT_OUTCOME_RECOVERY_DELAY_CAP);
+    (now + delay < deadline).then_some(delay)
+}
+
+fn submit_outcome_recovery_budget(config: &TbankExecutionClientConfig) -> Duration {
+    let check_interval_ms = u64::from(config.live_node_inflight_check_interval_ms);
+    let check_threshold_ms = u64::from(config.live_node_inflight_check_threshold_ms);
+    if check_interval_ms == 0 {
+        // Nautilus permits zero to disable in-flight polling. Keep the adapter's independent
+        // recovery deadline bounded without turning ordinary submission into an instant timeout.
+        return SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET;
+    }
+
+    // LiveNode checks at a fixed cadence and only acts once both the submit age and the age since
+    // the last query reach the threshold. Round the threshold up to the next check tick, then
+    // reserve 20% of that full retry window for scheduling and event delivery.
+    let ticks_per_threshold = check_threshold_ms.div_ceil(check_interval_ms).max(1);
+    let check_period_ms = check_interval_ms.saturating_mul(ticks_per_threshold);
+    let retry_count = u64::from(config.live_node_inflight_check_retries).max(1);
+    let engine_window_ms = check_period_ms.saturating_mul(retry_count);
+    let recovery_budget_ms = engine_window_ms.saturating_sub(engine_window_ms / 5);
+
+    Duration::from_millis(recovery_budget_ms).min(SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET)
+}
+
+fn submit_outcome_submit_budget(
+    configured_timeout: Duration,
+    recovery_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Option<(tokio::time::Instant, Duration)> {
+    let remaining = recovery_deadline.saturating_duration_since(now);
+    let max_submit_timeout = remaining.saturating_sub(remaining / 2);
+    let submit_timeout = configured_timeout.min(max_submit_timeout);
+    (!submit_timeout.is_zero()).then_some((now + submit_timeout, submit_timeout))
+}
+
+fn submit_outcome_recovery_lookup_deadline(
+    recovery_deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    (now + SUBMIT_OUTCOME_RECOVERY_LOOKUP_TIMEOUT).min(recovery_deadline)
 }
 
 #[derive(Clone)]
@@ -674,6 +829,7 @@ impl TbankExecutionRuntime {
             order_status_projection: Arc::new(Mutex::new(HashMap::new())),
             position_projection: Arc::new(Mutex::new(HashMap::new())),
             pending_submits: Arc::new(Mutex::new(HashMap::new())),
+            recovery_rpc_deadline: None,
             unresolved_trade_fills: Arc::new(Mutex::new(HashMap::new())),
             unresolved_cancellations: Arc::new(Mutex::new(HashSet::new())),
             stream_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -836,12 +992,7 @@ impl TbankExecutionRuntime {
             .lock()
             .expect("pending_submits lock")
             .values()
-            .any(|pending| {
-                matches!(
-                    pending.stage,
-                    TbankPendingSubmitStage::Submitted | TbankPendingSubmitStage::Unknown
-                )
-            });
+            .any(|pending| pending.stage.blocks_lifecycle_reset());
         unresolved_submit
             || !self
                 .unresolved_cancellations
@@ -1651,6 +1802,7 @@ impl TbankExecutionRuntime {
                     venue_order_id: None,
                     last_reconciliation_ts: None,
                     stage: TbankPendingSubmitStage::Submitted,
+                    recovery_attempts: 0,
                 },
             );
     }
@@ -1685,6 +1837,9 @@ impl TbankExecutionRuntime {
             .expect("pending_submits lock")
             .get_mut(client_order_id)
         {
+            if pending.stage.is_broker_confirmed() && !stage.is_broker_confirmed() {
+                return;
+            }
             pending.stage = stage;
             if let Some(ts) = reconciliation_ts {
                 pending.last_reconciliation_ts = Some(ts);
@@ -1703,6 +1858,75 @@ impl TbankExecutionRuntime {
 
     fn mark_pending_submit_report(&self, report: &OrderStatusReport) {
         mark_pending_submit_order_report(&self.pending_submits, report);
+    }
+
+    /// Settles a pending submit with an adapter-side outcome no broker order report confirmed.
+    fn mark_pending_submit_terminal(
+        &self,
+        client_order_id: &str,
+        stage: TbankPendingSubmitStage,
+        attempts: u32,
+        reconciliation_ts: UnixNanos,
+    ) {
+        let snapshot = {
+            let mut pending_submits = self.pending_submits.lock().expect("pending_submits lock");
+            let Some(pending) = pending_submits.get_mut(client_order_id) else {
+                return;
+            };
+            if pending.stage.is_broker_confirmed() {
+                return;
+            }
+            pending.stage = stage;
+            pending.recovery_attempts = attempts;
+            pending.last_reconciliation_ts = Some(reconciliation_ts);
+            pending.snapshot(client_order_id)
+        };
+        tracing::warn!(
+            client_order_id = %snapshot.client_order_id,
+            instrument_id = %snapshot.instrument_id,
+            side = ?snapshot.side,
+            order_type = ?snapshot.order_type,
+            submitted_ts = %snapshot.submitted_ts,
+            stage = ?snapshot.stage,
+            attempts = snapshot.attempts,
+            last_reconciliation_ts = ?snapshot.last_reconciliation_ts,
+            "T-Bank submit outcome settled without a broker response"
+        );
+    }
+
+    fn touch_pending_submit_reconciliation(
+        &self,
+        client_order_id: &str,
+        attempts: u32,
+        reconciliation_ts: UnixNanos,
+    ) {
+        if let Some(pending) = self
+            .pending_submits
+            .lock()
+            .expect("pending_submits lock")
+            .get_mut(client_order_id)
+        {
+            pending.recovery_attempts = attempts;
+            pending.last_reconciliation_ts = Some(reconciliation_ts);
+        }
+    }
+
+    /// Returns the pending submits whose outcome no broker order report has confirmed.
+    ///
+    /// Consumers gate live entries on this snapshot instead of scraping adapter logs. Order is
+    /// stable: oldest submit first.
+    #[must_use]
+    pub fn unresolved_submits(&self) -> Vec<TbankUnresolvedSubmit> {
+        let mut unresolved = self
+            .pending_submits
+            .lock()
+            .expect("pending_submits lock")
+            .iter()
+            .filter(|(_, pending)| !pending.stage.is_broker_confirmed())
+            .map(|(client_order_id, pending)| pending.snapshot(client_order_id))
+            .collect::<Vec<_>>();
+        unresolved.sort_by_key(|pending| pending.submitted_ts);
+        unresolved
     }
 
     fn pending_submit_timestamp(&self, client_order_id: &str) -> Option<UnixNanos> {
@@ -1739,20 +1963,30 @@ impl TbankExecutionRuntime {
         order: TbankSubmitOrder,
         metadata: TbankInstrumentMetadata,
         ts_init: UnixNanos,
+        deadline: tokio::time::Instant,
         emitter: ExecutionEventEmitter,
     ) {
         let mut client = self.clone();
         let policy = self.config.reconnect_policy.clone();
         self.spawn_mutating_followup_task(async move {
+            let mut attempts = 0_u32;
             for attempt in 0..SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
-                let delay = crate::grpc::retry::backoff_duration(&policy, attempt);
+                let Some(delay) = next_submit_outcome_recovery_delay(
+                    &policy,
+                    attempt,
+                    tokio::time::Instant::now(),
+                    deadline,
+                ) else {
+                    break;
+                };
                 tokio::time::sleep(delay).await;
+                attempts = attempt + 1;
                 let reconciliation_ts = current_unix_nanos();
                 match client
-                    .reconcile_submit_outcome(&order, &metadata, ts_init)
+                    .step_submit_outcome_recovery(&order, &metadata, ts_init, deadline)
                     .await
                 {
-                    Ok(Some(reconciled)) => {
+                    TbankSubmitRecoveryStep::Resolved(reconciled) => {
                         client.mark_pending_submit_report(&reconciled.order_report);
                         for report in order_status_execution_reports(
                             reconciled.order_report,
@@ -1762,50 +1996,74 @@ impl TbankExecutionRuntime {
                         }
                         tracing::info!(
                             client_order_id = %order.client_order_id,
-                            attempt = attempt + 1,
+                            attempt = attempts,
                             "recovered unresolved T-Bank submit outcome"
                         );
                         return;
                     }
-                    Ok(None) => {
-                        client.mark_pending_submit_stage(
+                    // T-Bank's 50005 only describes this lookup. Without a documented broker
+                    // finality guarantee, keep the request identity unresolved until an order
+                    // report confirms its outcome or the bounded ladder ends.
+                    TbankSubmitRecoveryStep::NotFound | TbankSubmitRecoveryStep::Inconclusive => {
+                        client.touch_pending_submit_reconciliation(
                             order.client_order_id.as_str(),
-                            TbankPendingSubmitStage::Unknown,
-                            Some(reconciliation_ts),
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            client_order_id = %order.client_order_id,
-                            attempt = attempt + 1,
-                            "T-Bank submit outcome recovery attempt failed"
+                            attempts,
+                            reconciliation_ts,
                         );
                     }
                 }
             }
-            tracing::warn!(
-                client_order_id = %order.client_order_id,
-                attempts = SUBMIT_OUTCOME_RECOVERY_ATTEMPTS,
-                "T-Bank submit outcome remained unresolved after background recovery"
+            client.mark_pending_submit_terminal(
+                order.client_order_id.as_str(),
+                TbankPendingSubmitStage::Unresolved,
+                attempts,
+                current_unix_nanos(),
             );
         });
     }
 
     /// Submits an order to T-Bank.
-    pub async fn submit_order(
+    pub(super) async fn submit_order_with_recovery_deadline(
         &mut self,
         order: &TbankSubmitOrder,
         instrument: &TbankInstrumentMetadata,
+        recovery_deadline: tokio::time::Instant,
     ) -> std::result::Result<TbankSubmitResponse, TbankCommandError> {
-        let request_timeout = self.config.request_timeout;
         if let Err(error) = self.ensure_broker_request_mapping(order) {
             self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
             return Err(TbankCommandError::before_rpc(error));
         }
+        let (submit_deadline, request_timeout) = match submit_outcome_submit_budget(
+            self.config.request_timeout,
+            recovery_deadline,
+            tokio::time::Instant::now(),
+        ) {
+            Some(budget) => budget,
+            None => {
+                self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+                return Err(TbankCommandError::before_rpc(
+                    TbankAdapterError::GrpcStatus {
+                        code: tonic::Code::DeadlineExceeded,
+                        message: "submit recovery deadline leaves no dispatch window".into(),
+                    },
+                ));
+            }
+        };
         self.record_pending_submit(order, current_unix_nanos());
-        self.submit_order_request(order, instrument, request_timeout)
-            .await
+        match tokio::time::timeout_at(
+            submit_deadline,
+            self.submit_order_request(order, instrument, request_timeout),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TbankCommandError::rpc_started(
+                TbankAdapterError::GrpcStatus {
+                    code: tonic::Code::DeadlineExceeded,
+                    message: "submit RPC exceeded its reserved deadline".into(),
+                },
+            )),
+        }
     }
 
     async fn submit_order_request(
@@ -2023,7 +2281,11 @@ impl TbankExecutionRuntime {
             order_id: order_id.to_string(),
             order_id_type: Some(OrderIdType::Exchange as i32),
         };
-        let request = with_timeout(request, self.config.request_timeout);
+        let request = with_timeout(
+            request,
+            self.rpc_request_timeout()
+                .map_err(TbankCommandError::before_rpc)?,
+        );
 
         if self.config.environment.is_live() {
             let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
@@ -2057,7 +2319,11 @@ impl TbankExecutionRuntime {
             account_id,
             stop_order_id: stop_order_id.to_string(),
         };
-        let request = with_timeout(request, self.config.request_timeout);
+        let request = with_timeout(
+            request,
+            self.rpc_request_timeout()
+                .map_err(TbankCommandError::before_rpc)?,
+        );
 
         if self.config.environment.is_live() {
             let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
@@ -2217,7 +2483,7 @@ impl TbankExecutionRuntime {
             price_type: PriceType::Currency as i32,
             order_id_type: Some(order_id_type as i32),
         };
-        let request = with_timeout(request, self.config.request_timeout);
+        let request = with_timeout(request, self.rpc_request_timeout()?);
         let rpc = if self.config.environment.is_live() {
             "OrdersService.GetOrderState"
         } else {
@@ -2357,7 +2623,7 @@ impl TbankExecutionRuntime {
             account_id: self.config.resolve_account_id()?,
             advanced_filters,
         };
-        let request = with_timeout(request, self.config.request_timeout);
+        let request = with_timeout(request, self.rpc_request_timeout()?);
 
         if self.config.environment.is_live() {
             Ok(self
@@ -2438,11 +2704,8 @@ impl TbankExecutionRuntime {
                     known_order_ids.insert(state.order_id.clone());
                     children.push(state);
                 }
-                Err(TbankAdapterError::GrpcStatus {
-                    code: tonic::Code::NotFound,
-                    message,
-                }) => tracing::debug!(
-                    %message,
+                Err(error) if error.is_order_absent() => tracing::debug!(
+                    %error,
                     "activated T-Bank stop child was absent from GetOrderState"
                 ),
                 Err(error) => return Err(error),
@@ -2533,7 +2796,7 @@ impl TbankExecutionRuntime {
             from,
             to,
         };
-        let request = with_timeout(request, self.config.request_timeout);
+        let request = with_timeout(request, self.rpc_request_timeout()?);
         let rpc = if self.config.environment.is_live() {
             "StopOrdersService.GetStopOrders"
         } else {
@@ -2569,7 +2832,7 @@ impl TbankExecutionRuntime {
             account_id: self.config.resolve_account_id()?,
             currency: None,
         };
-        let request = with_timeout(request, self.config.request_timeout);
+        let request = with_timeout(request, self.rpc_request_timeout()?);
         let rpc = if self.config.environment.is_live() {
             "OperationsService.GetPortfolio"
         } else {
@@ -2604,7 +2867,7 @@ impl TbankExecutionRuntime {
         let request = PositionsRequest {
             account_id: self.config.resolve_account_id()?,
         };
-        let request = with_timeout(request, self.config.request_timeout);
+        let request = with_timeout(request, self.rpc_request_timeout()?);
 
         if self.config.environment.is_live() {
             Ok(self
@@ -2687,6 +2950,11 @@ impl TbankExecutionRuntime {
     }
 
     /// Reconciles an order submission by its broker request ID.
+    ///
+    /// `Ok(None)` means this lookup did not find the request id. For an ambiguous submit this is
+    /// only one observation: submit recovery requires repeated misses over a minimum horizon before
+    /// it settles the lifecycle as definitively absent. Query failures remain errors so they are
+    /// never treated as evidence of absence.
     pub async fn reconcile_order_by_request_id(
         &mut self,
         order_request_id: &str,
@@ -2694,14 +2962,14 @@ impl TbankExecutionRuntime {
     ) -> anyhow::Result<Option<TbankOrderReconciliationReports>> {
         let state = match self.query_order_by_request_id(order_request_id).await {
             Ok(state) => state,
-            Err(error) => {
-                tracing::warn!(
+            Err(error) if error.is_order_absent() => {
+                tracing::debug!(
                     %order_request_id,
-                    %error,
-                    "T-Bank order reconciliation found no broker order state"
+                    "T-Bank has no order for this request id"
                 );
                 return Ok(None);
             }
+            Err(error) => return Err(error.into()),
         };
         let account_id = self.account_id();
         let report = self
@@ -2715,37 +2983,95 @@ impl TbankExecutionRuntime {
         }))
     }
 
-    /// Reconciles an ambiguous order-submission outcome.
-    pub async fn reconcile_submit_outcome(
+    /// Performs one bounded reconciliation step for a submit whose broker response was lost.
+    ///
+    /// Never emits an execution event and never re-sends the order: the submit outcome is resolved
+    /// only from broker state, or reported as unresolved for the caller to record.
+    pub async fn step_submit_outcome_recovery(
         &mut self,
         order: &TbankSubmitOrder,
         metadata: &TbankInstrumentMetadata,
         ts_init: UnixNanos,
-    ) -> anyhow::Result<Option<TbankOrderReconciliationReports>> {
-        match order.service(self.config.environment) {
-            TbankExecutionService::LiveOrders => {
-                self.reconcile_order_by_request_id(order.broker_request_id.as_str(), ts_init)
-                    .await
+        deadline: tokio::time::Instant,
+    ) -> TbankSubmitRecoveryStep {
+        let previous_deadline = self.recovery_rpc_deadline.replace(deadline);
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            self.step_submit_outcome_recovery_inner(order, metadata, ts_init, deadline),
+        )
+        .await;
+        self.recovery_rpc_deadline = previous_deadline;
+        match outcome {
+            Ok(step) => step,
+            Err(_) => {
+                tracing::warn!(
+                    client_order_id = %order.client_order_id,
+                    "T-Bank submit reconciliation reached its deadline"
+                );
+                TbankSubmitRecoveryStep::Inconclusive
             }
-            TbankExecutionService::LiveStopOrders => {
-                self.reconcile_stop_order_submit_outcome(order, metadata, ts_init)
-                    .await
+        }
+    }
+
+    async fn step_submit_outcome_recovery_inner(
+        &mut self,
+        order: &TbankSubmitOrder,
+        metadata: &TbankInstrumentMetadata,
+        ts_init: UnixNanos,
+        deadline: tokio::time::Instant,
+    ) -> TbankSubmitRecoveryStep {
+        let service = order.service(self.config.environment);
+        match broker_order_route_for_submit(order, service) {
+            TbankBrokerOrderRoute::RegularOrder => {
+                let lookup_deadline =
+                    submit_outcome_recovery_lookup_deadline(deadline, tokio::time::Instant::now());
+                let previous_deadline = self.recovery_rpc_deadline.replace(lookup_deadline);
+                let lookup = tokio::time::timeout_at(
+                    lookup_deadline,
+                    self.reconcile_order_by_request_id(order.broker_request_id.as_str(), ts_init),
+                )
+                .await;
+                self.recovery_rpc_deadline = previous_deadline;
+                match lookup {
+                    Err(_) => {
+                        tracing::warn!(
+                            client_order_id = %order.client_order_id,
+                            "T-Bank submit order-state lookup reached its per-attempt timeout"
+                        );
+                        TbankSubmitRecoveryStep::Inconclusive
+                    }
+                    Ok(Ok(Some(reconciled))) => {
+                        TbankSubmitRecoveryStep::Resolved(Box::new(reconciled))
+                    }
+                    Ok(Ok(None)) => TbankSubmitRecoveryStep::NotFound,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            client_order_id = %order.client_order_id,
+                            "T-Bank submit reconciliation query failed"
+                        );
+                        TbankSubmitRecoveryStep::Inconclusive
+                    }
+                }
             }
-            TbankExecutionService::Sandbox
-                if matches!(
-                    order.order_type,
-                    crate::common::TbankOrderType::StopMarket
-                        | crate::common::TbankOrderType::MarketIfTouched
-                        | crate::common::TbankOrderType::TrailingStopMarket
-                        | crate::common::TbankOrderType::TrailingStopLimit
-                ) =>
-            {
-                self.reconcile_stop_order_submit_outcome(order, metadata, ts_init)
+            TbankBrokerOrderRoute::StopOrder => {
+                match self
+                    .reconcile_stop_order_submit_outcome(order, metadata, ts_init)
                     .await
-            }
-            TbankExecutionService::Sandbox => {
-                self.reconcile_order_by_request_id(order.broker_request_id.as_str(), ts_init)
-                    .await
+                {
+                    Ok(Some(reconciled)) => TbankSubmitRecoveryStep::Resolved(Box::new(reconciled)),
+                    // GetStopOrders omits the request id and the query window is bounded, so
+                    // absence from that snapshot is not authoritative for a stop submit.
+                    Ok(None) => TbankSubmitRecoveryStep::Inconclusive,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            client_order_id = %order.client_order_id,
+                            "T-Bank stop-order submit reconciliation failed"
+                        );
+                        TbankSubmitRecoveryStep::Inconclusive
+                    }
+                }
             }
         }
     }
@@ -2976,6 +3302,7 @@ impl TbankExecutionRuntime {
         Ok(fill_report)
     }
 
+    #[cfg(test)]
     fn project_trade_fill_report(
         &self,
         report: TbankFillReport,
@@ -3019,6 +3346,24 @@ impl TbankExecutionRuntime {
         })
     }
 
+    fn rpc_request_timeout(&self) -> Result<Duration> {
+        let timeout = self
+            .recovery_rpc_deadline
+            .map(|deadline| {
+                self.config
+                    .request_timeout
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            })
+            .unwrap_or(self.config.request_timeout);
+        if timeout.is_zero() {
+            return Err(TbankAdapterError::GrpcStatus {
+                code: tonic::Code::DeadlineExceeded,
+                message: "submit outcome recovery deadline elapsed".to_string(),
+            });
+        }
+        Ok(timeout)
+    }
+
     fn detached_query_clone(&self) -> Self {
         Self {
             client_id: self.client_id,
@@ -3039,6 +3384,7 @@ impl TbankExecutionRuntime {
             order_status_projection: self.order_status_projection.clone(),
             position_projection: self.position_projection.clone(),
             pending_submits: self.pending_submits.clone(),
+            recovery_rpc_deadline: None,
             unresolved_trade_fills: self.unresolved_trade_fills.clone(),
             unresolved_cancellations: self.unresolved_cancellations.clone(),
             stream_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -3609,7 +3955,7 @@ impl TbankExecutionRuntime {
             figi: String::new(),
             instrument_id,
         };
-        let request_timeout = self.config.request_timeout;
+        let request_timeout = self.rpc_request_timeout()?;
         let response =
             self.clients_mut()?
                 .instruments
@@ -3690,7 +4036,7 @@ impl TbankExecutionRuntime {
         request: InstrumentRequest,
         requested_id: &str,
     ) -> Result<TbankInstrumentMetadata> {
-        let request_timeout = self.config.request_timeout;
+        let request_timeout = self.rpc_request_timeout()?;
         let response = self
             .clients_mut()?
             .instruments
@@ -3714,7 +4060,7 @@ impl TbankExecutionRuntime {
         request: InstrumentRequest,
         requested_id: &str,
     ) -> Result<TbankInstrumentMetadata> {
-        let request_timeout = self.config.request_timeout;
+        let request_timeout = self.rpc_request_timeout()?;
         let response = self
             .clients_mut()?
             .instruments
@@ -3786,7 +4132,7 @@ impl TbankExecutionRuntime {
     ) -> Result<TbankInstrumentMetadata> {
         let identifier_for_error = identifier;
         let request_for_details = request.clone();
-        let request_timeout = self.config.request_timeout;
+        let request_timeout = self.rpc_request_timeout()?;
         let kind = match self
             .clients_mut()?
             .instruments
@@ -4344,11 +4690,8 @@ impl TbankExecutionRuntime {
                     self.mark_pending_submit_report(&report);
                     return Ok(Some(report));
                 }
-                Err(TbankAdapterError::GrpcStatus {
-                    code: tonic::Code::NotFound,
-                    message,
-                }) => tracing::debug!(
-                    %message,
+                Err(error) if error.is_order_absent() => tracing::debug!(
+                    %error,
                     "activated T-Bank stop child was absent during single-order lookup"
                 ),
                 Err(error) => return Err(error.into()),

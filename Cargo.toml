@@ -27,10 +27,16 @@ name = "tbank-accounts"
 path = "src/bin/tbank_accounts.rs"
 required-features = ["tools"]
 
+[[test]]
+name = "sandbox_repair"
+path = "tests/sandbox_repair.rs"
+required-features = ["sandbox-repair-tests"]
+
 [features]
 default = []
 sandbox-tests = []
 sandbox-futures-tests = []
+sandbox-repair-tests = []
 tools = [
     "dep:clap",
     "dep:dotenvy",

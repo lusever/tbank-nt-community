@@ -88,14 +88,18 @@ SPB; брокерские счета имеют вид `TBANK-{broker_account_id
 
 Nautilus передаёт конкретную конфигурацию клиента и имя клиента в каждый вызов `create`. Обе
 фабрики клиентов не хранят состояние и отклоняют конфигурацию неверного типа, не подставляя
-молчаливые значения по умолчанию. Идентификатор трейдера передаётся `LiveNode` в factory API,
-а конфигурация исполнения содержит только venue- и broker-specific параметры.
+молчаливые значения по умолчанию. Идентификатор трейдера передаётся `LiveNode` в factory API.
+Для ограничения восстановления неоднозначного submit передавайте в адаптер настройки in-flight
+из той же конфигурации execution engine, которая используется при сборке `LiveNode`.
 
 Минимальная настройка `LiveNode`:
 
 ```rust
 use nautilus_common::enums::Environment as NautilusEnvironment;
-use nautilus_live::{config::RoutingConfig, node::LiveNode};
+use nautilus_live::{
+    config::{LiveExecutionEngineConfig, RoutingConfig},
+    node::LiveNode,
+};
 use nautilus_model::identifiers::TraderId;
 use tbank_nt_community::{
     register_tbank_currencies,
@@ -109,16 +113,19 @@ let data_config = TbankDataClientConfig {
     environment: TbankEnvironment::Sandbox,
     ..TbankDataClientConfig::default()
 };
+let live_execution_engine_config = LiveExecutionEngineConfig::default();
 let execution_config = TbankExecutionClientConfig {
     environment: TbankEnvironment::Sandbox,
     ..TbankExecutionClientConfig::default()
-};
+}
+.with_live_node_execution_engine_config(&live_execution_engine_config);
 
 let routing = RoutingConfig::builder()
     .default(true)
     .venues(vec!["MOEX".to_string(), "SPBE".to_string()])
     .build();
 let node = LiveNode::builder(trader_id, NautilusEnvironment::Sandbox)?
+    .with_exec_engine_config(live_execution_engine_config)
     .add_data_client_with_routing(
         Some("tbank".to_string()),
         Box::new(TbankDataClientFactory::new()),
@@ -188,7 +195,7 @@ bash scripts/check-public-method-docs.sh
 - `TBANK_SANDBOX_INVEST_TOKEN`
 - `TBANK_SANDBOX_ACCOUNT_ID` для тестов счетов и ордеров
 - `TBANK_SANDBOX_TEST_INSTRUMENT` — необязательная замена `SBER_TQBR.MOEX`; текущий приёмочный контур проверяет путь акции MOEX/TQBR в RUB
-- `TBANK_SANDBOX_FUTURES_INSTRUMENT` — необходима для отдельной приёмочной функции MOEX/SPBFUT и должна содержать активный фьючерсный контракт в RUB в формате `TICKER_SPBFUT.MOEX`
+- `TBANK_SANDBOX_FUTURES_INSTRUMENT` — обязательный тикер инструмента для поиска фьючерса MOEX/SPBFUT (например, `Si`); тесты выбирают ближайший ещё не истёкший контракт в RUB, а доступность операций проверяют отдельно
 - `TBANK_SANDBOX_PAY_IN_RUB` — необязательное пополнение настроенного счёта песочницы
 
 Храните эти значения в локальном файле `.env`, исключённом из Git, и ограничьте доступ к файлу

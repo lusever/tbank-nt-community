@@ -1003,6 +1003,96 @@ fn reset_and_dispose_refuse_while_mutating_command_is_in_flight() {
 }
 
 #[test]
+fn broker_report_wins_race_with_inconclusive_submit_lookup() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    let pending_order = TbankSubmitOrder {
+        instrument_id: "SBER_TQBR.MOEX".to_string(),
+        client_order_id: "uncertain-order".to_string(),
+        broker_request_id: "uncertain-request".to_string(),
+        side: TbankOrderSide::Buy,
+        order_type: TbankOrderType::Market,
+        time_in_force: TimeInForce::Day,
+        quantity_units: Decimal::ONE,
+        limit_price: None,
+        trigger_price: None,
+        trailing: None,
+        confirm_margin_trade: false,
+    };
+    client
+        .runtime
+        .record_pending_submit(&pending_order, UnixNanos::from(1_u64));
+
+    let report_ts = UnixNanos::from(2_u64);
+    let report = OrderStatusReport::new(
+        "TBANK-001".into(),
+        InstrumentId::from("SBER_TQBR.MOEX"),
+        Some(ClientOrderId::from("uncertain-order")),
+        VenueOrderId::from("exchange-order-1"),
+        Some(OrderSide::Buy),
+        OrderType::Market,
+        TimeInForce::Day,
+        OrderStatus::Accepted,
+        Quantity::from(1),
+        Quantity::from(0),
+        report_ts,
+        report_ts,
+        report_ts,
+        Some(UUID4::new()),
+    );
+    client.runtime.mark_pending_submit_report(&report);
+
+    // This is the same transition used after a `NotFound` lookup. The report may arrive from the
+    // order stream in between the lookup and this write, so the unconfirmed-stage write must not
+    // replace its authoritative result.
+    client.runtime.mark_pending_submit_stage(
+        "uncertain-order",
+        TbankPendingSubmitStage::Unknown,
+        Some(UnixNanos::from(3_u64)),
+    );
+
+    let pending_submits = client.runtime.pending_submits.lock().unwrap();
+    let pending = pending_submits.get("uncertain-order").unwrap();
+    assert_eq!(pending.stage, TbankPendingSubmitStage::Accepted);
+    assert_eq!(pending.venue_order_id.as_deref(), Some("exchange-order-1"));
+    drop(pending_submits);
+    assert!(client.unresolved_submits().is_empty());
+}
+
+#[test]
+fn reset_refuses_while_a_submit_outcome_is_unresolved() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    activate_test_lifecycle(&client);
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    client
+        .runtime
+        .record_pending_submit(&pending_submit_order("uncertain-order"), UnixNanos::from(1_u64));
+
+    client.runtime.mark_pending_submit_terminal(
+        "uncertain-order",
+        TbankPendingSubmitStage::Unresolved,
+        5,
+        UnixNanos::from(2_u64),
+    );
+    assert!(ExecutionClient::reset(&mut client).is_err());
+    assert!(!client.runtime.instruments.lock().unwrap().is_empty());
+
+    // Only a broker guarantee that the request cannot later resolve releases its identity.
+    client.runtime.mark_pending_submit_terminal(
+        "uncertain-order",
+        TbankPendingSubmitStage::DefinitivelyAbsent,
+        1,
+        UnixNanos::from(3_u64),
+    );
+    ExecutionClient::reset(&mut client).unwrap();
+    assert!(client.runtime.instruments.lock().unwrap().is_empty());
+}
+
+#[test]
 fn reset_refuses_to_discard_buffered_broker_fill() {
     let mut client = test_client(TbankExecutionClientConfig::default());
     let ts = UnixNanos::from(1_u64);
@@ -1065,6 +1155,7 @@ fn terminal_order_report_settles_submit_and_ambiguous_cancel_state() {
             venue_order_id: Some("venue-order-1".to_string()),
             last_reconciliation_ts: None,
             stage: TbankPendingSubmitStage::Unknown,
+            recovery_attempts: 0,
         },
     )])));
     let unresolved_cancellations =
@@ -2032,6 +2123,7 @@ struct MockOrdersService {
     cancel_calls: Arc<Mutex<Vec<CancelOrderRequest>>>,
     cancel_error: Arc<Mutex<Option<(Code, String)>>>,
     state_calls: Arc<Mutex<Vec<GetOrderStateRequest>>>,
+    state_delay: Arc<Mutex<std::time::Duration>>,
     state_error: Arc<Mutex<Option<(Code, String)>>>,
     state_response: Arc<Mutex<Option<OrderState>>>,
     get_orders_calls: Arc<AtomicU64>,
@@ -2845,13 +2937,17 @@ async fn run_order_status_report_query_test(
 }
 
 use super::{
-    TbankBrokerOrderIdentity, TbankBrokerOrderIndex, TbankBrokerOrderRoute, TbankCancelTarget,
-    TbankExecutionClient, TbankManagedOrderContext, TbankPendingSubmit, TbankPendingSubmitStage,
-    TbankSubmitResponse, TbankTimeInForceType, confirm_margin_trade_for_submit, current_unix_nanos,
-    fill_report_from_order_trade, fill_side_from_operation_type, project_order_status_report,
+    SUBMIT_OUTCOME_RECOVERY_ATTEMPTS, SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET,
+    SUBMIT_OUTCOME_RECOVERY_DELAY_CAP,
+    TbankBrokerOrderIdentity, TbankBrokerOrderIndex,
+    TbankBrokerOrderRoute, TbankCancelTarget, TbankExecutionClient, TbankManagedOrderContext,
+    TbankPendingSubmit, TbankPendingSubmitStage, TbankSubmitResponse, TbankTimeInForceType,
+    confirm_margin_trade_for_submit, current_unix_nanos, fill_report_from_order_trade,
+    fill_side_from_operation_type, next_submit_outcome_recovery_delay, project_order_status_report,
     reconnect_reconciliation_error_is_transient, resolve_stream_order_venue_id,
     settle_order_report_mutation_state, settle_reconciled_buffered_trade_fill,
     stream_order_state_client_order_id, stream_order_status_report_from_state,
+    submit_outcome_recovery_budget,
     stream_stop_order_status_report_from_state, submit_nautilus_order_reports,
     submit_nautilus_order_reports_with_recovery, tbank_broker_request_id_for_client_order_id,
     trailing_stop_params,

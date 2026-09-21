@@ -610,8 +610,8 @@ fn activated_stop_child_keeps_stop_identity_and_uses_regular_cancel_route() {
             duplicate_fill,
             Some(&sender),
         )
-            .unwrap()
-            .is_none()
+        .unwrap()
+        .is_none()
     );
     assert!(receiver.try_recv().is_err());
     let projection = race_projection.lock().unwrap();
@@ -1002,6 +1002,7 @@ fn stop_order_state_stream_updates_known_stop_lifecycle() {
             venue_order_id: Some("stop-order-1".to_string()),
             last_reconciliation_ts: None,
             stage: TbankPendingSubmitStage::Submitted,
+            recovery_attempts: 0,
         },
     )])));
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
@@ -1155,22 +1156,20 @@ fn stop_order_context_records_limit_take_profit_reporting_type() {
     let client = test_client(TbankExecutionClientConfig::default());
     let mut metadata = sber_metadata();
     metadata.instrument_uid = "sber-uid".to_string();
-    client
-        .runtime
-        .record_stop_order_context(
-            "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
-            &StopOrder {
-                stop_order_id: "limit-tp-stop-1".to_string(),
-                direction: StopOrderDirection::Buy as i32,
-                order_type: StopOrderType::TakeProfit as i32,
-                exchange_order_type: ExchangeOrderType::Limit as i32,
-                instrument_uid: "sber-uid".to_string(),
-                ticker: "SBER".to_string(),
-                class_code: "TQBR".to_string(),
-                ..StopOrder::default()
-            },
-            &metadata,
-        );
+    client.runtime.record_stop_order_context(
+        "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
+        &StopOrder {
+            stop_order_id: "limit-tp-stop-1".to_string(),
+            direction: StopOrderDirection::Buy as i32,
+            order_type: StopOrderType::TakeProfit as i32,
+            exchange_order_type: ExchangeOrderType::Limit as i32,
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            ..StopOrder::default()
+        },
+        &metadata,
+    );
 
     let context = client
         .runtime
@@ -1279,10 +1278,7 @@ async fn stop_submit_reconciliation_does_not_rebind_known_broker_order() {
         Some("other-client-order".to_string())
     );
     assert_eq!(
-        index.identity_for(
-            Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
-            None
-        ),
+        index.identity_for(Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"), None),
         None
     );
 }
@@ -2060,7 +2056,8 @@ fn reported_operation_commission_corrects_an_emitted_synthetic_fill() {
 
     assert!(projected.is_none());
     let event = receiver.try_recv().unwrap();
-    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) = event
+    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) =
+        event
     else {
         panic!("expected custom execution event");
     };
@@ -2380,7 +2377,10 @@ fn fully_matched_unknown_trade_does_not_block_later_cumulative_commission() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(next.commission, TbankFillCommission::Allocated(Money::from("1.25 RUB")));
+    assert_eq!(
+        next.commission,
+        TbankFillCommission::Allocated(Money::from("1.25 RUB"))
+    );
 }
 
 #[test]
@@ -2600,9 +2600,8 @@ fn split_operation_commissions_accumulate_on_one_synthetic_fill() {
 
     let event = receiver.try_recv().unwrap();
     let event_amount = |event| {
-        let nautilus_common::messages::DataEvent::Data(
-            nautilus_model::data::Data::Custom(data),
-        ) = event
+        let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) =
+            event
         else {
             panic!("expected custom execution event");
         };
@@ -3353,7 +3352,9 @@ async fn submit_unknown_outcome_recovers_in_background_after_initial_miss() {
     let state_error = Arc::clone(&service.state_error);
     let state_response = Arc::clone(&service.state_response);
     let state_calls = Arc::clone(&service.state_calls);
-    *state_error.lock().unwrap() = Some((Code::NotFound, "order state not found".to_string()));
+    // A NOT_FOUND can race broker indexing too. A later lookup must still be able to recover it.
+    *state_error.lock().unwrap() =
+        Some((Code::NotFound, "50005: order not indexed yet".to_string()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -3440,4 +3441,536 @@ async fn submit_unknown_outcome_recovers_in_background_after_initial_miss() {
         assert_eq!(pending.stage, TbankPendingSubmitStage::Accepted);
         assert_eq!(pending.venue_order_id.as_deref(), Some("exchange-order-1"));
     }
+}
+
+fn ambiguous_submit_config(addr: std::net::SocketAddr) -> TbankExecutionClientConfig {
+    TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        enable_trading: true,
+        allow_live_trading: true,
+        reconnect_policy: TbankReconnectPolicy {
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            jitter: false,
+        },
+        ..TbankExecutionClientConfig::default()
+    }
+}
+
+async fn wait_for_pending_submit_stage(
+    client: &TbankExecutionClient,
+    client_order_id: &str,
+    expected: TbankPendingSubmitStage,
+) {
+    for _ in 0..10_000 {
+        let stage = client
+            .runtime
+            .pending_submits
+            .lock()
+            .unwrap()
+            .get(client_order_id)
+            .map(|pending| pending.stage);
+        if stage == Some(expected) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    panic!("pending submit never reached {expected:?}");
+}
+
+/// Asserts the client emitted nothing while the submit outcome stayed unresolved.
+///
+/// A closed channel with nothing buffered is also proof: `recv` drains buffered events first.
+async fn assert_no_execution_event(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+) {
+    match tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(event)) => {
+            panic!("an unresolved ambiguous submit must not emit an execution event: {event:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeated_submit_not_found_keeps_identity_unresolved_and_blocks_reset() {
+    let service = MockOrdersService::default();
+    *service.post_error.lock().unwrap() =
+        Some((Code::Unavailable, "submit response lost".to_string()));
+    let state_calls = Arc::clone(&service.state_calls);
+    // Even repeated 50005 responses do not prove that a submitted order was not accepted.
+    *service.state_error.lock().unwrap() =
+        Some((Code::NotFound, "50005: order not found".to_string()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(ambiguous_submit_config(addr));
+    seed_sber_metadata(&mut client);
+    client.connect_for_queries().await.unwrap();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let cmd = submit_order_cmd(None);
+    let reports = submit_nautilus_order_reports_with_recovery(
+        &mut client.runtime,
+        &cmd,
+        current_unix_nanos(),
+        Some(test_emitter(sender)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        reports,
+        super::submit::SubmitPipelineOutcome::Reports(reports) if reports.is_empty()
+    ));
+
+    let client_order_id = "524b1a03-efdd-4cd0-bd56-7cc6570c7156";
+    wait_for_pending_submit_stage(
+        &client,
+        client_order_id,
+        TbankPendingSubmitStage::Unresolved,
+    )
+    .await;
+
+    for _ in 0..10_000 {
+        if !client.runtime.has_unfinished_mutating_tasks() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert!(!client.runtime.has_unfinished_mutating_tasks());
+
+    let snapshot = client.unresolved_submits();
+    let pending = snapshot
+        .iter()
+        .find(|pending| pending.client_order_id == client_order_id)
+        .expect("the unresolved submit keeps its request identity");
+    assert_eq!(pending.stage, TbankPendingSubmitStage::Unresolved);
+    assert_eq!(pending.attempts, SUBMIT_OUTCOME_RECOVERY_ATTEMPTS);
+    assert_eq!(pending.instrument_id, "SBER_TQBR.MOEX");
+    assert_eq!(pending.side, TbankOrderSide::Buy);
+    assert_eq!(pending.order_type, TbankOrderType::Market);
+    assert!(pending.last_reconciliation_ts.is_some());
+
+    // The bounded ladder polls every configured attempt, then leaves the request unresolved.
+    assert_eq!(
+        state_calls.lock().unwrap().len(),
+        1 + SUBMIT_OUTCOME_RECOVERY_ATTEMPTS as usize
+    );
+    assert!(ExecutionClient::reset(&mut client).is_err());
+    assert!(client
+        .runtime
+        .pending_submits
+        .lock()
+        .unwrap()
+        .contains_key(client_order_id));
+    assert_no_execution_event(&mut receiver).await;
+}
+
+#[tokio::test]
+async fn submit_recovery_polls_transport_failures_to_the_bound_then_reports_unresolved() {
+    let service = MockOrdersService::default();
+    *service.post_error.lock().unwrap() =
+        Some((Code::Unavailable, "submit response lost".to_string()));
+    let state_calls = Arc::clone(&service.state_calls);
+    *service.state_error.lock().unwrap() =
+        Some((Code::Unavailable, "order state unavailable".to_string()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(ambiguous_submit_config(addr));
+    seed_sber_metadata(&mut client);
+    client.connect_for_queries().await.unwrap();
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let cmd = submit_order_cmd(None);
+    let reports = submit_nautilus_order_reports_with_recovery(
+        &mut client.runtime,
+        &cmd,
+        current_unix_nanos(),
+        Some(test_emitter(sender)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        reports,
+        super::submit::SubmitPipelineOutcome::Reports(reports) if reports.is_empty()
+    ));
+
+    let client_order_id = "524b1a03-efdd-4cd0-bd56-7cc6570c7156";
+    wait_for_pending_submit_stage(
+        &client,
+        client_order_id,
+        TbankPendingSubmitStage::Unresolved,
+    )
+    .await;
+
+    let snapshot = client.unresolved_submits();
+    let pending = snapshot
+        .iter()
+        .find(|pending| pending.client_order_id == client_order_id)
+        .expect("an unresolved submit must stay visible to consumers");
+    assert_eq!(pending.stage, TbankPendingSubmitStage::Unresolved);
+    assert_eq!(pending.attempts, SUBMIT_OUTCOME_RECOVERY_ATTEMPTS);
+    assert!(pending.last_reconciliation_ts.is_some());
+
+    // Transport failures never prove absence, so the ladder polls every bounded attempt.
+    assert_eq!(
+        state_calls.lock().unwrap().len(),
+        1 + SUBMIT_OUTCOME_RECOVERY_ATTEMPTS as usize
+    );
+    assert_no_execution_event(&mut receiver).await;
+}
+
+#[test]
+fn submit_recovery_ladder_finishes_inside_the_node_inflight_window() {
+    let start = tokio::time::Instant::now();
+    let recovery_budget = submit_outcome_recovery_budget(&TbankExecutionClientConfig::default());
+    let deadline = start + recovery_budget;
+
+    let ladder = |policy: &TbankReconnectPolicy| {
+        let mut elapsed = std::time::Duration::ZERO;
+        let mut attempts = 0;
+        for attempt in 0..SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
+            let Some(delay) =
+                next_submit_outcome_recovery_delay(policy, attempt, start + elapsed, deadline)
+            else {
+                break;
+            };
+            assert!(delay <= SUBMIT_OUTCOME_RECOVERY_DELAY_CAP);
+            elapsed += delay;
+            attempts += 1;
+        }
+        (attempts, elapsed)
+    };
+
+    let (attempts, elapsed) = ladder(&TbankReconnectPolicy::default());
+    assert_eq!(attempts, SUBMIT_OUTCOME_RECOVERY_ATTEMPTS);
+    assert!(elapsed <= recovery_budget);
+    assert_eq!(recovery_budget, std::time::Duration::from_secs(20));
+
+    // A policy whose backoff outgrows the budget is truncated instead of overrunning the window.
+    let (slow_attempts, slow_elapsed) = ladder(&TbankReconnectPolicy {
+        initial_backoff_ms: 10_000,
+        max_backoff_ms: 10_000,
+        jitter: false,
+    });
+    assert!(slow_attempts < SUBMIT_OUTCOME_RECOVERY_ATTEMPTS);
+    assert!(slow_elapsed <= recovery_budget);
+
+    let fast_policy = TbankReconnectPolicy {
+        initial_backoff_ms: 1,
+        max_backoff_ms: 1,
+        jitter: false,
+    };
+    assert_eq!(
+        next_submit_outcome_recovery_delay(&fast_policy, 0, start, deadline),
+        Some(super::SUBMIT_OUTCOME_RECOVERY_MIN_DELAY)
+    );
+}
+
+#[test]
+fn submit_recovery_budget_tracks_custom_live_node_inflight_settings() {
+    let live_config = nautilus_live::config::LiveExecutionEngineConfig {
+        inflight_check_interval_ms: 2_000,
+        inflight_check_threshold_ms: 1_000,
+        inflight_check_retries: 2,
+        ..nautilus_live::config::LiveExecutionEngineConfig::default()
+    };
+    let config = TbankExecutionClientConfig::default()
+        .with_live_node_execution_engine_config(&live_config);
+    let budget = submit_outcome_recovery_budget(&config);
+
+    // LiveNode checks every 2 s, so two in-flight checks can close the order after about 4 s.
+    assert_eq!(budget, std::time::Duration::from_millis(3_200));
+    assert!(budget < std::time::Duration::from_secs(4));
+}
+
+#[test]
+fn disabled_live_node_inflight_checks_keep_a_bounded_submit_budget() {
+    let live_config = nautilus_live::config::LiveExecutionEngineConfig {
+        inflight_check_interval_ms: 0,
+        ..nautilus_live::config::LiveExecutionEngineConfig::default()
+    };
+    let config = TbankExecutionClientConfig::default()
+        .with_live_node_execution_engine_config(&live_config);
+    let budget = submit_outcome_recovery_budget(&config);
+
+    assert_eq!(budget, SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET);
+
+    let now = tokio::time::Instant::now();
+    let (submit_deadline, submit_timeout) = super::submit_outcome_submit_budget(
+        std::time::Duration::from_secs(30),
+        now + budget,
+        now,
+    )
+    .expect("disabling LiveNode in-flight polling must not reject every submit");
+    assert_eq!(submit_timeout, budget / 2);
+    assert!(submit_deadline > now);
+}
+
+#[test]
+fn submit_budget_reserves_time_for_reconciliation_after_slow_post() {
+    let started = tokio::time::Instant::now();
+    let recovery_budget = submit_outcome_recovery_budget(&TbankExecutionClientConfig::default());
+    let reconciliation_reserve = recovery_budget / 2;
+    let recovery_deadline = started + recovery_budget;
+
+    let (submit_deadline, submit_timeout) = super::submit_outcome_submit_budget(
+        std::time::Duration::from_secs(30),
+        recovery_deadline,
+        started,
+    )
+    .expect("the submit must retain time before the reconciliation reserve");
+
+    assert_eq!(
+        submit_timeout,
+        recovery_budget - reconciliation_reserve
+    );
+    assert_eq!(
+        recovery_deadline.saturating_duration_since(submit_deadline),
+        reconciliation_reserve
+    );
+
+    let short_request = std::time::Duration::from_secs(3);
+    let (submit_deadline, submit_timeout) = super::submit_outcome_submit_budget(
+        short_request,
+        recovery_deadline,
+        started,
+    )
+    .expect("a shorter configured timeout must remain in effect");
+    assert_eq!(submit_timeout, short_request);
+    assert!(recovery_deadline.saturating_duration_since(submit_deadline) > reconciliation_reserve);
+
+    let short_live_config = nautilus_live::config::LiveExecutionEngineConfig {
+        inflight_check_interval_ms: 2_000,
+        inflight_check_threshold_ms: 1_000,
+        inflight_check_retries: 2,
+        ..nautilus_live::config::LiveExecutionEngineConfig::default()
+    };
+    let short_budget = submit_outcome_recovery_budget(
+        &TbankExecutionClientConfig::default()
+            .with_live_node_execution_engine_config(&short_live_config),
+    );
+    let (short_submit_deadline, short_submit_timeout) = super::submit_outcome_submit_budget(
+        std::time::Duration::from_secs(30),
+        started + short_budget,
+        started,
+    )
+    .expect("custom node settings retain a bounded submit window");
+    assert_eq!(short_submit_timeout, short_budget / 2);
+    assert_eq!(
+        (started + short_budget).saturating_duration_since(short_submit_deadline),
+        short_budget / 2
+    );
+
+    assert!(super::submit_outcome_submit_budget(
+        std::time::Duration::from_secs(30),
+        started,
+        started,
+    )
+    .is_none());
+}
+
+#[test]
+fn submit_recovery_rpc_timeout_uses_remaining_deadline_budget() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    let now = tokio::time::Instant::now();
+    client.runtime.recovery_rpc_deadline =
+        Some(now + std::time::Duration::from_millis(50));
+
+    let timeout = client.runtime.rpc_request_timeout().unwrap();
+    assert!(timeout > std::time::Duration::ZERO);
+    assert!(timeout <= std::time::Duration::from_millis(50));
+
+    let recovery_deadline = now + SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET;
+    let lookup_deadline = super::submit_outcome_recovery_lookup_deadline(recovery_deadline, now);
+    client.runtime.recovery_rpc_deadline = Some(lookup_deadline);
+    assert!(client.runtime.rpc_request_timeout().unwrap()
+        <= super::SUBMIT_OUTCOME_RECOVERY_LOOKUP_TIMEOUT);
+
+    client.runtime.recovery_rpc_deadline =
+        Some(tokio::time::Instant::now() - std::time::Duration::from_millis(1));
+    assert!(matches!(
+        client.runtime.rpc_request_timeout(),
+        Err(TbankAdapterError::GrpcStatus {
+            code: tonic::Code::DeadlineExceeded,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn submit_recovery_lookup_timeout_leaves_time_for_a_repeated_lookup() {
+    let started = tokio::time::Instant::now();
+    let recovery_budget = submit_outcome_recovery_budget(&TbankExecutionClientConfig::default());
+    let deadline = started + recovery_budget;
+    let first_lookup_start = deadline - recovery_budget / 2;
+    let first_lookup_deadline =
+        super::submit_outcome_recovery_lookup_deadline(deadline, first_lookup_start);
+
+    assert_eq!(
+        first_lookup_deadline.duration_since(first_lookup_start),
+        super::SUBMIT_OUTCOME_RECOVERY_LOOKUP_TIMEOUT
+    );
+
+    // Even the maximum backoff still leaves a positive RPC window for the next lookup.
+    let repeated_lookup_start = first_lookup_deadline + SUBMIT_OUTCOME_RECOVERY_DELAY_CAP;
+    assert!(repeated_lookup_start < deadline);
+    assert!(super::submit_outcome_recovery_lookup_deadline(deadline, repeated_lookup_start)
+        > repeated_lookup_start);
+}
+
+#[tokio::test]
+async fn submit_recovery_cancels_a_slow_rpc_at_the_remaining_deadline() {
+    let service = MockOrdersService::default();
+    *service.state_delay.lock().unwrap() = std::time::Duration::from_secs(1);
+    let state_calls = Arc::clone(&service.state_calls);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(ambiguous_submit_config(addr));
+    seed_sber_metadata(&mut client);
+    client.connect_for_queries().await.unwrap();
+    let order = pending_submit_order("client-deadline");
+    client
+        .runtime
+        .record_pending_submit(&order, current_unix_nanos());
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(25);
+    let outcome = client
+        .runtime
+        .step_submit_outcome_recovery(&order, &sber_metadata(), current_unix_nanos(), deadline)
+        .await;
+
+    assert!(matches!(
+        outcome,
+        super::TbankSubmitRecoveryStep::Inconclusive
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    assert_eq!(state_calls.lock().unwrap().len(), 1);
+}
+
+fn pending_submit_order(client_order_id: &str) -> TbankSubmitOrder {
+    TbankSubmitOrder {
+        instrument_id: "SBER_TQBR.MOEX".to_string(),
+        client_order_id: client_order_id.to_string(),
+        broker_request_id: format!("request-{client_order_id}"),
+        side: TbankOrderSide::Buy,
+        order_type: TbankOrderType::Market,
+        time_in_force: TimeInForce::Day,
+        quantity_units: Decimal::ONE,
+        limit_price: None,
+        trigger_price: None,
+        trailing: None,
+        confirm_margin_trade: false,
+    }
+}
+
+#[test]
+fn unresolved_submit_snapshot_tracks_stage_attempts_and_order() {
+    let client = test_client(TbankExecutionClientConfig::default());
+    client.runtime.record_pending_submit(
+        &pending_submit_order("client-later"),
+        UnixNanos::from(20_u64),
+    );
+    client.runtime.record_pending_submit(
+        &pending_submit_order("client-earlier"),
+        UnixNanos::from(10_u64),
+    );
+    client.runtime.touch_pending_submit_reconciliation(
+        "client-later",
+        3,
+        UnixNanos::from(25_u64),
+    );
+
+    let in_progress = client
+        .unresolved_submits()
+        .into_iter()
+        .find(|pending| pending.client_order_id == "client-later")
+        .unwrap();
+    assert_eq!(in_progress.attempts, 3);
+    assert_eq!(
+        in_progress.last_reconciliation_ts,
+        Some(UnixNanos::from(25_u64))
+    );
+
+    client.runtime.mark_pending_submit_terminal(
+        "client-later",
+        TbankPendingSubmitStage::Unresolved,
+        5,
+        UnixNanos::from(30_u64),
+    );
+
+    let snapshot = client.unresolved_submits();
+    assert_eq!(
+        snapshot
+            .iter()
+            .map(|pending| pending.client_order_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["client-earlier", "client-later"]
+    );
+
+    let unresolved = snapshot
+        .iter()
+        .find(|pending| pending.client_order_id == "client-later")
+        .unwrap();
+    assert_eq!(unresolved.stage, TbankPendingSubmitStage::Unresolved);
+    assert_eq!(unresolved.attempts, 5);
+    assert_eq!(unresolved.submitted_ts, UnixNanos::from(20_u64));
+    assert_eq!(
+        unresolved.last_reconciliation_ts,
+        Some(UnixNanos::from(30_u64))
+    );
+    assert_eq!(unresolved.instrument_id, "SBER_TQBR.MOEX");
+    assert_eq!(unresolved.side, TbankOrderSide::Buy);
+    assert_eq!(unresolved.order_type, TbankOrderType::Market);
+
+    let submitted = snapshot
+        .iter()
+        .find(|pending| pending.client_order_id == "client-earlier")
+        .unwrap();
+    assert_eq!(submitted.stage, TbankPendingSubmitStage::Submitted);
+    assert_eq!(submitted.attempts, 0);
+    assert_eq!(submitted.last_reconciliation_ts, None);
+
+    // A broker order report settles the submit and removes it from the snapshot.
+    client.runtime.mark_pending_submit_stage(
+        "client-later",
+        TbankPendingSubmitStage::Accepted,
+        None,
+    );
+    assert!(
+        client
+            .unresolved_submits()
+            .iter()
+            .all(|pending| pending.client_order_id != "client-later")
+    );
 }
