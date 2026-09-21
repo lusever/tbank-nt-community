@@ -101,6 +101,23 @@ pub enum TbankAdapterError {
     ReconnectFailed(String),
 }
 
+impl TbankAdapterError {
+    /// Whether the broker authoritatively reported that no order exists for this lookup.
+    ///
+    /// T-Bank answers an unknown order id with gRPC `NOT_FOUND` (broker code 50005). A transport
+    /// or timeout status says nothing about the order and must leave the outcome ambiguous.
+    #[must_use]
+    pub(crate) fn is_order_absent(&self) -> bool {
+        matches!(
+            self,
+            Self::GrpcStatus {
+                code: tonic::Code::NotFound,
+                message,
+            } if broker_error_code(message) == Some(50005)
+        )
+    }
+}
+
 impl From<tonic::Status> for TbankAdapterError {
     fn from(status: tonic::Status) -> Self {
         let message = grpc_status_message(&status);
@@ -184,5 +201,20 @@ mod tests {
             instrument_limit,
             TbankAdapterError::StopOrderLimitReached(message) if message == "80007"
         ));
+    }
+
+    #[test]
+    fn only_tbank_order_not_found_is_authoritative_absence() {
+        let order_absent =
+            TbankAdapterError::from(tonic::Status::not_found("50005: order not found"));
+        assert!(order_absent.is_order_absent());
+
+        let other_not_found =
+            TbankAdapterError::from(tonic::Status::not_found("instrument was not found"));
+        assert!(!other_not_found.is_order_absent());
+
+        let other_status_with_order_code =
+            TbankAdapterError::from(tonic::Status::unavailable("50005"));
+        assert!(!other_status_with_order_code.is_order_absent());
     }
 }

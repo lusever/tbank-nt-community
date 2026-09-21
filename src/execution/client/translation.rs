@@ -2,11 +2,10 @@
 
 use super::*;
 use crate::execution::projections::{
-    project_trade_fill_report_locked, update_duplicate_fill_provenance,
+    allocate_money_by_weights, project_trade_fill_report_locked, update_duplicate_fill_provenance,
 };
 use crate::grpc::generated::{StopOrderDirection, StopOrderType};
 use anyhow::Context;
-use rust_decimal::prelude::ToPrimitive;
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -1176,89 +1175,15 @@ pub(super) fn allocate_operation_commission(
     let TbankFillCommission::Reported(total) = commission else {
         return Ok(vec![TbankFillCommission::Unknown; notional_weights.len()]);
     };
-    for weight in notional_weights {
-        anyhow::ensure!(
-            *weight >= Decimal::ZERO,
-            "T-Bank operation commission weight must be non-negative: {weight}"
-        );
-    }
     let status = if notional_weights.len() == 1 {
         TbankFillCommission::Reported
     } else {
         TbankFillCommission::Allocated
     };
-    let total_weight = notional_weights.iter().copied().sum::<Decimal>();
-    let total_minor = money_to_minor_units(total)?;
-    let sign = total_minor.signum();
-    let total_minor = total_minor
-        .checked_abs()
-        .ok_or_else(|| anyhow::anyhow!("T-Bank operation commission minor units overflow"))?;
-    let total_minor_decimal = Decimal::from_i128_with_scale(total_minor, 0);
-    let mut allocations = vec![0_i128; notional_weights.len()];
-    let mut remainders = vec![Decimal::ZERO; notional_weights.len()];
-
-    if total_weight > Decimal::ZERO {
-        for (index, weight) in notional_weights.iter().copied().enumerate() {
-            let ideal = total_minor_decimal * weight / total_weight;
-            let base = ideal.floor().to_i128().ok_or_else(|| {
-                anyhow::anyhow!("T-Bank operation commission allocation overflow")
-            })?;
-            allocations[index] = base;
-            remainders[index] = ideal - Decimal::from_i128_with_scale(base, 0);
-        }
-    } else {
-        let count = i128::try_from(notional_weights.len())?;
-        let base = total_minor / count;
-        let remainder = usize::try_from(total_minor % count)?;
-        allocations.fill(base);
-        for index in 0..remainder {
-            remainders[index] = Decimal::ONE;
-        }
-    }
-
-    let allocated_minor = allocations.iter().copied().sum::<i128>();
-    let remaining_minor = total_minor - allocated_minor;
-    anyhow::ensure!(
-        (0..=i128::try_from(notional_weights.len())?).contains(&remaining_minor),
-        "T-Bank operation commission minor-unit allocation overflow: total={total_minor}, allocated={allocated_minor}"
-    );
-    let mut remainder_order = (0..notional_weights.len()).collect::<Vec<_>>();
-    remainder_order.sort_by(|left, right| {
-        remainders[*right]
-            .partial_cmp(&remainders[*left])
-            .expect("Decimal values are finite")
-            .then_with(|| left.cmp(right))
-    });
-    for index in remainder_order
+    Ok(allocate_money_by_weights(total, notional_weights)?
         .into_iter()
-        .take(usize::try_from(remaining_minor)?)
-    {
-        allocations[index] += 1;
-    }
-
-    let mut result = Vec::with_capacity(notional_weights.len());
-    for allocation in allocations {
-        let allocation = if sign < 0 { -allocation } else { allocation };
-        let amount = Decimal::from_i128_with_scale(allocation, u32::from(total.currency.precision));
-        let money = Money::from_decimal(amount, total.currency)?;
-        result.push(status(money));
-    }
-    Ok(result)
-}
-
-fn money_to_minor_units(money: Money) -> anyhow::Result<i128> {
-    let scale = 10_i128
-        .checked_pow(u32::from(money.currency.precision))
-        .ok_or_else(|| anyhow::anyhow!("currency precision is too large for minor units"))?;
-    let minor = money.as_decimal() * Decimal::from_i128_with_scale(scale, 0);
-    let integer = minor.trunc();
-    anyhow::ensure!(
-        integer == minor,
-        "money amount is not representable in currency minor units: {money}"
-    );
-    integer
-        .to_i128()
-        .ok_or_else(|| anyhow::anyhow!("money amount exceeds minor-unit range: {money}"))
+        .map(status)
+        .collect())
 }
 
 pub(super) fn fill_side_from_operation_type(operation_type: i32) -> Option<OrderSide> {

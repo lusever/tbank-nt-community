@@ -209,10 +209,24 @@ pub(super) async fn prepare_nautilus_order(
     })
 }
 
+pub(super) async fn prepare_nautilus_order_before_deadline(
+    client: &mut TbankExecutionRuntime,
+    cmd: nautilus_common::messages::execution::SubmitOrder,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<PreparedNautilusOrder> {
+    if tokio::time::Instant::now() >= deadline {
+        anyhow::bail!("T-Bank submit deadline expired during order preparation");
+    }
+    tokio::time::timeout_at(deadline, prepare_nautilus_order(client, cmd))
+        .await
+        .map_err(|_| anyhow::anyhow!("T-Bank submit deadline expired during order preparation"))?
+}
+
 pub(super) async fn submit_prepared_nautilus_order(
     client: &mut TbankExecutionRuntime,
     prepared: PreparedNautilusOrder,
     emitter: ExecutionEventEmitter,
+    recovery_deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
     let ts_init = current_unix_nanos();
     let order: nautilus_model::orders::OrderAny = prepared.cmd.order_init.clone().try_into()?;
@@ -220,6 +234,7 @@ pub(super) async fn submit_prepared_nautilus_order(
         client,
         prepared,
         ts_init,
+        recovery_deadline,
         Some(emitter.clone()),
     )
     .await?
@@ -302,12 +317,15 @@ pub(super) async fn submit_nautilus_order_reports_with_recovery(
     ts_init: UnixNanos,
     recovery_emitter: Option<ExecutionEventEmitter>,
 ) -> anyhow::Result<SubmitPipelineOutcome> {
-    match prepare_nautilus_order(client, cmd.clone()).await {
+    let recovery_deadline =
+        tokio::time::Instant::now() + submit_outcome_recovery_budget(&client.config);
+    match prepare_nautilus_order_before_deadline(client, cmd.clone(), recovery_deadline).await {
         Ok(prepared) => {
             submit_prepared_nautilus_order_reports_with_recovery(
                 client,
                 prepared,
                 ts_init,
+                recovery_deadline,
                 recovery_emitter,
             )
             .await
@@ -323,6 +341,7 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
     client: &mut TbankExecutionRuntime,
     prepared: PreparedNautilusOrder,
     ts_init: UnixNanos,
+    recovery_deadline: tokio::time::Instant,
     recovery_emitter: Option<ExecutionEventEmitter>,
 ) -> anyhow::Result<SubmitPipelineOutcome> {
     let PreparedNautilusOrder {
@@ -340,7 +359,12 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
         confirm_margin_trade = order.confirm_margin_trade,
         "submitting Nautilus order to T-Bank"
     );
-    let response = match client.submit_order(&order, &metadata).await {
+    // This deadline is captured when the command starts, before metadata preparation. The RPC
+    // timeout reserves part of the remaining window for reconciliation.
+    let response = match client
+        .submit_order_with_recovery_deadline(&order, &metadata, recovery_deadline)
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             match classify_command_failure(&error) {
@@ -355,11 +379,12 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
                 client_order_id = %cmd.client_order_id,
                 "T-Bank submit response failed; running broker reconciliation"
             );
+            // A single miss is not terminal: T-Bank may not have indexed an order it just applied.
             let unresolved_reason = match client
-                .reconcile_submit_outcome(&order, &metadata, ts_init)
+                .step_submit_outcome_recovery(&order, &metadata, ts_init, recovery_deadline)
                 .await
             {
-                Ok(Some(reconciled)) => {
+                TbankSubmitRecoveryStep::Resolved(reconciled) => {
                     client.mark_pending_submit_report(&reconciled.order_report);
                     return Ok(SubmitPipelineOutcome::Reports(
                         order_status_execution_reports(
@@ -368,11 +393,11 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
                         ),
                     ));
                 }
-                Ok(None) => format!(
-                    "T-Bank submit response failed and reconciliation found no broker state: {error}"
+                TbankSubmitRecoveryStep::NotFound => format!(
+                    "T-Bank submit response failed and the broker has not indexed the request id yet: {error}"
                 ),
-                Err(reconciliation_error) => format!(
-                    "T-Bank submit response failed and immediate reconciliation also failed: {reconciliation_error}"
+                TbankSubmitRecoveryStep::Inconclusive => format!(
+                    "T-Bank submit response failed and immediate reconciliation was inconclusive: {error}"
                 ),
             };
             tracing::warn!(
@@ -386,7 +411,13 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
                 Some(ts_init),
             );
             if let Some(emitter) = recovery_emitter {
-                client.spawn_submit_outcome_recovery(order, metadata, ts_init, emitter);
+                client.spawn_submit_outcome_recovery(
+                    order,
+                    metadata,
+                    ts_init,
+                    recovery_deadline,
+                    emitter,
+                );
             }
             return Ok(SubmitPipelineOutcome::Reports(Vec::new()));
         }

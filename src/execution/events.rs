@@ -57,7 +57,7 @@ impl TbankFillCommissionSource {
 pub enum TbankFillCommissionStatus {
     /// The venue message carried a commission value for this fill.
     Reported,
-    /// The venue supplied an operation-level total which the adapter allocated across fills.
+    /// The venue supplied an aggregate commission which the adapter attributed to this fill.
     Allocated,
     /// The venue message carries no commission field, so the value is unknown rather than zero.
     Unknown,
@@ -68,7 +68,7 @@ pub enum TbankFillCommissionStatus {
 pub enum TbankFillCommission {
     /// The venue supplied a commission value.
     Reported(Money),
-    /// The venue supplied an operation-level total which the adapter allocated across fills.
+    /// The venue supplied an aggregate commission which the adapter attributed to this fill.
     Allocated(Money),
     /// The venue message carries no commission field for this fill.
     Unknown,

@@ -1430,6 +1430,62 @@ async fn submit_order_list_accepts_explicit_no_contingency_orders() {
 }
 
 #[tokio::test]
+async fn submit_order_list_denies_every_undispatched_leg_after_shared_deadline() {
+    let first = submit_order_cmd_for("SBER_TQBR.MOEX", OrderType::Market, None).order_init;
+    let mut second = first.clone();
+    second.client_order_id = ClientOrderId::from("order-2");
+    let list = submit_order_list_cmd(vec![first, second]);
+    let mut client = test_client(TbankExecutionClientConfig {
+        account_id: Some("account-1".to_string()),
+        enable_trading: true,
+        allow_live_trading: true,
+        ..TbankExecutionClientConfig::default()
+    });
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    client.runtime.emitter.set_sender(sender);
+    let emitter = client.runtime.emitter.clone();
+
+    let mut prepared_orders = Vec::new();
+    let mut orders = Vec::new();
+    for command in super::nautilus::submit_commands_from_list(list) {
+        let order = command.order_init.clone().try_into().unwrap();
+        let client_order_id = command.client_order_id;
+        let prepared = super::prepare_nautilus_order(&mut client.runtime, command)
+            .await
+            .unwrap();
+        prepared_orders.push((prepared, client_order_id));
+        orders.push(order);
+    }
+
+    super::nautilus::submit_prepared_nautilus_order_list(
+        &mut client.runtime,
+        prepared_orders,
+        orders,
+        emitter,
+        tokio::time::Instant::now() - std::time::Duration::from_millis(1),
+    )
+    .await;
+
+    for _ in 0..2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ExecutionEvent::Order(OrderEventAny::Denied(event)) = event else {
+            panic!("expired order-list deadline must deny undispatched legs");
+        };
+        assert!(event.reason.as_str().contains("no dispatch window"));
+    }
+    assert!(receiver.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn submit_uses_order_initialized_instrument_when_command_instrument_diverges() {
     let mut client = test_client(TbankExecutionClientConfig {
         account_id: Some("account-1".to_string()),
@@ -1625,7 +1681,11 @@ async fn submit_response_without_order_id_is_outcome_unknown() {
     let client_order_id = prepared.order.client_order_id.clone();
     let error = client
         .runtime
-        .submit_order(&prepared.order, &prepared.metadata)
+        .submit_order_with_recovery_deadline(
+            &prepared.order,
+            &prepared.metadata,
+            tokio::time::Instant::now() + SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET,
+        )
         .await
         .expect_err("missing order_id must fail closed");
     assert!(error.to_string().contains("missing order_id"));
@@ -1639,6 +1699,24 @@ async fn submit_response_without_order_id_is_outcome_unknown() {
             .map(|pending| pending.stage),
         Some(TbankPendingSubmitStage::Unknown)
     );
+}
+
+#[tokio::test]
+async fn order_preparation_fails_closed_after_the_shared_submit_deadline() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    let cmd = submit_order_cmd(None);
+    let deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
+
+    let error = super::submit::prepare_nautilus_order_before_deadline(
+        &mut client.runtime,
+        cmd,
+        deadline,
+    )
+    .await
+    .err()
+    .expect("expired preparation deadline must stop before broker submit");
+
+    assert!(error.to_string().contains("deadline expired during order preparation"));
 }
 
 #[tokio::test]
@@ -1946,6 +2024,7 @@ fn update_pending_submit_binds_venue_order_id_and_timestamp() {
         venue_order_id: None,
         last_reconciliation_ts: None,
         stage: TbankPendingSubmitStage::Submitted,
+        recovery_attempts: 0,
     };
 
     update_pending_submit(&mut pending, TbankPendingSubmitStage::Accepted, Some("venue-1".to_string()), ts);
@@ -1978,6 +2057,7 @@ fn mark_pending_submit_order_report_only_touches_matching_client_order() {
                 venue_order_id: None,
                 last_reconciliation_ts: None,
                 stage: TbankPendingSubmitStage::Submitted,
+                recovery_attempts: 0,
             },
         )])));
 
@@ -2045,6 +2125,7 @@ fn mark_pending_submit_fill_report_matches_by_client_then_venue_order_id() {
                 venue_order_id: Some("venue-1".to_string()),
                 last_reconciliation_ts: None,
                 stage: TbankPendingSubmitStage::Accepted,
+                recovery_attempts: 0,
             },
         )])));
 

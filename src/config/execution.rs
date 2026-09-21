@@ -1,6 +1,7 @@
 use std::{env, fmt, time::Duration};
 
 use nautilus_common::factories::ClientConfig;
+use nautilus_live::config::LiveExecutionEngineConfig;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -33,6 +34,18 @@ pub struct TbankExecutionClientConfig {
     #[builder(default = Duration::from_secs(30))]
     /// Timeout for initial account registration with Nautilus.
     pub account_registration_timeout: Duration,
+    #[builder(default = 2_000)]
+    /// Mirrors `LiveExecutionEngineConfig::inflight_check_interval_ms`.
+    ///
+    /// Keep this synchronized with the config passed to `LiveNode` so ambiguous-submit recovery
+    /// ends before Nautilus closes an in-flight order.
+    pub live_node_inflight_check_interval_ms: u32,
+    #[builder(default = 5_000)]
+    /// Mirrors `LiveExecutionEngineConfig::inflight_check_threshold_ms`.
+    pub live_node_inflight_check_threshold_ms: u32,
+    #[builder(default = 5)]
+    /// Mirrors `LiveExecutionEngineConfig::inflight_check_retries`.
+    pub live_node_inflight_check_retries: u32,
     #[builder(default)]
     /// Stream reconnect backoff policy.
     pub reconnect_policy: TbankReconnectPolicy,
@@ -59,6 +72,18 @@ impl fmt::Debug for TbankExecutionClientConfig {
                 "account_registration_timeout",
                 &self.account_registration_timeout,
             )
+            .field(
+                "live_node_inflight_check_interval_ms",
+                &self.live_node_inflight_check_interval_ms,
+            )
+            .field(
+                "live_node_inflight_check_threshold_ms",
+                &self.live_node_inflight_check_threshold_ms,
+            )
+            .field(
+                "live_node_inflight_check_retries",
+                &self.live_node_inflight_check_retries,
+            )
             .field("reconnect_policy", &self.reconnect_policy)
             .field("enable_trading", &self.enable_trading)
             .field("allow_live_trading", &self.allow_live_trading)
@@ -83,6 +108,22 @@ impl Default for TbankExecutionClientConfig {
 }
 
 impl TbankExecutionClientConfig {
+    /// Copies the in-flight reconciliation settings from the config used to build `LiveNode`.
+    ///
+    /// Use the same `LiveExecutionEngineConfig` value for this method and
+    /// `LiveNodeBuilder::with_exec_engine_config` to keep submit recovery within Nautilus' actual
+    /// in-flight window.
+    #[must_use]
+    pub fn with_live_node_execution_engine_config(
+        mut self,
+        config: &LiveExecutionEngineConfig,
+    ) -> Self {
+        self.live_node_inflight_check_interval_ms = config.inflight_check_interval_ms;
+        self.live_node_inflight_check_threshold_ms = config.inflight_check_threshold_ms;
+        self.live_node_inflight_check_retries = config.inflight_check_retries;
+        self
+    }
+
     /// Returns the validated gRPC endpoint URI.
     pub fn endpoint_uri(&self) -> Result<String> {
         validate_endpoint(
@@ -237,6 +278,23 @@ mod tests {
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("secret-account"));
         assert!(!debug.contains("secret-endpoint"));
+    }
+
+    #[test]
+    fn live_node_execution_engine_config_is_copied_for_submit_recovery() {
+        let live_config = LiveExecutionEngineConfig {
+            inflight_check_interval_ms: 2_000,
+            inflight_check_threshold_ms: 1_000,
+            inflight_check_retries: 2,
+            ..LiveExecutionEngineConfig::default()
+        };
+
+        let config = TbankExecutionClientConfig::default()
+            .with_live_node_execution_engine_config(&live_config);
+
+        assert_eq!(config.live_node_inflight_check_interval_ms, 2_000);
+        assert_eq!(config.live_node_inflight_check_threshold_ms, 1_000);
+        assert_eq!(config.live_node_inflight_check_retries, 2);
     }
 
     #[test]
