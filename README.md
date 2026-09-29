@@ -19,7 +19,7 @@ Rust-нативный адаптер API T-Bank Invest для NautilusTrader.
 
 | tbank-nt-community | NautilusTrader | Rust | Контракты T-Bank |
 | --- | --- | --- | --- |
-| `0.3.0` | `v2.0.0rc4` | `1.98.0` | Release 1.49 |
+| `0.3.1` | `v2.0.0rc4` | `1.98.0` | Release 1.51 |
 
 ## Область поддержки
 
@@ -59,7 +59,7 @@ tbank-nt-community = { path = "../tbank-nt-community" }
 Для воспроизводимой Git-зависимости используйте неизменяемый тег:
 
 ```toml
-tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.3.0" }
+tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.3.1" }
 ```
 
 Все прямые зависимости потребителя от Nautilus должны использовать тот же источник `v2.0.0rc4`,
