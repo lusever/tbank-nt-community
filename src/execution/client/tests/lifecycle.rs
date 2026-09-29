@@ -2157,8 +2157,10 @@ struct MockOperationsService {
     portfolio_calls: Arc<AtomicU64>,
     portfolio_response: Arc<Mutex<Option<PortfolioResponse>>>,
     positions_response: Arc<Mutex<Option<PositionsResponse>>>,
-    cursor_gate: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    cursor_gate: CursorGate,
 }
+
+type CursorGate = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
 
 #[derive(Clone)]
 struct ShareByOnlyInstrumentsService {

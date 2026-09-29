@@ -519,13 +519,15 @@ pub(super) fn project_submit_response_fill_report(
     let Some(result) = client.lifecycle_active.run_if_active(|| {
         let sender = client.current_data_event_sender();
         let fill = client.project_order_status_fill_report_and_publish(
-            report,
-            order_id,
-            trade_id,
-            ts_init,
-            order_request_id,
-            cumulative_commission,
-            TbankFillCommissionSource::SubmitResponse,
+            TbankOrderStatusFillProjection::new(
+                report,
+                order_id,
+                trade_id,
+                ts_init,
+                order_request_id,
+                cumulative_commission,
+                TbankFillCommissionSource::SubmitResponse,
+            ),
             sender.as_ref(),
         )?;
         Ok(fill.and_then(|fill| client.finish_order_status_fill_report(fill)))

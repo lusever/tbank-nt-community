@@ -379,7 +379,7 @@ pub fn register_tbank_execution_custom_data() {
 pub(crate) fn fill_report_commission(commission: TbankFillCommission) -> Money {
     commission
         .amount()
-        .unwrap_or_else(|| unknown_commission_placeholder())
+        .unwrap_or_else(unknown_commission_placeholder)
 }
 
 fn unknown_commission_placeholder() -> Money {

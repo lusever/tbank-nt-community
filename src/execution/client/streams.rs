@@ -30,17 +30,19 @@ fn project_order_state_fills(
         let fill = context
             .query_client
             .project_order_status_fill_report_and_publish(
-                report,
-                report.venue_order_id.as_str(),
-                synthetic_trade_id.as_str(),
-                report.ts_last,
-                report
-                    .client_order_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .as_deref(),
-                None,
-                TbankFillCommissionSource::OrderStateStream,
+                TbankOrderStatusFillProjection::new(
+                    report,
+                    report.venue_order_id.as_str(),
+                    synthetic_trade_id.as_str(),
+                    report.ts_last,
+                    report
+                        .client_order_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    None,
+                    TbankFillCommissionSource::OrderStateStream,
+                ),
                 sender.as_ref(),
             )?;
         let Some(fill) = fill else {
@@ -369,14 +371,8 @@ pub(super) async fn publish_order_state_stream(
                         }
                         if context.is_active()
                             && let Err(error) = publish_buffered_trade_fills_for_venue(
+                                &context,
                                 current_broker_order_id.as_str(),
-                                &context.emitter,
-                                &context.broker_order_index,
-                                &context.fill_projection,
-                                &context.pending_submits,
-                                &context.unresolved_trade_fills,
-                                &context.lifecycle_active,
-                                context.query_client.current_data_event_sender().as_ref(),
                             )
                         {
                             tracing::warn!(

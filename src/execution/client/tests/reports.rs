@@ -1688,13 +1688,15 @@ fn order_status_fill_projection_dedupes_late_stream_fill() {
     let projected = client
         .runtime
         .project_order_status_fill_report(
-            &report,
-            "exchange-order-1",
-            "SUBMIT-exchange-order-1-10",
-            ts_init,
-            Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
-            None,
-            TbankFillCommissionSource::SubmitResponse,
+            super::TbankOrderStatusFillProjection::new(
+                &report,
+                "exchange-order-1",
+                "SUBMIT-exchange-order-1-10",
+                ts_init,
+                Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
+                None,
+                TbankFillCommissionSource::SubmitResponse,
+            ),
         )
         .unwrap()
         .unwrap();
@@ -1758,13 +1760,15 @@ fn order_status_fill_projection_requires_execution_average_price() {
         client
             .runtime
             .project_order_status_fill_report(
-                &report,
-                "venue-order-1",
-                "synthetic-trade-stream",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateQuery,
+                super::TbankOrderStatusFillProjection::new(
+                    &report,
+                    "venue-order-1",
+                    "synthetic-trade-stream",
+                    ts,
+                    Some("client-order-1"),
+                    None,
+                    TbankFillCommissionSource::OrderStateQuery,
+                ),
             )
             .unwrap()
             .is_none()
@@ -1804,13 +1808,15 @@ fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
     let first_fill = client
         .runtime
         .project_order_status_fill_report(
-            &first,
-            "venue-order-1",
-            "synthetic-trade-1",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateQuery,
+            super::TbankOrderStatusFillProjection::new(
+                &first,
+                "venue-order-1",
+                "synthetic-trade-1",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateQuery,
+            ),
         )
         .unwrap()
         .unwrap();
@@ -1837,13 +1843,15 @@ fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
     let second_fill = client
         .runtime
         .project_order_status_fill_report(
-            &second,
-            "venue-order-1",
-            "synthetic-trade-2",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateQuery,
+            super::TbankOrderStatusFillProjection::new(
+                &second,
+                "venue-order-1",
+                "synthetic-trade-2",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateQuery,
+            ),
         )
         .unwrap()
         .unwrap();
@@ -1880,13 +1888,15 @@ fn repeated_cumulative_snapshot_corrects_unknown_commission_provenance() {
     let first = client
         .runtime
         .project_order_status_fill_report(
-            &report,
-            "venue-order-1",
-            "synthetic-trade-stream",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateStream,
+            super::TbankOrderStatusFillProjection::new(
+                &report,
+                "venue-order-1",
+                "synthetic-trade-stream",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateStream,
+            ),
         )
         .unwrap()
         .expect("the initial cumulative snapshot emits the fill");
@@ -1904,13 +1914,15 @@ fn repeated_cumulative_snapshot_corrects_unknown_commission_provenance() {
     let correction = client
         .runtime
         .project_order_status_fill_report(
-            &report,
-            "venue-order-1",
-            "synthetic-trade-submit",
-            ts,
-            Some("client-order-1"),
-            Some(Money::from("1.25 RUB")),
-            TbankFillCommissionSource::SubmitResponse,
+            super::TbankOrderStatusFillProjection::new(
+                &report,
+                "venue-order-1",
+                "synthetic-trade-submit",
+                ts,
+                Some("client-order-1"),
+                Some(Money::from("1.25 RUB")),
+                TbankFillCommissionSource::SubmitResponse,
+            ),
         )
         .unwrap()
         .expect("a later cumulative commission must produce a provenance correction");
@@ -1972,13 +1984,15 @@ fn fill_snapshot_does_not_overwrite_live_commission_with_unknown() {
     let live_fill = client
         .runtime
         .project_order_status_fill_report(
-            &order,
-            "venue-order-1",
-            "trade-1",
-            ts,
-            Some("client-order-1"),
-            Some(Money::from("1 RUB")),
-            TbankFillCommissionSource::OrderStateQuery,
+            super::TbankOrderStatusFillProjection::new(
+                &order,
+                "venue-order-1",
+                "trade-1",
+                ts,
+                Some("client-order-1"),
+                Some(Money::from("1 RUB")),
+                TbankFillCommissionSource::OrderStateQuery,
+            ),
         )
         .unwrap()
         .expect("live fill provenance is tracked");
@@ -2056,13 +2070,15 @@ fn fill_snapshot_upgrade_prevents_later_cumulative_commission_downgrade() {
     let live_unknown = client
         .runtime
         .project_order_status_fill_report(
-            &order,
-            "venue-order-1",
-            "trade-1",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateStream,
+            super::TbankOrderStatusFillProjection::new(
+                &order,
+                "venue-order-1",
+                "trade-1",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateStream,
+            ),
         )
         .unwrap()
         .expect("live unknown commission is tracked");
@@ -2125,13 +2141,15 @@ fn fill_snapshot_upgrade_prevents_later_cumulative_commission_downgrade() {
     assert!(client
         .runtime
         .project_order_status_fill_report(
-            &order,
-            "venue-order-1",
-            "query-trade-1",
-            ts,
-            Some("client-order-1"),
-            Some(Money::from("1 RUB")),
-            TbankFillCommissionSource::OrderStateQuery,
+            super::TbankOrderStatusFillProjection::new(
+                &order,
+                "venue-order-1",
+                "query-trade-1",
+                ts,
+                Some("client-order-1"),
+                Some(Money::from("1 RUB")),
+                TbankFillCommissionSource::OrderStateQuery,
+            ),
         )
         .unwrap()
         .is_none());
@@ -2166,13 +2184,15 @@ fn inactive_lifecycle_does_not_publish_snapshot_fill_provenance() {
     assert!(client
         .runtime
         .project_order_status_fill_report(
-            &order,
-            "venue-order-1",
-            "trade-1",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateStream,
+            super::TbankOrderStatusFillProjection::new(
+                &order,
+                "venue-order-1",
+                "trade-1",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateStream,
+            ),
         )
         .unwrap()
         .is_some());
@@ -2233,13 +2253,15 @@ fn cumulative_commission_corrects_single_unknown_partial_fill_with_new_snapshot_
     let known = client
         .runtime
         .project_order_status_fill_report(
-            &partial,
-            "venue-order-1",
-            "known-partial-fill",
-            ts,
-            Some("client-order-1"),
-            Some(Money::from("0.25 RUB")),
-            TbankFillCommissionSource::OrderStateStream,
+            super::TbankOrderStatusFillProjection::new(
+                &partial,
+                "venue-order-1",
+                "known-partial-fill",
+                ts,
+                Some("client-order-1"),
+                Some(Money::from("0.25 RUB")),
+                TbankFillCommissionSource::OrderStateStream,
+            ),
         )
         .unwrap()
         .expect("known partial fill emits once");
@@ -2269,13 +2291,15 @@ fn cumulative_commission_corrects_single_unknown_partial_fill_with_new_snapshot_
     let unknown = client
         .runtime
         .project_order_status_fill_report(
-            &filled,
-            "venue-order-1",
-            "unknown-partial-fill",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateStream,
+            super::TbankOrderStatusFillProjection::new(
+                &filled,
+                "venue-order-1",
+                "unknown-partial-fill",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateStream,
+            ),
         )
         .unwrap()
         .expect("unknown partial fill emits once");
@@ -2289,13 +2313,15 @@ fn cumulative_commission_corrects_single_unknown_partial_fill_with_new_snapshot_
     let correction = client
         .runtime
         .project_order_status_fill_report(
-            &filled,
-            "venue-order-1",
-            "new-cumulative-query-id",
-            ts,
-            Some("client-order-1"),
-            Some(Money::from("1.25 RUB")),
-            TbankFillCommissionSource::OrderStateQuery,
+            super::TbankOrderStatusFillProjection::new(
+                &filled,
+                "venue-order-1",
+                "new-cumulative-query-id",
+                ts,
+                Some("client-order-1"),
+                Some(Money::from("1.25 RUB")),
+                TbankFillCommissionSource::OrderStateQuery,
+            ),
         )
         .unwrap()
         .expect("the sole unknown partial fill is corrected from the cumulative commission");
@@ -2395,13 +2421,15 @@ fn submit_commission_correction_cannot_overtake_stream_provenance_publication() 
             .run_if_active(|| {
                 let fill = stream_runtime
                     .project_order_status_fill_report(
-                        &stream_report,
-                        "venue-order-1",
-                        "stream-fill",
-                        ts,
-                        Some("client-order-1"),
-                        None,
-                        TbankFillCommissionSource::OrderStateStream,
+                        super::TbankOrderStatusFillProjection::new(
+                            &stream_report,
+                            "venue-order-1",
+                            "stream-fill",
+                            ts,
+                            Some("client-order-1"),
+                            None,
+                            TbankFillCommissionSource::OrderStateStream,
+                        ),
                     )
                     .unwrap()
                     .expect("stream fill is projected");
@@ -2515,13 +2543,15 @@ fn unknown_order_side_does_not_advance_fill_projection() {
         client
             .runtime
             .project_order_status_fill_report(
-                &unknown_side,
-                "venue-order-1",
-                "synthetic-trade-unknown-side",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateQuery,
+                super::TbankOrderStatusFillProjection::new(
+                    &unknown_side,
+                    "venue-order-1",
+                    "synthetic-trade-unknown-side",
+                    ts,
+                    Some("client-order-1"),
+                    None,
+                    TbankFillCommissionSource::OrderStateQuery,
+                ),
             )
             .unwrap()
             .is_none()
@@ -2556,13 +2586,15 @@ fn unknown_order_side_does_not_advance_fill_projection() {
     let fill = client
         .runtime
         .project_order_status_fill_report(
-            &known_side,
-            "venue-order-1",
-            "synthetic-trade-known-side",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateQuery,
+            super::TbankOrderStatusFillProjection::new(
+                &known_side,
+                "venue-order-1",
+                "synthetic-trade-known-side",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateQuery,
+            ),
         )
         .unwrap()
         .expect("known side should publish the previously unprojected fill");
@@ -4101,13 +4133,15 @@ fn closed_cumulative_provenance_channel_does_not_block_fill_projection() {
     let fill = client
         .runtime
         .project_order_status_fill_report_and_publish(
-            &report,
-            "venue-order-1",
-            "synthetic-trade-1",
-            ts,
-            Some("client-order-1"),
-            None,
-            TbankFillCommissionSource::OrderStateStream,
+            super::TbankOrderStatusFillProjection::new(
+                &report,
+                "venue-order-1",
+                "synthetic-trade-1",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateStream,
+            ),
             Some(&closed_sender),
         )
         .unwrap()
@@ -4634,7 +4668,7 @@ async fn generate_fill_reports_returns_operation_history_trades() {
             order_requests[0]
                 .advanced_filters
                 .as_ref()
-                .and_then(|filters| filters.from.clone()),
+                .and_then(|filters| filters.from),
             Some(today),
             "identity warmup must start at the broker's full current-day boundary"
         );
@@ -4816,9 +4850,10 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
 async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_partial_fills() {
     let operations_service = MockOperationsService::default();
     let operation_calls = Arc::clone(&operations_service.calls);
-    let mut pages = operations_service.pages.lock().unwrap();
-    pages.push_back(GetOperationsByCursorResponse {
-        items: vec![
+    {
+        let mut pages = operations_service.pages.lock().unwrap();
+        pages.push_back(GetOperationsByCursorResponse {
+            items: vec![
             OperationItem {
                 id: "operation-with-order-identity".to_string(),
                 r#type: TbankOperationType::Buy as i32,
@@ -4868,10 +4903,10 @@ async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_
                 }),
                 ..OperationItem::default()
             },
-        ],
-        ..GetOperationsByCursorResponse::default()
-    });
-    drop(pages);
+            ],
+            ..GetOperationsByCursorResponse::default()
+        });
+    }
     *operations_service.positions_response.lock().unwrap() = Some(PositionsResponse::default());
 
     let orders_service = MockOrdersService::default();

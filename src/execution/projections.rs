@@ -524,11 +524,13 @@ mod tests {
 
     #[test]
     fn snapshot_provenance_upgrade_changes_only_the_existing_commission_ledger() {
-        let mut order = super::TbankOrderFillProjection::default();
-        order.cumulative_filled_quantity = Decimal::from(10);
-        order.emitted_fill_quantity = Decimal::from(10);
-        order.emitted_fill_notional = Decimal::from(1_000);
-        order.unmatched_emitted_quantity = Decimal::from(2);
+        let mut order = super::TbankOrderFillProjection {
+            cumulative_filled_quantity: Decimal::from(10),
+            emitted_fill_quantity: Decimal::from(10),
+            emitted_fill_notional: Decimal::from(1_000),
+            unmatched_emitted_quantity: Decimal::from(2),
+            ..Default::default()
+        };
         order.seen_trade_ids.insert("live-trade".to_string());
         order
             .unmatched_synthetic_fills
@@ -1174,6 +1176,11 @@ pub(super) struct TbankProjectedFill {
     pub(super) trade_id: Option<String>,
 }
 
+type TbankDuplicateFillCorrections = (
+    Vec<(String, TbankFillCommission)>,
+    Option<TbankFillCommission>,
+);
+
 #[cfg(test)]
 pub(super) fn project_cumulative_order_fill(
     projection: &Arc<Mutex<TbankFillProjection>>,
@@ -1225,7 +1232,7 @@ pub(super) fn project_cumulative_order_fill_with_publication(
             Some(commission) => update_cumulative_commission_tracking(&mut order, commission)?,
             None => None,
         };
-        let projected = correction
+        correction
             .map(
                 |(trade_id, quantity, commission)| -> anyhow::Result<TbankProjectedFill> {
                     Ok(TbankProjectedFill {
@@ -1240,8 +1247,7 @@ pub(super) fn project_cumulative_order_fill_with_publication(
                     })
                 },
             )
-            .transpose()?;
-        projected
+            .transpose()?
     } else {
         let residual_notional = cumulative_notional - order.emitted_fill_notional;
         anyhow::ensure!(
@@ -1478,10 +1484,7 @@ pub(super) fn update_duplicate_fill_provenance(
     projection: &mut TbankFillProjection,
     report: &FillReport,
     commission: TbankFillCommission,
-) -> anyhow::Result<(
-    Vec<(String, TbankFillCommission)>,
-    Option<TbankFillCommission>,
-)> {
+) -> anyhow::Result<TbankDuplicateFillCorrections> {
     let Some(reported) = commission.amount() else {
         return Ok((Vec::new(), None));
     };
@@ -1785,8 +1788,8 @@ pub(super) fn allocate_money_by_weights(
         let base = total_minor / count;
         let remainder = usize::try_from(total_minor % count)?;
         allocations.fill(base);
-        for index in 0..remainder {
-            remainders[index] = Decimal::ONE;
+        for remainder in remainders.iter_mut().take(remainder) {
+            *remainder = Decimal::ONE;
         }
     }
 

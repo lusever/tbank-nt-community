@@ -748,16 +748,9 @@ pub(super) fn schedule_regular_order_reconciliation(
                         .identity_for(client_order_id.as_deref(), None)
                         .map(|identity| identity.broker_order_id)
                         .unwrap_or(reconciled_venue_order_id);
-                    if let Err(error) = publish_buffered_trade_fills_for_venue(
-                        current_order_id.as_str(),
-                        &context.emitter,
-                        &context.broker_order_index,
-                        &context.fill_projection,
-                        &context.pending_submits,
-                        &context.unresolved_trade_fills,
-                        &context.lifecycle_active,
-                        context.query_client.current_data_event_sender().as_ref(),
-                    ) {
+                    if let Err(error) =
+                        publish_buffered_trade_fills_for_venue(&context, current_order_id.as_str())
+                    {
                         tracing::warn!(
                             %error,
                             client_order_id = client_order_id.as_deref().unwrap_or(""),
@@ -952,14 +945,8 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                                 }
                             });
                             match publish_buffered_trade_fills_for_venue(
+                                &context,
                                 venue_order_id.as_str(),
-                                &context.emitter,
-                                &context.broker_order_index,
-                                &context.fill_projection,
-                                &context.pending_submits,
-                                &context.unresolved_trade_fills,
-                                &context.lifecycle_active,
-                                context.query_client.current_data_event_sender().as_ref(),
                             ) {
                                 Ok(_) => {
                                     if finish_unresolved_trade_reconciliation_if_idle(
@@ -1114,14 +1101,8 @@ pub(super) fn schedule_unresolved_trade_reconciliation(
                 }
                 drop(broker_order_index);
                 match publish_buffered_trade_fills_for_venue(
+                    &context,
                     venue_order_id.as_str(),
-                    &context.emitter,
-                    &context.broker_order_index,
-                    &context.fill_projection,
-                    &context.pending_submits,
-                    &context.unresolved_trade_fills,
-                    &context.lifecycle_active,
-                    context.query_client.current_data_event_sender().as_ref(),
                 ) {
                     Ok(_) => {
                         if finish_unresolved_trade_reconciliation_if_idle(
@@ -1227,14 +1208,8 @@ pub(super) fn schedule_activated_stop_child_reconciliation(
                         .aliases_for_canonical_venue_order_id(stop_order_id.as_str());
                     for child_order_id in child_aliases {
                         if let Err(error) = publish_buffered_trade_fills_for_venue(
+                            &context,
                             child_order_id.as_str(),
-                            &context.emitter,
-                            &context.broker_order_index,
-                            &context.fill_projection,
-                            &context.pending_submits,
-                            &context.unresolved_trade_fills,
-                            &context.lifecycle_active,
-                            context.query_client.current_data_event_sender().as_ref(),
                         ) {
                             tracing::warn!(
                                 %error,
@@ -1290,18 +1265,14 @@ pub(super) fn schedule_activated_stop_child_reconciliation(
 }
 
 pub(super) fn publish_buffered_trade_fills_for_venue(
+    context: &TbankOrderStreamContext,
     venue_order_id: &str,
-    emitter: &ExecutionEventEmitter,
-    broker_order_index: &Arc<Mutex<TbankBrokerOrderIndex>>,
-    fill_projection: &Arc<Mutex<TbankFillProjection>>,
-    pending_submits: &Arc<Mutex<HashMap<String, TbankPendingSubmit>>>,
-    unresolved_trade_fills: &Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
-    lifecycle_active: &Arc<TbankLifecycleToken>,
-    sender: Option<&TbankDataEventSender>,
 ) -> anyhow::Result<usize> {
-    lifecycle_active
+    context
+        .lifecycle_active
         .run_if_active(|| {
-            let reports = unresolved_trade_fills
+            let reports = context
+                .unresolved_trade_fills
                 .lock()
                 .expect("unresolved_trade_fills lock")
                 .remove(venue_order_id)
@@ -1310,17 +1281,17 @@ pub(super) fn publish_buffered_trade_fills_for_venue(
             let mut published = 0_usize;
             while let Some(raw_report) = reports.next() {
                 let projected = match project_managed_trade_fill_report(
-                    broker_order_index,
-                    fill_projection,
+                    &context.broker_order_index,
+                    &context.fill_projection,
                     raw_report.clone(),
-                    sender,
+                    context.query_client.current_data_event_sender().as_ref(),
                 ) {
                     Ok(projected) => projected,
                     Err(error) => {
                         let mut unprocessed = vec![raw_report];
                         unprocessed.extend(reports);
                         restore_unprocessed_trade_fills(
-                            unresolved_trade_fills,
+                            &context.unresolved_trade_fills,
                             venue_order_id,
                             unprocessed,
                         );
@@ -1328,8 +1299,8 @@ pub(super) fn publish_buffered_trade_fills_for_venue(
                     }
                 };
                 if let Some(report) = projected {
-                    emitter.send_fill_report(report.clone());
-                    mark_pending_submit_fill_report(pending_submits, &report);
+                    context.emitter.send_fill_report(report.clone());
+                    mark_pending_submit_fill_report(&context.pending_submits, &report);
                     published = published.saturating_add(1);
                 }
             }

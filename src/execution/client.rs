@@ -422,6 +422,38 @@ struct TbankOrderStreamContext {
     reconciliation_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
+struct TbankOrderStatusFillProjection<'a> {
+    report: &'a OrderStatusReport,
+    order_id: &'a str,
+    trade_id: &'a str,
+    ts_init: UnixNanos,
+    order_request_id: Option<&'a str>,
+    cumulative_commission: Option<Money>,
+    source: TbankFillCommissionSource,
+}
+
+impl<'a> TbankOrderStatusFillProjection<'a> {
+    fn new(
+        report: &'a OrderStatusReport,
+        order_id: &'a str,
+        trade_id: &'a str,
+        ts_init: UnixNanos,
+        order_request_id: Option<&'a str>,
+        cumulative_commission: Option<Money>,
+        source: TbankFillCommissionSource,
+    ) -> Self {
+        Self {
+            report,
+            order_id,
+            trade_id,
+            ts_init,
+            order_request_id,
+            cumulative_commission,
+            source,
+        }
+    }
+}
+
 impl TbankOrderStreamContext {
     fn is_active(&self) -> bool {
         self.lifecycle_active.load(Ordering::Acquire)
@@ -3156,13 +3188,15 @@ impl TbankExecutionRuntime {
         match self.lifecycle_active.run_if_active(|| {
             let sender = self.current_data_event_sender();
             let Some(fill) = self.project_order_status_fill_report_and_publish(
-                report,
-                order_id,
-                trade_id.as_str(),
-                ts_init,
-                Some(state.order_request_id.as_str()),
-                cumulative_commission,
-                TbankFillCommissionSource::OrderStateQuery,
+                TbankOrderStatusFillProjection::new(
+                    report,
+                    order_id,
+                    trade_id.as_str(),
+                    ts_init,
+                    Some(state.order_request_id.as_str()),
+                    cumulative_commission,
+                    TbankFillCommissionSource::OrderStateQuery,
+                ),
                 sender.as_ref(),
             )?
             else {
@@ -3181,38 +3215,28 @@ impl TbankExecutionRuntime {
     #[cfg(test)]
     fn project_order_status_fill_report(
         &self,
-        report: &OrderStatusReport,
-        order_id: &str,
-        trade_id: &str,
-        ts_init: UnixNanos,
-        order_request_id: Option<&str>,
-        cumulative_commission: Option<Money>,
-        source: TbankFillCommissionSource,
+        projection: TbankOrderStatusFillProjection<'_>,
     ) -> anyhow::Result<Option<TbankFillReport>> {
-        self.project_order_status_fill_report_with_publisher(
-            report,
-            order_id,
-            trade_id,
-            ts_init,
-            order_request_id,
-            cumulative_commission,
-            source,
-            |_| Ok(()),
-        )
+        self.project_order_status_fill_report_with_publisher(projection, |_| Ok(()))
     }
 
     fn project_order_status_fill_report_and_publish(
         &self,
-        report: &OrderStatusReport,
-        order_id: &str,
-        trade_id: &str,
-        ts_init: UnixNanos,
-        order_request_id: Option<&str>,
-        cumulative_commission: Option<Money>,
-        source: TbankFillCommissionSource,
+        projection: TbankOrderStatusFillProjection<'_>,
         sender: Option<&TbankDataEventSender>,
     ) -> anyhow::Result<Option<TbankFillReport>> {
-        self.project_order_status_fill_report_with_publisher(
+        self.project_order_status_fill_report_with_publisher(projection, |fill| {
+            fill.publish_provenance_best_effort(sender);
+            Ok(())
+        })
+    }
+
+    fn project_order_status_fill_report_with_publisher(
+        &self,
+        projection: TbankOrderStatusFillProjection<'_>,
+        publish: impl FnOnce(&TbankFillReport) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<TbankFillReport>> {
+        let TbankOrderStatusFillProjection {
             report,
             order_id,
             trade_id,
@@ -3220,24 +3244,7 @@ impl TbankExecutionRuntime {
             order_request_id,
             cumulative_commission,
             source,
-            |fill| {
-                fill.publish_provenance_best_effort(sender);
-                Ok(())
-            },
-        )
-    }
-
-    fn project_order_status_fill_report_with_publisher(
-        &self,
-        report: &OrderStatusReport,
-        order_id: &str,
-        trade_id: &str,
-        ts_init: UnixNanos,
-        order_request_id: Option<&str>,
-        cumulative_commission: Option<Money>,
-        source: TbankFillCommissionSource,
-        publish: impl FnOnce(&TbankFillReport) -> anyhow::Result<()>,
-    ) -> anyhow::Result<Option<TbankFillReport>> {
+        } = projection;
         let cumulative_quantity = report.filled_qty.as_decimal();
         if cumulative_quantity <= Decimal::ZERO {
             return Ok(None);

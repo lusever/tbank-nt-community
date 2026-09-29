@@ -46,22 +46,6 @@ fn utc_day_start(timestamp: UnixNanos) -> UnixNanos {
     UnixNanos::from(timestamp.as_u64() / NANOS_PER_DAY * NANOS_PER_DAY)
 }
 
-#[cfg(test)]
-mod mass_status_window_tests {
-    use super::*;
-
-    #[test]
-    fn unbounded_mass_status_marks_day_limited_coverage_incomplete() {
-        let current_day_start = UnixNanos::from(86_400_000_000_000_u64);
-
-        let window = execution_mass_status_window(None, current_day_start);
-
-        assert_eq!(window.order_start, None);
-        assert_eq!(window.report_start, current_day_start);
-        assert!(!window.complete);
-    }
-}
-
 pub(super) fn order_report_matches_command(
     report: &OrderStatusReport,
     cmd: &nautilus_common::messages::execution::GenerateOrderStatusReports,
@@ -1358,5 +1342,21 @@ impl ExecutionClient for TbankExecutionClient {
                 .expect("instruments lock")
                 .insert(metadata.instrument_id.clone(), metadata);
         }
+    }
+}
+
+#[cfg(test)]
+mod mass_status_window_tests {
+    use super::*;
+
+    #[test]
+    fn unbounded_mass_status_marks_day_limited_coverage_incomplete() {
+        let current_day_start = UnixNanos::from(86_400_000_000_000_u64);
+
+        let window = execution_mass_status_window(None, current_day_start);
+
+        assert_eq!(window.order_start, None);
+        assert_eq!(window.report_start, current_day_start);
+        assert!(!window.complete);
     }
 }
