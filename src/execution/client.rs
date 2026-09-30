@@ -1090,8 +1090,11 @@ impl TbankExecutionRuntime {
         self.account_id
     }
 
-    fn publish_account_state(&self, state: nautilus_model::events::AccountState) {
-        self.emitter.send_account_state(state);
+    fn publish_account_state(
+        &self,
+        state: nautilus_model::events::AccountState,
+    ) -> anyhow::Result<()> {
+        self.emitter.try_send_account_state(state)
     }
 
     /// Connects the client to the configured T-Bank endpoint.
@@ -3761,7 +3764,8 @@ impl TbankExecutionRuntime {
         if let Some(state) = account_state_from_portfolio(&portfolio)
             .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?
         {
-            self.publish_account_state(state);
+            self.publish_account_state(state)
+                .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
         }
         Ok(())
     }

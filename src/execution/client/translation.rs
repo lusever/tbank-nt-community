@@ -16,6 +16,20 @@ pub(super) struct TbankFillIdentityUnresolved {
     trade_id: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("T-Bank operation {operation_id} contains trade {trade_id} with a non-positive quantity")]
+pub(super) struct TbankFillQuantityInvalid {
+    operation_id: String,
+    trade_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TbankFillOperationKind {
+    Trade(OrderSide),
+    NonTrade,
+    Unknown,
+}
+
 pub(super) fn tbank_side(side: OrderSide) -> anyhow::Result<crate::common::TbankOrderSide> {
     match side {
         OrderSide::Buy => Ok(crate::common::TbankOrderSide::Buy),
@@ -1047,8 +1061,9 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
     instruments: Option<&Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>>,
     broker_order_index: Option<&Arc<Mutex<TbankBrokerOrderIndex>>>,
 ) -> Vec<anyhow::Result<TbankFillReport>> {
-    let Some(side) = fill_side_from_operation_type(item.r#type) else {
-        return Vec::new();
+    let side = match classify_fill_operation_type(item.r#type) {
+        TbankFillOperationKind::Trade(side) => side,
+        TbankFillOperationKind::NonTrade | TbankFillOperationKind::Unknown => return Vec::new(),
     };
     let instrument_id = match instrument_id_from_ticker_class_or_cached_identity(
         &item.ticker,
@@ -1064,11 +1079,28 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
         Ok(value) => TbankFillCommission::from(value),
         Err(error) => return vec![Err(error)],
     };
-    let trades = item
+    let all_trades = item
         .trades_info
         .as_ref()
         .map(|info| info.trades.as_slice())
         .unwrap_or_default();
+    let invalid_quantities = all_trades
+        .iter()
+        .filter(|trade| trade.quantity < 0)
+        .map(|trade| {
+            Err(anyhow::Error::new(TbankFillQuantityInvalid {
+                operation_id: item.id.clone(),
+                trade_id: trade.num.clone(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let trades = all_trades
+        .iter()
+        .filter(|trade| trade.quantity > 0)
+        .collect::<Vec<_>>();
+    if trades.is_empty() {
+        return invalid_quantities;
+    }
     let prices = match trades
         .iter()
         .map(|trade| {
@@ -1084,17 +1116,21 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
         Ok(prices) => prices,
         Err(error) => return vec![Err(error)],
     };
-    let commissions = match allocate_operation_commission(
-        commission,
-        trades
-            .iter()
-            .zip(&prices)
-            .map(|(trade, price)| Decimal::from(trade.quantity).abs() * price.as_decimal().abs())
-            .collect::<Vec<_>>()
-            .as_slice(),
-    ) {
-        Ok(commissions) => commissions,
-        Err(error) => return vec![Err(error)],
+    let commissions = if invalid_quantities.is_empty() {
+        match allocate_operation_commission(
+            commission,
+            trades
+                .iter()
+                .zip(&prices)
+                .map(|(trade, price)| Decimal::from(trade.quantity) * price.as_decimal().abs())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        ) {
+            Ok(commissions) => commissions,
+            Err(error) => return vec![Err(error)],
+        }
+    } else {
+        vec![TbankFillCommission::Unknown; trades.len()]
     };
     let venue_order_ids = broker_order_index.map(|index| {
         let index = index.lock().expect("broker_order_index lock");
@@ -1121,7 +1157,7 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
             trade_id: trade.num.clone(),
         }))];
     }
-    trades
+    let mut reports: Vec<anyhow::Result<TbankFillReport>> = trades
         .iter()
         .enumerate()
         .map(|(trade_index, trade)| {
@@ -1136,16 +1172,22 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
                 Ok(value) => value.unwrap_or(ts_init),
                 Err(error) => return Err(error),
             };
+            let quantity = match Quantity::from_decimal(Decimal::from(trade.quantity)) {
+                Ok(quantity) => quantity,
+                Err(_) => {
+                    return Err(anyhow::Error::new(TbankFillQuantityInvalid {
+                        operation_id: item.id.clone(),
+                        trade_id: trade.num.clone(),
+                    }));
+                }
+            };
             let report = FillReport::new(
                 account_id,
                 instrument_id,
                 venue_order_id.into(),
                 trade.num.as_str().into(),
                 side,
-                match Quantity::from_decimal(Decimal::from(trade.quantity)) {
-                    Ok(quantity) => quantity,
-                    Err(error) => return Err(error.into()),
-                },
+                quantity,
                 prices[trade_index],
                 fill_report_commission(commission),
                 LiquiditySide::NoLiquiditySide,
@@ -1162,7 +1204,9 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
             );
             Ok(TbankFillReport::new(report, commission, source))
         })
-        .collect()
+        .collect();
+    reports.extend(invalid_quantities);
+    reports
 }
 
 pub(super) fn allocate_operation_commission(
@@ -1186,17 +1230,18 @@ pub(super) fn allocate_operation_commission(
         .collect())
 }
 
-pub(super) fn fill_side_from_operation_type(operation_type: i32) -> Option<OrderSide> {
+pub(super) fn classify_fill_operation_type(operation_type: i32) -> TbankFillOperationKind {
     match TbankOperationType::try_from(operation_type).ok() {
         Some(
             TbankOperationType::Buy | TbankOperationType::BuyCard | TbankOperationType::BuyMargin,
-        ) => Some(OrderSide::Buy),
+        ) => TbankFillOperationKind::Trade(OrderSide::Buy),
         Some(
             TbankOperationType::Sell
             | TbankOperationType::SellCard
             | TbankOperationType::SellMargin,
-        ) => Some(OrderSide::Sell),
-        Some(_) | None => None,
+        ) => TbankFillOperationKind::Trade(OrderSide::Sell),
+        Some(_) => TbankFillOperationKind::NonTrade,
+        None => TbankFillOperationKind::Unknown,
     }
 }
 
@@ -1206,6 +1251,7 @@ pub(super) fn fill_report_from_order_trade(
     ts_init: UnixNanos,
     instruments: &Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
 ) -> anyhow::Result<TbankFillReport> {
+    anyhow::ensure!(trade.quantity > 0, "T-Bank trade quantity must be positive");
     let side = order_side_for_fill(order.direction)?;
     let instrument_id = instrument_id_from_ticker_class_or_cached_identity(
         "",

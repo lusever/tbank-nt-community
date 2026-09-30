@@ -1,6 +1,9 @@
+use std::{cell::RefCell, rc::Rc};
+
 use nautilus_common::{
     cache::CacheView,
     clients::ExecutionClient,
+    clock::Clock,
     factories::{ClientConfig, ExecutionClientFactory as NautilusExecutionClientFactory},
 };
 use nautilus_execution::client::core::ExecutionClientCore;
@@ -32,6 +35,7 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let config = config
             .as_any()
@@ -76,7 +80,7 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
 mod tests {
     use super::*;
 
-    use nautilus_common::cache::Cache;
+    use nautilus_common::{cache::Cache, clock::TestClock};
     use nautilus_model::identifiers::ClientId;
     use std::{cell::RefCell, rc::Rc};
 
@@ -98,6 +102,10 @@ mod tests {
         Rc::new(RefCell::new(Cache::default())).into()
     }
 
+    fn clock() -> Rc<RefCell<dyn Clock>> {
+        Rc::new(RefCell::new(TestClock::new()))
+    }
+
     #[test]
     fn creates_client_with_requested_identity() {
         let config = TbankExecutionClientConfig {
@@ -111,6 +119,7 @@ mod tests {
                 "TBANK-CUSTOM",
                 &config,
                 cache(),
+                clock(),
             )
             .unwrap();
 
@@ -129,6 +138,7 @@ mod tests {
                 "TBANK",
                 &WrongConfig,
                 cache(),
+                clock(),
             )
             .err()
             .expect("wrong config type should fail");
@@ -152,6 +162,7 @@ mod tests {
                 "TBANK",
                 &config,
                 cache(),
+                clock(),
             )
             .err()
             .expect("invalid config should fail at the factory boundary");

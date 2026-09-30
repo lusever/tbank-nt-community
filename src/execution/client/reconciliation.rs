@@ -460,8 +460,15 @@ pub(super) async fn publish_reconnect_reconciliation(
     query_client.ensure_lifecycle_active()?;
     let mut reconciled_trade_fills = Vec::new();
     for item in &operations.items {
-        if fill_side_from_operation_type(item.r#type).is_none() {
-            continue;
+        match classify_fill_operation_type(item.r#type) {
+            TbankFillOperationKind::Trade(_) => {}
+            TbankFillOperationKind::NonTrade => continue,
+            TbankFillOperationKind::Unknown => {
+                anyhow::bail!(
+                    "T-Bank reconnect reconciliation encountered unknown operation type {}",
+                    item.r#type
+                );
+            }
         }
         match query_client
             .load_supported_metadata_for_identity(

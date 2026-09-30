@@ -385,6 +385,27 @@ fn disconnected_submit_is_rejected_before_registration_or_submitted_event() {
 }
 
 #[test]
+fn publish_account_state_returns_closed_channel_error() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    client.runtime.emitter.set_sender(sender);
+    drop(receiver);
+
+    let state = AccountState::new(
+        client.runtime.account_id(),
+        AccountType::Margin,
+        Vec::new(),
+        Vec::new(),
+        true,
+        UUID4::new(),
+        UnixNanos::from(1_u64),
+        UnixNanos::from(1_u64),
+        None,
+    );
+    assert!(client.runtime.publish_account_state(state).is_err());
+}
+
+#[test]
 fn stale_read_generation_cannot_publish_after_reset_and_new_generation() {
     let mut client = test_client(TbankExecutionClientConfig::default());
     activate_test_lifecycle(&client);
@@ -399,7 +420,8 @@ fn stale_read_generation_cannot_publish_after_reset_and_new_generation() {
         let _ = started_tx.send(());
         let _ = release_rx.await;
         if stale_runtime.ensure_lifecycle_active().is_ok() {
-            stale_runtime.publish_account_state(AccountState::new(
+            stale_runtime
+                .publish_account_state(AccountState::new(
                 stale_account_id,
                 AccountType::Margin,
                 Vec::new(),
@@ -409,7 +431,8 @@ fn stale_read_generation_cannot_publish_after_reset_and_new_generation() {
                 UnixNanos::from(1_u64),
                 UnixNanos::from(1_u64),
                 None,
-            ));
+                ))
+                .expect("active generation has a live execution event sender");
         }
         let _ = completed_tx.send(());
     });
@@ -2129,6 +2152,7 @@ struct MockOrdersService {
     get_orders_calls: Arc<AtomicU64>,
     get_orders_requests: Arc<Mutex<Vec<GetOrdersRequest>>>,
     get_orders_response: Arc<Mutex<Option<GetOrdersResponse>>>,
+    get_orders_unfiltered_response: Arc<Mutex<Option<GetOrdersResponse>>>,
 }
 
 #[derive(Clone)]
@@ -2749,7 +2773,7 @@ fn submit_stop_order_cmd() -> SubmitOrder {
         Quantity::from_decimal(Decimal::from(20)).unwrap(),
         TimeInForce::Gtc,
         false,
-        true,
+        false,
         false,
         false,
         UUID4::new(),
@@ -2945,7 +2969,8 @@ use super::{
     TbankBrokerOrderRoute, TbankCancelTarget, TbankExecutionClient, TbankManagedOrderContext,
     TbankPendingSubmit, TbankPendingSubmitStage, TbankSubmitResponse, TbankTimeInForceType,
     confirm_margin_trade_for_submit, current_unix_nanos, fill_report_from_order_trade,
-    fill_side_from_operation_type, next_submit_outcome_recovery_delay, project_order_status_report,
+    classify_fill_operation_type, next_submit_outcome_recovery_delay, project_order_status_report,
+    TbankFillOperationKind,
     reconnect_reconciliation_error_is_transient, resolve_stream_order_venue_id,
     settle_order_report_mutation_state, settle_reconciled_buffered_trade_fill,
     stream_order_state_client_order_id, stream_order_status_report_from_state,

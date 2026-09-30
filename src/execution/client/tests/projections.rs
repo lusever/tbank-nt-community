@@ -1327,18 +1327,21 @@ fn activated_stop_order_state_links_by_trade_order_id() {
 #[test]
 fn operation_fill_allowlist_excludes_funding_and_unknown_operations() {
     assert_eq!(
-        fill_side_from_operation_type(TbankOperationType::Buy as i32),
-        Some(OrderSide::Buy)
+        classify_fill_operation_type(TbankOperationType::Buy as i32),
+        TbankFillOperationKind::Trade(OrderSide::Buy)
     );
     assert_eq!(
-        fill_side_from_operation_type(TbankOperationType::Sell as i32),
-        Some(OrderSide::Sell)
+        classify_fill_operation_type(TbankOperationType::Sell as i32),
+        TbankFillOperationKind::Trade(OrderSide::Sell)
     );
     assert_eq!(
-        fill_side_from_operation_type(TbankOperationType::Funding as i32),
-        None
+        classify_fill_operation_type(TbankOperationType::Funding as i32),
+        TbankFillOperationKind::NonTrade
     );
-    assert_eq!(fill_side_from_operation_type(99_999), None);
+    assert_eq!(
+        classify_fill_operation_type(99_999),
+        TbankFillOperationKind::Unknown
+    );
 }
 
 #[tokio::test]

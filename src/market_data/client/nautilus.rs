@@ -109,9 +109,13 @@ impl DataClient for TbankDataClient {
         if cmd.book_type != BookType::L2_MBP {
             anyhow::bail!("T-Bank data client supports only L2_MBP order book depth");
         }
-        let depth = cmd.depth.map_or(DEPTH10_LEN as i32, |depth| {
-            depth.get().min(DEPTH10_LEN) as i32
-        });
+        let requested_depth = cmd.depth.map_or(DEPTH10_LEN, |depth| depth.get());
+        if !matches!(requested_depth, 1 | 10 | 20 | 30 | 40 | 50) {
+            anyhow::bail!("T-Bank supports order book depths 1, 10, 20, 30, 40, and 50");
+        }
+        // Nautilus OrderBookDepth10 only carries ten levels, so valid deeper T-Bank requests are
+        // intentionally projected to the first ten levels.
+        let depth = requested_depth.min(DEPTH10_LEN) as i32;
         self.depth10_subscriptions.insert(cmd.instrument_id, depth);
         self.sync_nautilus_order_book_registry(cmd.instrument_id);
         self.schedule_depth10_stream(cmd.instrument_id, depth)

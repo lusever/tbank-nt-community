@@ -5219,6 +5219,62 @@ mod tests {
     }
 
     #[test]
+    fn nautilus_depth_accepts_only_tbank_supported_depths() {
+        use std::num::NonZeroUsize;
+
+        use nautilus_core::UUID4;
+
+        for requested_depth in [1, 10, 20, 30, 40, 50] {
+            let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+            let command = SubscribeBookDepth10::new(
+                sber_id(),
+                BookType::L2_MBP,
+                Some(*TBANK_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                NonZeroUsize::new(requested_depth),
+                false,
+                None,
+                None,
+            );
+            assert!(DataClient::subscribe_book_depth10(&mut client, command).is_err());
+            let requests = client.restore_subscription_requests();
+            assert_eq!(requests.len(), 1, "depth {requested_depth}");
+            let Some(market_data_request::Payload::SubscribeOrderBookRequest(request)) =
+                &requests[0].payload
+            else {
+                panic!("expected order-book restore request");
+            };
+            assert_eq!(
+                request.instruments[0].depth,
+                requested_depth.min(10) as i32,
+                "depth {requested_depth}"
+            );
+        }
+
+        for requested_depth in [2, 5, 9, 11, 49] {
+            let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+            let command = SubscribeBookDepth10::new(
+                sber_id(),
+                BookType::L2_MBP,
+                Some(*TBANK_CLIENT_ID),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                NonZeroUsize::new(requested_depth),
+                false,
+                None,
+                None,
+            );
+            let error = DataClient::subscribe_book_depth10(&mut client, command)
+                .expect_err("broker-invalid depths must be rejected");
+            assert!(error.to_string().contains("supports order book depths"));
+            assert!(client.restore_subscription_requests().is_empty());
+        }
+    }
+
+    #[test]
     fn nautilus_quote_and_depth_one_share_restore_stream_until_both_unsubscribe() {
         use std::num::NonZeroUsize;
 

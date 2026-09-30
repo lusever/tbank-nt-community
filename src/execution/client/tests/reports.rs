@@ -68,6 +68,148 @@ fn order_report_scope_defers_incomplete_instrument_identity_to_metadata_resoluti
 }
 
 #[test]
+fn working_order_reports_ignore_history_windows_but_keep_instrument_filter() {
+    let cmd = futures_order_report_command(false);
+    let active = OrderState {
+        order_id: "working-order".to_string(),
+        ticker: "SiZ6".to_string(),
+        class_code: "SPBFUT".to_string(),
+        order_date: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 500,
+        }),
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
+        lots_requested: 1,
+        ..OrderState::default()
+    };
+    let wrong_instrument = OrderState {
+        ticker: "SiU6".to_string(),
+        ..active.clone()
+    };
+
+    assert!(super::nautilus::order_state_matches_report_command(&active, &cmd).unwrap());
+    assert!(!super::nautilus::order_state_matches_report_command(&wrong_instrument, &cmd).unwrap());
+}
+
+#[test]
+fn active_stop_and_child_reports_ignore_create_date_windows() {
+    let cmd = futures_order_report_command(false);
+    let old_active_stop = StopOrder {
+        stop_order_id: "old-working-stop".to_string(),
+        ticker: "SiZ6".to_string(),
+        class_code: "SPBFUT".to_string(),
+        create_date: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 50,
+        }),
+        status: StopOrderStatusOption::StopOrderStatusActive as i32,
+        ..StopOrder::default()
+    };
+    assert!(super::nautilus::stop_order_matches_report_command(&old_active_stop, &cmd, None).unwrap());
+
+    let terminal_parent = StopOrder {
+        status: StopOrderStatusOption::StopOrderStatusExecuted as i32,
+        ..old_active_stop
+    };
+    let active_child = OrderState {
+        order_id: "active-child".to_string(),
+        order_request_id: terminal_parent.stop_order_id.clone(),
+        ticker: "SiZ6".to_string(),
+        class_code: "SPBFUT".to_string(),
+        order_date: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 50,
+        }),
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
+        lots_requested: 1,
+        ..OrderState::default()
+    };
+    assert!(super::nautilus::stop_order_matches_report_command(
+        &terminal_parent,
+        &cmd,
+        Some(&active_child)
+    )
+    .unwrap());
+}
+
+#[test]
+fn terminal_stop_reports_use_child_time_and_inclusive_window_bounds() {
+    let cmd = futures_order_report_command(false);
+    let stop = StopOrder {
+        stop_order_id: "terminal-stop".to_string(),
+        ticker: "SiZ6".to_string(),
+        class_code: "SPBFUT".to_string(),
+        create_date: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 50,
+        }),
+        status: StopOrderStatusOption::StopOrderStatusExecuted as i32,
+        ..StopOrder::default()
+    };
+    let child_at_start = OrderState {
+        order_id: "terminal-child".to_string(),
+        order_request_id: stop.stop_order_id.clone(),
+        ticker: "SiZ6".to_string(),
+        class_code: "SPBFUT".to_string(),
+        order_date: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 100,
+        }),
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+        lots_requested: 1,
+        lots_executed: 1,
+        ..OrderState::default()
+    };
+    assert!(super::nautilus::stop_order_matches_report_command(
+        &stop,
+        &cmd,
+        Some(&child_at_start)
+    )
+    .unwrap());
+    let child_after_end = OrderState {
+        order_date: Some(prost_types::Timestamp {
+            seconds: 0,
+            nanos: 301,
+        }),
+        ..child_at_start
+    };
+    assert!(!super::nautilus::stop_order_matches_report_command(
+        &stop,
+        &cmd,
+        Some(&child_after_end)
+    )
+    .unwrap());
+}
+
+#[test]
+fn open_order_filter_accepts_submitted_pending_cancel_and_partial_fill() {
+    let cmd = futures_order_report_command(true);
+    for status in [
+        nautilus_model::enums::OrderStatus::Submitted,
+        nautilus_model::enums::OrderStatus::PendingCancel,
+        nautilus_model::enums::OrderStatus::PartiallyFilled,
+    ] {
+        let report = OrderStatusReport::new(
+            "TBANK-001".into(),
+            "SiZ6_SPBFUT.MOEX".parse().unwrap(),
+            Some("working-order".into()),
+            "venue-order".into(),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            status,
+            Quantity::from(1),
+            Quantity::from(0),
+            UnixNanos::from(500),
+            UnixNanos::from(500),
+            UnixNanos::from(500),
+            Some(UUID4::new()),
+        );
+        assert!(super::nautilus::order_report_matches_command(&report, &cmd));
+    }
+}
+
+#[test]
 fn stop_report_scope_excludes_old_unrelated_future_before_metadata_resolution() {
     let cmd = futures_order_report_command(false);
     let old_future_stop = StopOrder {
@@ -1455,6 +1597,105 @@ fn operation_cursor_allocates_operation_commission_across_trades() {
             .sum::<Decimal>(),
         Decimal::from(10)
     );
+}
+
+#[test]
+fn operation_cursor_skips_zero_quantity_and_keeps_valid_trade_with_negative_row() {
+    let metadata = si_futures_metadata();
+    let instruments = Arc::new(Mutex::new(HashMap::from([(
+        metadata.instrument_id.clone(),
+        metadata.clone(),
+    )])));
+    let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
+    broker_order_index
+        .lock()
+        .unwrap()
+        .record_trade_order_mapping("valid-trade", "valid-order");
+    let operation = OperationItem {
+        id: "mixed-quantity-operation".to_string(),
+        r#type: TbankOperationType::Buy as i32,
+        instrument_uid: metadata.instrument_uid.clone(),
+        ticker: metadata.ticker.clone(),
+        class_code: metadata.class_code.clone(),
+        trades_info: Some(OperationItemTrades {
+            trades: vec![
+                OperationItemTrade {
+                    num: "negative-trade".to_string(),
+                    quantity: -1,
+                    price: Some(MoneyValue {
+                        currency: "rub".to_string(),
+                        units: 100,
+                        ..MoneyValue::default()
+                    }),
+                    ..OperationItemTrade::default()
+                },
+                OperationItemTrade {
+                    num: "zero-trade".to_string(),
+                    quantity: 0,
+                    price: Some(MoneyValue {
+                        currency: "rub".to_string(),
+                        units: 100,
+                        ..MoneyValue::default()
+                    }),
+                    ..OperationItemTrade::default()
+                },
+                OperationItemTrade {
+                    num: "valid-trade".to_string(),
+                    quantity: 3,
+                    price: Some(MoneyValue {
+                        currency: "rub".to_string(),
+                        units: 200,
+                        ..MoneyValue::default()
+                    }),
+                    ..OperationItemTrade::default()
+                },
+            ],
+        }),
+        ..OperationItem::default()
+    };
+
+    let reports = super::fill_reports_from_cursor_operation_with_instruments(
+        "TBANK-001".into(),
+        &operation,
+        super::current_unix_nanos(),
+        Some(&instruments),
+        Some(&broker_order_index),
+    );
+
+    assert_eq!(reports.len(), 2);
+    let valid = reports
+        .iter()
+        .find_map(|report| report.as_ref().ok())
+        .expect("valid trade must survive a malformed sibling row");
+    assert_eq!(valid.report.trade_id.to_string(), "valid-trade");
+    assert_eq!(valid.report.last_qty, Quantity::from(3));
+    let invalid = reports
+        .iter()
+        .find_map(|report| report.as_ref().err())
+        .expect("negative quantity must be reported as malformed");
+    assert!(invalid.downcast_ref::<super::TbankFillQuantityInvalid>().is_some());
+
+    let mut zero_only = operation;
+    zero_only.trades_info = Some(OperationItemTrades {
+        trades: vec![OperationItemTrade {
+            num: "zero-only-trade".to_string(),
+            quantity: 0,
+            price: Some(MoneyValue {
+                currency: "rub".to_string(),
+                units: 100,
+                ..MoneyValue::default()
+            }),
+            ..OperationItemTrade::default()
+        }],
+    });
+    assert!(super::fill_reports_from_cursor_operation_with_instruments(
+        "TBANK-001".into(),
+        &zero_only,
+        super::current_unix_nanos(),
+        Some(&instruments),
+        Some(&broker_order_index),
+    )
+    .is_empty());
 }
 
 #[test]
@@ -2937,10 +3178,14 @@ impl OrdersService for MockOrdersService {
         request: Request<GetOrdersRequest>,
     ) -> std::result::Result<Response<GetOrdersResponse>, Status> {
         self.get_orders_calls.fetch_add(1, Ordering::SeqCst);
-        self.get_orders_requests
-            .lock()
-            .unwrap()
-            .push(request.into_inner());
+        let request = request.into_inner();
+        let unfiltered = request.advanced_filters.is_none();
+        self.get_orders_requests.lock().unwrap().push(request);
+        if unfiltered
+            && let Some(response) = self.get_orders_unfiltered_response.lock().unwrap().clone()
+        {
+            return Ok(Response::new(response));
+        }
         self.get_orders_response
             .lock()
             .unwrap()
@@ -4776,6 +5021,26 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
     let order_requests = Arc::clone(&orders_service.get_orders_requests);
     *orders_service.get_orders_response.lock().unwrap() =
         Some(GetOrdersResponse::default());
+    let (today, _) = super::current_utc_day_bounds();
+    *orders_service.get_orders_unfiltered_response.lock().unwrap() =
+        Some(GetOrdersResponse {
+            orders: vec![OrderState {
+                order_id: "previous-day-working-order".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                instrument_uid: "sber-uid".to_string(),
+                order_date: Some(prost_types::Timestamp {
+                    seconds: today.seconds - 3_600,
+                    nanos: 0,
+                }),
+                direction: OrderDirection::Buy as i32,
+                order_type: crate::grpc::generated::OrderType::Market as i32,
+                execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew
+                    as i32,
+                lots_requested: 1,
+                ..OrderState::default()
+            }],
+        });
     let stop_orders_service = MockStopOrdersService::default();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4797,6 +5062,9 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
+    let mut metadata = sber_metadata();
+    metadata.instrument_uid = "sber-uid".to_string();
+    client.runtime.cache_instrument_metadata(metadata);
     client.connect_for_queries().await.unwrap();
 
     let status = <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_mass_status(
@@ -4809,6 +5077,11 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
 
     let day_start = UnixNanos::from(status.ts_init.as_u64() / NANOS_PER_DAY * NANOS_PER_DAY);
     assert_eq!(status.lookback_start(), Some(day_start));
+    assert_eq!(status.order_reports().len(), 1);
+    assert_eq!(
+        status.order_reports()[0].venue_order_id.as_str(),
+        "previous-day-working-order"
+    );
     assert!(
         !status.reports_complete(),
         "a lookback clipped to today's history must disclose incomplete coverage"
@@ -4818,7 +5091,7 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
     assert!(!order_requests.is_empty());
     let requested_starts = order_requests
         .iter()
-        .map(|request| {
+        .filter_map(|request| {
             request
                 .advanced_filters
                 .as_ref()
@@ -4827,12 +5100,20 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
         })
         .collect::<Vec<_>>();
     let day_start_seconds = (day_start.as_u64() / 1_000_000_000) as i64;
-    assert_eq!(requested_starts.first().copied().flatten(), Some(day_start_seconds));
+    assert_eq!(requested_starts.first().copied(), Some(day_start_seconds));
     assert!(
         requested_starts
             .iter()
-            .all(|start| start.is_some_and(|start| start >= day_start_seconds)),
+            .all(|start| *start >= day_start_seconds),
         "order history starts were {requested_starts:?}"
+    );
+    assert_eq!(
+        order_requests
+            .iter()
+            .filter(|request| request.advanced_filters.is_none())
+            .count(),
+        1,
+        "the open-order request must remain unbounded by creation time"
     );
     let operation_calls = operation_calls.lock().unwrap();
     assert_eq!(operation_calls.len(), 1);

@@ -12,6 +12,38 @@ fn confirm_margin_trade_param_overrides_global_default() {
     assert!(confirm_margin_trade_for_submit(true, None));
     assert!(!confirm_margin_trade_for_submit(false, None));
 }
+
+#[tokio::test]
+async fn unsupported_submit_flags_are_rejected_before_order_preparation() {
+    for (flag, expected_message) in [
+        ("reduce_only", "does not support reduce-only orders"),
+        ("post_only", "does not support post-only orders"),
+        ("quote_quantity", "quantity in instrument units"),
+    ] {
+        let mut client = test_client(TbankExecutionClientConfig {
+            environment: TbankEnvironment::Live,
+            enable_trading: true,
+            allow_live_trading: true,
+            account_id: Some("account-1".to_string()),
+            ..TbankExecutionClientConfig::default()
+        });
+        let mut cmd = submit_order_cmd_for("SBER_TQBR.MOEX", OrderType::Limit, None);
+        match flag {
+            "reduce_only" => cmd.order_init.reduce_only = true,
+            "post_only" => cmd.order_init.post_only = true,
+            "quote_quantity" => cmd.order_init.quote_quantity = true,
+            _ => unreachable!(),
+        }
+
+        let error = super::submit::prepare_nautilus_order(&mut client.runtime, cmd)
+            .await
+            .err()
+            .expect("unsupported order semantics must fail closed");
+
+        assert!(error.to_string().contains(expected_message));
+        assert!(client.runtime.pending_submits.lock().unwrap().is_empty());
+    }
+}
 #[test]
 fn nautilus_trailing_order_maps_to_native_submit_params() {
     let mut cmd = submit_order_cmd_for("SBER_TQBR.MOEX", OrderType::TrailingStopLimit, None);
@@ -86,10 +118,35 @@ fn reconciliation_report_filters_match_upstream_command_contracts() {
     ));
     let mut early_order = order.clone();
     early_order.ts_last = UnixNanos::from(50);
-    assert!(!super::nautilus::order_report_matches_command(
-        &early_order,
-        &order_cmd
-    ));
+    assert!(super::nautilus::order_report_matches_command(&early_order, &order_cmd));
+    let mut late_order = order.clone();
+    late_order.ts_last = UnixNanos::from(350);
+    assert!(super::nautilus::order_report_matches_command(&late_order, &order_cmd));
+
+    let history_cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        ts,
+        false,
+        Some(instrument_id),
+        Some(UnixNanos::from(100)),
+        Some(UnixNanos::from(300)),
+        None,
+        None,
+    );
+    let mut terminal_before = terminal_order.clone();
+    terminal_before.ts_last = UnixNanos::from(99);
+    assert!(!super::nautilus::order_report_matches_command(&terminal_before, &history_cmd));
+    for bound in [100, 300] {
+        let mut terminal_at_bound = terminal_order.clone();
+        terminal_at_bound.ts_last = UnixNanos::from(bound);
+        assert!(super::nautilus::order_report_matches_command(
+            &terminal_at_bound,
+            &history_cmd
+        ));
+    }
+    let mut terminal_after = terminal_order;
+    terminal_after.ts_last = UnixNanos::from(301);
+    assert!(!super::nautilus::order_report_matches_command(&terminal_after, &history_cmd));
 
     let fill = FillReport::new(
         account_id,

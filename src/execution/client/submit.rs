@@ -130,6 +130,15 @@ pub(super) async fn prepare_nautilus_order(
     cmd: nautilus_common::messages::execution::SubmitOrder,
 ) -> anyhow::Result<PreparedNautilusOrder> {
     client.config.ensure_submit_allowed()?;
+    if cmd.order_init.reduce_only {
+        anyhow::bail!("T-Bank does not support reduce-only orders");
+    }
+    if cmd.order_init.post_only {
+        anyhow::bail!("T-Bank does not support post-only orders");
+    }
+    if cmd.order_init.quote_quantity {
+        anyhow::bail!("T-Bank orders require quantity in instrument units, not quote currency");
+    }
     let account_id = client.config.resolve_account_id()?;
     let instrument_id = order_initialized_instrument_id(&cmd);
     let mut cmd = cmd;

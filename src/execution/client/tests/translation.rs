@@ -409,8 +409,8 @@ fn operation_side_maps_regular_card_and_margin_buys_and_sells() {
         crate::grpc::generated::OperationType::BuyMargin,
     ] {
         assert_eq!(
-            super::fill_side_from_operation_type(operation as i32),
-            Some(OrderSide::Buy)
+            super::classify_fill_operation_type(operation as i32),
+            super::TbankFillOperationKind::Trade(OrderSide::Buy)
         );
     }
     for operation in [
@@ -419,11 +419,20 @@ fn operation_side_maps_regular_card_and_margin_buys_and_sells() {
         crate::grpc::generated::OperationType::SellMargin,
     ] {
         assert_eq!(
-            super::fill_side_from_operation_type(operation as i32),
-            Some(OrderSide::Sell)
+            super::classify_fill_operation_type(operation as i32),
+            super::TbankFillOperationKind::Trade(OrderSide::Sell)
         );
     }
-    assert_eq!(super::fill_side_from_operation_type(9999), None);
+    assert_eq!(
+        super::classify_fill_operation_type(
+            crate::grpc::generated::OperationType::Funding as i32
+        ),
+        super::TbankFillOperationKind::NonTrade
+    );
+    assert_eq!(
+        super::classify_fill_operation_type(9999),
+        super::TbankFillOperationKind::Unknown
+    );
 }
 
 #[test]
