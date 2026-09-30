@@ -1086,7 +1086,7 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
         .unwrap_or_default();
     let invalid_quantities = all_trades
         .iter()
-        .filter(|trade| trade.quantity < 0)
+        .filter(|trade| trade.quantity <= 0)
         .map(|trade| {
             Err(anyhow::Error::new(TbankFillQuantityInvalid {
                 operation_id: item.id.clone(),

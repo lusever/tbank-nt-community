@@ -1600,7 +1600,7 @@ fn operation_cursor_allocates_operation_commission_across_trades() {
 }
 
 #[test]
-fn operation_cursor_skips_zero_quantity_and_keeps_valid_trade_with_negative_row() {
+fn operation_cursor_rejects_non_positive_quantity_rows_and_keeps_valid_trade() {
     let metadata = si_futures_metadata();
     let instruments = Arc::new(Mutex::new(HashMap::from([(
         metadata.instrument_id.clone(),
@@ -1662,18 +1662,23 @@ fn operation_cursor_skips_zero_quantity_and_keeps_valid_trade_with_negative_row(
         Some(&broker_order_index),
     );
 
-    assert_eq!(reports.len(), 2);
+    assert_eq!(reports.len(), 3);
     let valid = reports
         .iter()
         .find_map(|report| report.as_ref().ok())
         .expect("valid trade must survive a malformed sibling row");
     assert_eq!(valid.report.trade_id.to_string(), "valid-trade");
     assert_eq!(valid.report.last_qty, Quantity::from(3));
-    let invalid = reports
+    let invalid_quantities = reports
         .iter()
-        .find_map(|report| report.as_ref().err())
-        .expect("negative quantity must be reported as malformed");
-    assert!(invalid.downcast_ref::<super::TbankFillQuantityInvalid>().is_some());
+        .filter_map(|report| report.as_ref().err())
+        .collect::<Vec<_>>();
+    assert_eq!(invalid_quantities.len(), 2);
+    assert!(invalid_quantities.iter().all(|error| {
+        error
+            .downcast_ref::<super::TbankFillQuantityInvalid>()
+            .is_some()
+    }));
 
     let mut zero_only = operation;
     zero_only.trades_info = Some(OperationItemTrades {
@@ -1688,14 +1693,20 @@ fn operation_cursor_skips_zero_quantity_and_keeps_valid_trade_with_negative_row(
             ..OperationItemTrade::default()
         }],
     });
-    assert!(super::fill_reports_from_cursor_operation_with_instruments(
+    let zero_only_reports = super::fill_reports_from_cursor_operation_with_instruments(
         "TBANK-001".into(),
         &zero_only,
         super::current_unix_nanos(),
         Some(&instruments),
         Some(&broker_order_index),
-    )
-    .is_empty());
+    );
+    assert_eq!(zero_only_reports.len(), 1);
+    let zero_only_error = zero_only_reports[0]
+        .as_ref()
+        .expect_err("zero-only trade rows must make the operation invalid");
+    assert!(zero_only_error
+        .downcast_ref::<super::TbankFillQuantityInvalid>()
+        .is_some());
 }
 
 #[test]
