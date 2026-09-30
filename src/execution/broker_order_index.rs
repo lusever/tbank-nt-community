@@ -40,6 +40,7 @@ pub(super) enum TbankCancelTarget {
     Pending {
         route: TbankBrokerOrderRoute,
         client_order_id: String,
+        owner: bool,
     },
 }
 
@@ -70,6 +71,7 @@ pub(super) struct TbankBrokerOrderIndex {
     canonical_venue_order_id_by_alias: HashMap<String, String>,
     managed_context_by_client_order_id: HashMap<String, TbankManagedOrderContext>,
     pending_cancel_client_order_ids: HashSet<String>,
+    pending_cancel_identity_claims: HashSet<String>,
 }
 
 const TBANK_BROKER_REQUEST_NAMESPACE: Uuid =
@@ -105,6 +107,7 @@ impl TbankBrokerOrderIndex {
         {
             self.pending_cancel_client_order_ids.remove(client_order_id);
         }
+        self.pending_cancel_identity_claims.remove(client_order_id);
     }
 
     pub(super) fn record_mapping(
@@ -421,10 +424,36 @@ impl TbankBrokerOrderIndex {
         self.stop_broker_order_ids.contains(venue_order_id)
     }
 
-    pub(super) fn record_pending_cancel(&mut self, client_order_id: &str) {
+    pub(super) fn record_pending_cancel(&mut self, client_order_id: &str) -> bool {
         if !client_order_id.is_empty() {
+            self.pending_cancel_identity_claims.remove(client_order_id);
             self.pending_cancel_client_order_ids
-                .insert(client_order_id.to_string());
+                .insert(client_order_id.to_string())
+        } else {
+            false
         }
+    }
+
+    /// Resolves a pending cancel if the broker mapping won the deadline race; otherwise expires it.
+    pub(super) fn finish_pending_cancel_wait(
+        &mut self,
+        client_order_id: &str,
+    ) -> Option<TbankBrokerOrderIdentity> {
+        let identity = self.by_client_order_id.get(client_order_id).cloned();
+        if identity.is_some() {
+            self.pending_cancel_identity_claims
+                .insert(client_order_id.to_string());
+        } else {
+            self.pending_cancel_client_order_ids.remove(client_order_id);
+        }
+        identity
+    }
+
+    pub(super) fn take_pending_cancel_identity_claim(&mut self, client_order_id: &str) -> bool {
+        self.pending_cancel_identity_claims.remove(client_order_id)
+    }
+
+    pub(super) fn has_pending_cancels(&self) -> bool {
+        !self.pending_cancel_client_order_ids.is_empty()
     }
 }

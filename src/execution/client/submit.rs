@@ -420,13 +420,9 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
                 Some(ts_init),
             );
             if let Some(emitter) = recovery_emitter {
-                client.spawn_submit_outcome_recovery(
-                    order,
-                    metadata,
-                    ts_init,
-                    recovery_deadline,
-                    emitter,
-                );
+                client
+                    .recover_submit_outcome(order, metadata, ts_init, recovery_deadline, emitter)
+                    .await;
             }
             return Ok(SubmitPipelineOutcome::Reports(Vec::new()));
         }
