@@ -182,7 +182,7 @@ cargo fmt --check
 cargo check --locked --all-targets --no-default-features
 cargo test --locked
 cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo lint
 bash scripts/check-public-method-docs.sh
 ```
 

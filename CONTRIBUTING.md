@@ -6,6 +6,7 @@ selection, position sizing, and live-runner orchestration belong in consumer rep
 ## Development
 
 - Use the Rust toolchain pinned in `rust-toolchain.toml`.
+- Run `cargo lint` during development to catch Clippy warnings with the same strict settings as CI.
 - Keep every direct NautilusTrader dependency on the same upstream tag or revision.
 - Keep vendored protobufs at the exact revision recorded in `proto/contracts.lock`.
 - Do not expose tokens, account identifiers, broker request IDs, venue order IDs, or tracking
@@ -21,7 +22,7 @@ cargo fmt --check
 cargo check --locked --all-targets --no-default-features
 cargo test --locked
 cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo lint
 cargo deny check
 bash scripts/check-public-method-docs.sh
 ```
