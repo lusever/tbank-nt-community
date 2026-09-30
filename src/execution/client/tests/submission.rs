@@ -118,10 +118,16 @@ fn reconciliation_report_filters_match_upstream_command_contracts() {
     ));
     let mut early_order = order.clone();
     early_order.ts_last = UnixNanos::from(50);
-    assert!(super::nautilus::order_report_matches_command(&early_order, &order_cmd));
+    assert!(super::nautilus::order_report_matches_command(
+        &early_order,
+        &order_cmd
+    ));
     let mut late_order = order.clone();
     late_order.ts_last = UnixNanos::from(350);
-    assert!(super::nautilus::order_report_matches_command(&late_order, &order_cmd));
+    assert!(super::nautilus::order_report_matches_command(
+        &late_order,
+        &order_cmd
+    ));
 
     let history_cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
@@ -135,7 +141,10 @@ fn reconciliation_report_filters_match_upstream_command_contracts() {
     );
     let mut terminal_before = terminal_order.clone();
     terminal_before.ts_last = UnixNanos::from(99);
-    assert!(!super::nautilus::order_report_matches_command(&terminal_before, &history_cmd));
+    assert!(!super::nautilus::order_report_matches_command(
+        &terminal_before,
+        &history_cmd
+    ));
     for bound in [100, 300] {
         let mut terminal_at_bound = terminal_order.clone();
         terminal_at_bound.ts_last = UnixNanos::from(bound);
@@ -146,7 +155,10 @@ fn reconciliation_report_filters_match_upstream_command_contracts() {
     }
     let mut terminal_after = terminal_order;
     terminal_after.ts_last = UnixNanos::from(301);
-    assert!(!super::nautilus::order_report_matches_command(&terminal_after, &history_cmd));
+    assert!(!super::nautilus::order_report_matches_command(
+        &terminal_after,
+        &history_cmd
+    ));
 
     let fill = FillReport::new(
         account_id,
@@ -285,12 +297,131 @@ async fn execution_client_connect_and_disconnect_are_idempotent() {
         ..TbankExecutionClientConfig::default()
     });
 
-    client.runtime.connect().await.unwrap();
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
     assert!(client.runtime.is_connected());
     client.disconnect();
     client.disconnect();
     assert!(!client.runtime.is_connected());
+}
+
+#[tokio::test]
+async fn admitted_submit_remains_owned_across_disconnect_and_reconnect() {
+    let service = MockOrdersService::default();
+    let calls = Arc::clone(&service.calls);
+    let post_started = Arc::new(tokio::sync::Notify::new());
+    let post_release = Arc::new(tokio::sync::Notify::new());
+    *service.post_gate.lock().unwrap() = Some(MockPostOrderGate {
+        started: Arc::clone(&post_started),
+        release: Arc::clone(&post_release),
+    });
+    let operations = MockOperationsService::default();
+    *operations.portfolio_response.lock().unwrap() = Some(PortfolioResponse::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(service))
+            .add_service(OperationsServiceServer::new(operations))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        enable_trading: true,
+        allow_live_trading: true,
+        ..TbankExecutionClientConfig::default()
+    });
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    client.runtime.emitter.set_sender(sender);
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
+
+    let cmd = submit_order_cmd(None);
+    let client_order_id = cmd.client_order_id;
+    let expected_request_id = tbank_broker_request_id_for_client_order_id(client_order_id.as_str());
+    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::submit_order(
+        &client, cmd,
+    )
+    .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap(),
+        Some(ExecutionEvent::Order(OrderEventAny::Submitted(_)))
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(2), post_started.notified())
+        .await
+        .expect("submit RPC did not reach the controlled server");
+    assert_eq!(client.task_owner.operation_tasks.len(), 1);
+
+    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::disconnect(&mut client)
+        .await
+        .unwrap();
+    assert!(!client.runtime.is_connected());
+    assert_eq!(client.task_owner.operation_tasks.len(), 1);
+
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
+    assert!(client.runtime.is_connected());
+    assert_eq!(client.task_owner.operation_tasks.len(), 1);
+    {
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].order_id, expected_request_id);
+    }
+
+    post_release.notify_one();
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(ExecutionEvent::Report(ExecutionReport::Order(report))) =
+                receiver.recv().await
+                && report.order_status == OrderStatus::Accepted
+            {
+                break report;
+            }
+        }
+    })
+    .await
+    .expect("admitted submit did not publish its accepted broker outcome");
+    assert_eq!(accepted.client_order_id, Some(client_order_id));
+    assert_eq!(
+        client.runtime.known_broker_order_identity(Some(&client_order_id), None),
+        Some(TbankBrokerOrderIdentity {
+            route: TbankBrokerOrderRoute::RegularOrder,
+            broker_order_id: "exchange-order-1".to_string(),
+        })
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::disconnect(&mut client)
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -596,7 +727,11 @@ async fn order_stream_reconnect_reconciles_before_consuming_reopened_events() {
         venue_order_id.as_str(),
     );
     nautilus_common::clients::ExecutionClient::start(&mut client).unwrap();
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let reports = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let mut reports = Vec::new();
@@ -716,7 +851,11 @@ async fn malformed_order_stream_event_is_rejected_without_reconnect() {
         ..TbankExecutionClientConfig::default()
     });
     nautilus_common::clients::ExecutionClient::start(&mut client).unwrap();
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !lookup_started.load(Ordering::SeqCst) {
@@ -855,10 +994,43 @@ async fn explicit_broker_submit_rejection_emits_upstream_rejected_event() {
     client.connect_for_queries().await.unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     client.runtime.emitter.set_sender(sender);
+    let submit_cmd = submit_order_cmd(None);
+    let client_order_id = submit_cmd.client_order_id;
+    client
+        .runtime
+        .prepare_submit_route(&client_order_id, OrderType::Market);
+    let cancel_cmd = CancelOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("TBANK")),
+        StrategyId::from("STRATEGY-001"),
+        InstrumentId::from("SBER_TQBR.MOEX"),
+        client_order_id,
+        None,
+        UUID4::new(),
+        UnixNanos::from(1),
+        None,
+        None,
+    );
+    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::cancel_order(
+        &client, cancel_cmd,
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !client
+            .runtime
+            .broker_order_index
+            .lock()
+            .unwrap()
+            .has_pending_cancels()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancel command did not wait for the pending submit identity");
 
     <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::submit_order(
-        &client,
-        submit_order_cmd(None),
+        &client, submit_cmd,
     )
     .unwrap();
 
@@ -866,30 +1038,45 @@ async fn explicit_broker_submit_rejection_emits_upstream_rejected_event() {
         receiver.recv().await,
         Some(ExecutionEvent::Order(OrderEventAny::Submitted(_)))
     ));
-    let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let ExecutionEvent::Order(OrderEventAny::Rejected(event)) = event else {
-        panic!("expected OrderRejected");
-    };
-    assert!(event.reason.as_str().contains("not enough buying power"));
+    let mut rejected_order_id = None;
+    let mut cancel_rejection_reason = None;
+    for _ in 0..2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            ExecutionEvent::Order(OrderEventAny::Rejected(event)) => {
+                assert!(event.reason.as_str().contains("not enough buying power"));
+                rejected_order_id = Some(event.client_order_id);
+            }
+            ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
+                cancel_rejection_reason = Some(event.reason.to_string());
+            }
+            event => panic!("unexpected event after rejected submit: {event:?}"),
+        }
+    }
+    let rejected_order_id = rejected_order_id.expect("submit rejection event was not emitted");
+    assert!(cancel_rejection_reason
+        .expect("pending cancel was not rejected with its submit")
+        .contains("submission was rejected"));
     assert_eq!(
         client
             .runtime
             .broker_order_index
             .lock()
             .unwrap()
-            .route_for_client_order_id(event.client_order_id.as_str()),
+            .route_for_client_order_id(rejected_order_id.as_str()),
         None
     );
     assert!(matches!(
         client
             .runtime
-            .resolve_cancel_target(event.client_order_id.as_str(), None)
+            .resolve_cancel_target(rejected_order_id.as_str(), None)
             .await,
         Err(TbankAdapterError::BrokerOrderIdentityUnresolved(_))
     ));
+    client.disconnect_async().await.unwrap();
 }
 
 #[tokio::test]
@@ -1110,6 +1297,100 @@ async fn explicit_broker_cancel_rejection_emits_cancel_rejected() {
 }
 
 #[tokio::test]
+async fn admitted_pending_cancel_survives_disconnect_and_reconnect() {
+    let service = MockOrdersService::default();
+    let cancel_calls = Arc::clone(&service.cancel_calls);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
+    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    client.runtime.emitter.set_sender(sender);
+    let client_order_id = ClientOrderId::from("pending-cancel-order");
+    client
+        .runtime
+        .prepare_submit_route(&client_order_id, OrderType::Limit);
+    let cmd = CancelOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from("TBANK")),
+        StrategyId::from("STRATEGY-001"),
+        InstrumentId::from("SBER_TQBR.MOEX"),
+        client_order_id,
+        None,
+        UUID4::new(),
+        UnixNanos::from(1),
+        None,
+        None,
+    );
+    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::cancel_order(&client, cmd)
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !client
+            .runtime
+            .broker_order_index
+            .lock()
+            .unwrap()
+            .has_pending_cancels()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancel command did not enter its identity wait");
+
+    client.disconnect();
+    assert!(!client.task_owner.operation_tasks.is_empty());
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
+    assert!(client.runtime.record_broker_order_mapping(
+        TbankBrokerOrderRoute::RegularOrder,
+        "pending-cancel-order",
+        "venue-order-1",
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while cancel_calls.lock().unwrap().is_empty()
+            || !client.task_owner.operation_tasks.is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("admitted cancel did not finish after identity resolution");
+    assert_eq!(cancel_calls.lock().unwrap().len(), 1);
+    assert!(
+        !client
+            .runtime
+            .cancellation_is_unresolved(&TbankBrokerOrderIdentity {
+                route: TbankBrokerOrderRoute::RegularOrder,
+                broker_order_id: "venue-order-1".to_string(),
+            })
+    );
+    client.disconnect_async().await.unwrap();
+}
+
+#[tokio::test]
 async fn unresolved_broker_identity_emits_cancel_rejected() {
     let mut client = test_client(TbankExecutionClientConfig::default());
     activate_test_lifecycle(&client);
@@ -1128,10 +1409,8 @@ async fn unresolved_broker_identity_emits_cancel_rejected() {
         None,
     );
 
-    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::cancel_order(
-        &client, cmd,
-    )
-    .unwrap();
+    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::cancel_order(&client, cmd)
+        .unwrap();
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
         .await
@@ -1196,7 +1475,7 @@ async fn exhausted_single_cancel_recovery_blocks_reset_until_known_outcome() {
 
     let initial = client
         .runtime
-        .cancel_resolved_broker_order(identity.clone())
+        .cancel_resolved_broker_order_admitted(identity.clone())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1222,11 +1501,12 @@ async fn exhausted_single_cancel_recovery_blocks_reset_until_known_outcome() {
     assert!(
         client
             .runtime
-            .cancel_resolved_broker_order(identity.clone())
+            .cancel_resolved_broker_order_admitted(identity.clone())
             .await
             .is_err()
     );
     assert!(!client.runtime.cancellation_is_unresolved(&identity));
+    client.disconnect_async().await.unwrap();
     ExecutionClient::reset(&mut client).unwrap();
 }
 
@@ -1269,7 +1549,7 @@ async fn terminal_cancel_retry_reconciles_cancelled_state_and_clears_unknown_out
 
     let initial = client
         .runtime
-        .cancel_resolved_broker_order(identity.clone())
+        .cancel_resolved_broker_order_admitted(identity.clone())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1285,6 +1565,7 @@ async fn terminal_cancel_retry_reconciles_cancelled_state_and_clears_unknown_out
         .unwrap();
 
     assert!(!client.runtime.cancellation_is_unresolved(&identity));
+    client.disconnect_async().await.unwrap();
     ExecutionClient::reset(&mut client).unwrap();
 }
 
@@ -1730,7 +2011,11 @@ async fn submit_response_without_order_id_is_outcome_unknown() {
         .lock()
         .unwrap()
         .insert(metadata.instrument_id.clone(), metadata);
-    client.runtime.connect_for_queries().await.unwrap();
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let prepared = super::prepare_nautilus_order(&mut client.runtime, submit_order_cmd(None))
         .await
@@ -1764,16 +2049,17 @@ async fn order_preparation_fails_closed_after_the_shared_submit_deadline() {
     let cmd = submit_order_cmd(None);
     let deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
 
-    let error = super::submit::prepare_nautilus_order_before_deadline(
-        &mut client.runtime,
-        cmd,
-        deadline,
-    )
-    .await
-    .err()
-    .expect("expired preparation deadline must stop before broker submit");
+    let error =
+        super::submit::prepare_nautilus_order_before_deadline(&mut client.runtime, cmd, deadline)
+            .await
+            .err()
+            .expect("expired preparation deadline must stop before broker submit");
 
-    assert!(error.to_string().contains("deadline expired during order preparation"));
+    assert!(
+        error
+            .to_string()
+            .contains("deadline expired during order preparation")
+    );
 }
 
 #[tokio::test]
@@ -2030,16 +2316,19 @@ fn classify_cancel_failure_distinguishes_rejected_from_unknown() {
 fn pending_stage_after_submit_response_marks_rejected_orders_terminal() {
     use super::{TbankPendingSubmitStage, pending_stage_after_submit_response};
 
-    let rejected = pending_stage_after_submit_response(&TbankSubmitResponse::Order(PostOrderResponse {
-        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusRejected as i32,
-        ..PostOrderResponse::default()
-    }));
+    let rejected =
+        pending_stage_after_submit_response(&TbankSubmitResponse::Order(PostOrderResponse {
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusRejected
+                as i32,
+            ..PostOrderResponse::default()
+        }));
     assert_eq!(rejected, TbankPendingSubmitStage::Rejected);
 
-    let accepted = pending_stage_after_submit_response(&TbankSubmitResponse::Order(PostOrderResponse {
-        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
-        ..PostOrderResponse::default()
-    }));
+    let accepted =
+        pending_stage_after_submit_response(&TbankSubmitResponse::Order(PostOrderResponse {
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
+            ..PostOrderResponse::default()
+        }));
     assert_eq!(accepted, TbankPendingSubmitStage::Submitted);
 
     let stop = pending_stage_after_submit_response(&TbankSubmitResponse::StopOrder(
@@ -2055,14 +2344,38 @@ fn pending_stage_after_submit_response_marks_rejected_orders_terminal() {
 fn pending_stage_from_order_status_maps_lifecycle_terminal_states() {
     use super::{TbankPendingSubmitStage, pending_stage_from_order_status};
 
-    assert_eq!(pending_stage_from_order_status(OrderStatus::Accepted), Some(TbankPendingSubmitStage::Accepted));
-    assert_eq!(pending_stage_from_order_status(OrderStatus::PartiallyFilled), Some(TbankPendingSubmitStage::Filled));
-    assert_eq!(pending_stage_from_order_status(OrderStatus::Filled), Some(TbankPendingSubmitStage::Filled));
-    assert_eq!(pending_stage_from_order_status(OrderStatus::Rejected), Some(TbankPendingSubmitStage::Rejected));
-    assert_eq!(pending_stage_from_order_status(OrderStatus::Canceled), Some(TbankPendingSubmitStage::Cancelled));
-    assert_eq!(pending_stage_from_order_status(OrderStatus::Expired), Some(TbankPendingSubmitStage::Cancelled));
-    assert_eq!(pending_stage_from_order_status(OrderStatus::Initialized), None);
-    assert_eq!(pending_stage_from_order_status(OrderStatus::Triggered), None);
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::Accepted),
+        Some(TbankPendingSubmitStage::Accepted)
+    );
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::PartiallyFilled),
+        Some(TbankPendingSubmitStage::Filled)
+    );
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::Filled),
+        Some(TbankPendingSubmitStage::Filled)
+    );
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::Rejected),
+        Some(TbankPendingSubmitStage::Rejected)
+    );
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::Canceled),
+        Some(TbankPendingSubmitStage::Cancelled)
+    );
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::Expired),
+        Some(TbankPendingSubmitStage::Cancelled)
+    );
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::Initialized),
+        None
+    );
+    assert_eq!(
+        pending_stage_from_order_status(OrderStatus::Triggered),
+        None
+    );
 }
 
 #[test]
@@ -2084,7 +2397,12 @@ fn update_pending_submit_binds_venue_order_id_and_timestamp() {
         recovery_attempts: 0,
     };
 
-    update_pending_submit(&mut pending, TbankPendingSubmitStage::Accepted, Some("venue-1".to_string()), ts);
+    update_pending_submit(
+        &mut pending,
+        TbankPendingSubmitStage::Accepted,
+        Some("venue-1".to_string()),
+        ts,
+    );
     assert_eq!(pending.stage, TbankPendingSubmitStage::Accepted);
     assert_eq!(pending.venue_order_id.as_deref(), Some("venue-1"));
     assert_eq!(pending.last_reconciliation_ts, Some(ts));
@@ -2136,7 +2454,10 @@ fn mark_pending_submit_order_report_only_touches_matching_client_order() {
     );
     mark_pending_submit_order_report(&pending_submits, &report);
     let pending = pending_submits.lock().unwrap();
-    assert_eq!(pending.get("client-1").unwrap().stage, TbankPendingSubmitStage::Accepted);
+    assert_eq!(
+        pending.get("client-1").unwrap().stage,
+        TbankPendingSubmitStage::Accepted
+    );
     assert_eq!(
         pending.get("client-1").unwrap().venue_order_id.as_deref(),
         Some("venue-1")
@@ -2160,7 +2481,10 @@ fn mark_pending_submit_order_report_only_touches_matching_client_order() {
         Some(UUID4::new()),
     );
     mark_pending_submit_order_report(&pending_submits, &unlinked);
-    assert_eq!(pending.get("client-1").unwrap().stage, TbankPendingSubmitStage::Accepted);
+    assert_eq!(
+        pending.get("client-1").unwrap().stage,
+        TbankPendingSubmitStage::Accepted
+    );
 }
 
 #[test]
@@ -2204,7 +2528,12 @@ fn mark_pending_submit_fill_report_matches_by_client_then_venue_order_id() {
     );
     mark_pending_submit_fill_report(&pending_submits, &fill);
     assert_eq!(
-        pending_submits.lock().unwrap().get("client-1").unwrap().stage,
+        pending_submits
+            .lock()
+            .unwrap()
+            .get("client-1")
+            .unwrap()
+            .stage,
         TbankPendingSubmitStage::Filled
     );
 
@@ -2227,7 +2556,12 @@ fn mark_pending_submit_fill_report_matches_by_client_then_venue_order_id() {
     );
     mark_pending_submit_fill_report(&pending_submits, &anonymous);
     assert_eq!(
-        pending_submits.lock().unwrap().get("client-1").unwrap().stage,
+        pending_submits
+            .lock()
+            .unwrap()
+            .get("client-1")
+            .unwrap()
+            .stage,
         TbankPendingSubmitStage::Filled
     );
 }
@@ -2236,8 +2570,14 @@ fn mark_pending_submit_fill_report_matches_by_client_then_venue_order_id() {
 fn stop_direction_and_type_mapping_covers_submit_side_contracts() {
     use super::{tbank_order_type_from_stop_order, tbank_side_from_stop_direction};
 
-    assert_eq!(tbank_side_from_stop_direction(StopOrderDirection::Buy as i32), Some(TbankOrderSide::Buy));
-    assert_eq!(tbank_side_from_stop_direction(StopOrderDirection::Sell as i32), Some(TbankOrderSide::Sell));
+    assert_eq!(
+        tbank_side_from_stop_direction(StopOrderDirection::Buy as i32),
+        Some(TbankOrderSide::Buy)
+    );
+    assert_eq!(
+        tbank_side_from_stop_direction(StopOrderDirection::Sell as i32),
+        Some(TbankOrderSide::Sell)
+    );
     assert_eq!(tbank_side_from_stop_direction(9999), None);
 
     // Trailing take-profit stops keep their trailing identity.
@@ -2264,7 +2604,10 @@ fn stop_direction_and_type_mapping_covers_submit_side_contracts() {
         order_type: StopOrderType::StopLoss as i32,
         ..StopOrder::default()
     };
-    assert_eq!(tbank_order_type_from_stop_order(&stop_loss), Some(TbankOrderType::StopMarket));
+    assert_eq!(
+        tbank_order_type_from_stop_order(&stop_loss),
+        Some(TbankOrderType::StopMarket)
+    );
 
     let take_profit_limit = StopOrder {
         order_type: StopOrderType::TakeProfit as i32,
@@ -2308,7 +2651,10 @@ fn post_stop_order_response_builds_accepted_report_with_stop_identity() {
 
     assert_eq!(report.order_status, OrderStatus::Accepted);
     assert_eq!(report.venue_order_id.to_string(), "stop-1");
-    assert_eq!(report.client_order_id.map(|id| id.to_string()).as_deref(), Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"));
+    assert_eq!(
+        report.client_order_id.map(|id| id.to_string()).as_deref(),
+        Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156")
+    );
     assert_eq!(report.order_type, OrderType::StopMarket);
     assert_eq!(report.trigger_price, Some(Price::from("270.00")));
     assert_eq!(report.trigger_type, Some(TriggerType::Default));
@@ -2417,12 +2763,20 @@ fn stop_order_matches_submit_requires_exact_identity_and_prices() {
         instrument_uid: "other-uid".to_string(),
         ..matching_stop.clone()
     };
-    assert!(!stop_order_matches_submit(&order, &metadata, &wrong_instrument));
+    assert!(!stop_order_matches_submit(
+        &order,
+        &metadata,
+        &wrong_instrument
+    ));
 
     // A mismatched direction must not be attributed to this submit.
     let wrong_direction = StopOrder {
         direction: StopOrderDirection::Buy as i32,
         ..matching_stop
     };
-    assert!(!stop_order_matches_submit(&order, &metadata, &wrong_direction));
+    assert!(!stop_order_matches_submit(
+        &order,
+        &metadata,
+        &wrong_direction
+    ));
 }

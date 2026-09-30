@@ -798,7 +798,8 @@ async fn external_activated_stop_initial_ack_recovers_confirmed_child_in_backgro
         reconnect_policy: client.runtime.config.reconnect_policy.clone(),
         activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
         regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
-        reconciliation_tasks: client.runtime.reconciliation_tasks.clone(),
+        session_spawner: client.task_owner.session_tasks.spawner().unwrap(),
+        session_generation: client.task_owner.session_generation,
     };
 
     super::schedule_activated_stop_child_reconciliation(context, None, "stop-order-1".to_string());
@@ -906,7 +907,8 @@ async fn external_regular_initial_ack_schedules_request_id_reconciliation() {
         reconnect_policy: client.runtime.config.reconnect_policy.clone(),
         activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
         regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
-        reconciliation_tasks: client.runtime.reconciliation_tasks.clone(),
+        session_spawner: client.task_owner.session_tasks.spawner().unwrap(),
+        session_generation: client.task_owner.session_generation,
     };
 
     super::schedule_regular_order_reconciliation(
@@ -1364,9 +1366,7 @@ async fn duplicate_reported_commission_updates_provenance_without_replaying_fill
             OrderSide::Buy,
             Quantity::from(10),
             Price::from("275"),
-            commission
-                .amount()
-                .unwrap_or_else(|| Money::from("0 RUB")),
+            commission.amount().unwrap_or_else(|| Money::from("0 RUB")),
             LiquiditySide::NoLiquiditySide,
             Some("client-order-1".into()),
             None,
@@ -1692,16 +1692,18 @@ fn stale_cumulative_snapshot_cannot_correct_a_newer_fill_commission() {
     .unwrap();
     assert_eq!(initial.commission, TbankFillCommission::Unknown);
 
-    assert!(project_cumulative_order_fill(
-        &fill_projection,
-        "broker-order-1",
-        "stale-order-state-5",
-        Decimal::from(5),
-        Decimal::from(1_375),
-        Some(Money::from("0.5 RUB")),
-    )
-    .unwrap()
-    .is_none());
+    assert!(
+        project_cumulative_order_fill(
+            &fill_projection,
+            "broker-order-1",
+            "stale-order-state-5",
+            Decimal::from(5),
+            Decimal::from(1_375),
+            Some(Money::from("0.5 RUB")),
+        )
+        .unwrap()
+        .is_none()
+    );
 
     let correction = project_cumulative_order_fill(
         &fill_projection,
@@ -1714,7 +1716,10 @@ fn stale_cumulative_snapshot_cannot_correct_a_newer_fill_commission() {
     .unwrap()
     .expect("fresh cumulative commission corrects the unknown fill");
     assert!(correction.provenance_only);
-    assert_eq!(correction.trade_id.as_deref(), Some("synthetic-order-state-10"));
+    assert_eq!(
+        correction.trade_id.as_deref(),
+        Some("synthetic-order-state-10")
+    );
     assert_eq!(
         correction.commission,
         TbankFillCommission::Allocated(Money::from("1 RUB"))
@@ -1784,16 +1789,18 @@ fn stale_cumulative_commission_does_not_resolve_a_larger_stream_fill() {
     .unwrap()
     .expect("the stream trade emits the ten-lot fill");
 
-    assert!(project_cumulative_order_fill(
-        &fill_projection,
-        "broker-order-1",
-        "stale-order-state-5",
-        Decimal::from(5),
-        Decimal::from(1_375),
-        Some(Money::from("0.5 RUB")),
-    )
-    .unwrap()
-    .is_none());
+    assert!(
+        project_cumulative_order_fill(
+            &fill_projection,
+            "broker-order-1",
+            "stale-order-state-5",
+            Decimal::from(5),
+            Decimal::from(1_375),
+            Some(Money::from("0.5 RUB")),
+        )
+        .unwrap()
+        .is_none()
+    );
 
     let correction = project_cumulative_order_fill(
         &fill_projection,
@@ -1971,13 +1978,15 @@ fn partial_alias_merge_resizes_commission_before_trade_reconciliation() {
     );
     {
         let mut projection = fill_projection.lock().unwrap();
-        assert!(crate::execution::projections::project_trade_fill_report_locked(
-            &mut projection,
-            real_trade.clone(),
-            TbankFillCommission::Reported(Money::from("1 RUB")),
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            crate::execution::projections::project_trade_fill_report_locked(
+                &mut projection,
+                real_trade.clone(),
+                TbankFillCommission::Reported(Money::from("1 RUB")),
+            )
+            .unwrap()
+            .is_none()
+        );
         let (corrections, residual) =
             crate::execution::projections::update_duplicate_fill_provenance(
                 &mut projection,
@@ -2228,7 +2237,8 @@ fn partially_matched_operation_commission_reserves_known_synthetic_fee() {
     );
 
     let event = receiver.try_recv().unwrap();
-    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) = event
+    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) =
+        event
     else {
         panic!("expected custom execution event");
     };
@@ -2502,7 +2512,8 @@ fn reported_operation_commission_upgrades_exact_allocated_synthetic_fill() {
     );
 
     let event = receiver.try_recv().unwrap();
-    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) = event
+    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Custom(data)) =
+        event
     else {
         panic!("expected custom execution event");
     };
@@ -2734,12 +2745,12 @@ fn repeated_cumulative_snapshot_resolves_a_partially_matched_operation_commissio
         project_managed_trade_fill_report(
             &broker_order_index,
             &fill_projection,
-                TbankFillReport::new(
+            TbankFillReport::new(
                 report,
                 TbankFillCommission::Reported(Money::from("0.02 RUB")),
-                    TbankFillCommissionSource::OperationsCursor,
-                ),
-                Some(&sender),
+                TbankFillCommissionSource::OperationsCursor,
+            ),
+            Some(&sender),
         )
         .unwrap()
         .is_none()
@@ -2769,8 +2780,6 @@ fn repeated_cumulative_snapshot_resolves_a_partially_matched_operation_commissio
         TbankFillCommission::Allocated(Money::from("0.04 RUB"))
     );
 }
-
-
 
 #[tokio::test]
 async fn submit_reconciliation_partial_fill_bundles_status_and_fill_reports() {
@@ -3348,16 +3357,31 @@ async fn submit_unresolved_reconciliation_keeps_unknown_pending() {
 }
 
 #[tokio::test]
-async fn submit_unknown_outcome_recovers_in_background_after_initial_miss() {
+async fn submit_unknown_outcome_recovers_within_admitted_operation_after_initial_miss() {
     let service = MockOrdersService::default();
     *service.post_error.lock().unwrap() =
         Some((Code::Unavailable, "submit response lost".to_string()));
-    let state_error = Arc::clone(&service.state_error);
-    let state_response = Arc::clone(&service.state_response);
+    let state_error_responses = Arc::clone(&service.state_error_responses);
     let state_calls = Arc::clone(&service.state_calls);
-    // A NOT_FOUND can race broker indexing too. A later lookup must still be able to recover it.
-    *state_error.lock().unwrap() =
-        Some((Code::NotFound, "50005: order not indexed yet".to_string()));
+    state_error_responses
+        .lock()
+        .unwrap()
+        .push_back((Code::NotFound, "50005: order not indexed yet".to_string()));
+    *service.state_response.lock().unwrap() = Some(OrderState {
+        order_id: "exchange-order-1".to_string(),
+        order_request_id: tbank_broker_request_id_for_client_order_id(
+            "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
+        ),
+        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
+        lots_requested: 2,
+        lots_executed: 0,
+        direction: OrderDirection::Buy as i32,
+        order_type: crate::grpc::generated::OrderType::Market as i32,
+        instrument_uid: "sber-uid".to_string(),
+        ticker: "SBER".to_string(),
+        class_code: "TQBR".to_string(),
+        ..OrderState::default()
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -3406,25 +3430,8 @@ async fn submit_unknown_outcome_recovers_in_background_after_initial_miss() {
         let pending = pending_submits
             .get("524b1a03-efdd-4cd0-bd56-7cc6570c7156")
             .unwrap();
-        assert_eq!(pending.stage, TbankPendingSubmitStage::Unknown);
+        assert_eq!(pending.stage, TbankPendingSubmitStage::Accepted);
     }
-
-    *state_error.lock().unwrap() = None;
-    *state_response.lock().unwrap() = Some(OrderState {
-        order_id: "exchange-order-1".to_string(),
-        order_request_id: tbank_broker_request_id_for_client_order_id(
-            "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
-        ),
-        execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
-        lots_requested: 2,
-        lots_executed: 0,
-        direction: OrderDirection::Buy as i32,
-        order_type: crate::grpc::generated::OrderType::Market as i32,
-        instrument_uid: "sber-uid".to_string(),
-        ticker: "SBER".to_string(),
-        class_code: "TQBR".to_string(),
-        ..OrderState::default()
-    });
 
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
         .await
@@ -3546,12 +3553,12 @@ async fn repeated_submit_not_found_keeps_identity_unresolved_and_blocks_reset() 
     .await;
 
     for _ in 0..10_000 {
-        if !client.runtime.has_unfinished_mutating_tasks() {
+        if client.task_owner.operation_tasks.is_empty() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
-    assert!(!client.runtime.has_unfinished_mutating_tasks());
+    assert!(client.task_owner.operation_tasks.is_empty());
 
     let snapshot = client.unresolved_submits();
     let pending = snapshot
@@ -3571,12 +3578,14 @@ async fn repeated_submit_not_found_keeps_identity_unresolved_and_blocks_reset() 
         1 + SUBMIT_OUTCOME_RECOVERY_ATTEMPTS as usize
     );
     assert!(ExecutionClient::reset(&mut client).is_err());
-    assert!(client
-        .runtime
-        .pending_submits
-        .lock()
-        .unwrap()
-        .contains_key(client_order_id));
+    assert!(
+        client
+            .runtime
+            .pending_submits
+            .lock()
+            .unwrap()
+            .contains_key(client_order_id)
+    );
     assert_no_execution_event(&mut receiver).await;
 }
 
@@ -3698,8 +3707,8 @@ fn submit_recovery_budget_tracks_custom_live_node_inflight_settings() {
         inflight_check_retries: 2,
         ..nautilus_live::config::LiveExecutionEngineConfig::default()
     };
-    let config = TbankExecutionClientConfig::default()
-        .with_live_node_execution_engine_config(&live_config);
+    let config =
+        TbankExecutionClientConfig::default().with_live_node_execution_engine_config(&live_config);
     let budget = submit_outcome_recovery_budget(&config);
 
     // LiveNode checks every 2 s, so two in-flight checks can close the order after about 4 s.
@@ -3713,19 +3722,16 @@ fn disabled_live_node_inflight_checks_keep_a_bounded_submit_budget() {
         inflight_check_interval_ms: 0,
         ..nautilus_live::config::LiveExecutionEngineConfig::default()
     };
-    let config = TbankExecutionClientConfig::default()
-        .with_live_node_execution_engine_config(&live_config);
+    let config =
+        TbankExecutionClientConfig::default().with_live_node_execution_engine_config(&live_config);
     let budget = submit_outcome_recovery_budget(&config);
 
     assert_eq!(budget, SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET);
 
     let now = tokio::time::Instant::now();
-    let (submit_deadline, submit_timeout) = super::submit_outcome_submit_budget(
-        std::time::Duration::from_secs(30),
-        now + budget,
-        now,
-    )
-    .expect("disabling LiveNode in-flight polling must not reject every submit");
+    let (submit_deadline, submit_timeout) =
+        super::submit_outcome_submit_budget(std::time::Duration::from_secs(30), now + budget, now)
+            .expect("disabling LiveNode in-flight polling must not reject every submit");
     assert_eq!(submit_timeout, budget / 2);
     assert!(submit_deadline > now);
 }
@@ -3744,22 +3750,16 @@ fn submit_budget_reserves_time_for_reconciliation_after_slow_post() {
     )
     .expect("the submit must retain time before the reconciliation reserve");
 
-    assert_eq!(
-        submit_timeout,
-        recovery_budget - reconciliation_reserve
-    );
+    assert_eq!(submit_timeout, recovery_budget - reconciliation_reserve);
     assert_eq!(
         recovery_deadline.saturating_duration_since(submit_deadline),
         reconciliation_reserve
     );
 
     let short_request = std::time::Duration::from_secs(3);
-    let (submit_deadline, submit_timeout) = super::submit_outcome_submit_budget(
-        short_request,
-        recovery_deadline,
-        started,
-    )
-    .expect("a shorter configured timeout must remain in effect");
+    let (submit_deadline, submit_timeout) =
+        super::submit_outcome_submit_budget(short_request, recovery_deadline, started)
+            .expect("a shorter configured timeout must remain in effect");
     assert_eq!(submit_timeout, short_request);
     assert!(recovery_deadline.saturating_duration_since(submit_deadline) > reconciliation_reserve);
 
@@ -3785,20 +3785,17 @@ fn submit_budget_reserves_time_for_reconciliation_after_slow_post() {
         short_budget / 2
     );
 
-    assert!(super::submit_outcome_submit_budget(
-        std::time::Duration::from_secs(30),
-        started,
-        started,
-    )
-    .is_none());
+    assert!(
+        super::submit_outcome_submit_budget(std::time::Duration::from_secs(30), started, started,)
+            .is_none()
+    );
 }
 
 #[test]
 fn submit_recovery_rpc_timeout_uses_remaining_deadline_budget() {
     let mut client = test_client(TbankExecutionClientConfig::default());
     let now = tokio::time::Instant::now();
-    client.runtime.recovery_rpc_deadline =
-        Some(now + std::time::Duration::from_millis(50));
+    client.runtime.recovery_rpc_deadline = Some(now + std::time::Duration::from_millis(50));
 
     let timeout = client.runtime.rpc_request_timeout().unwrap();
     assert!(timeout > std::time::Duration::ZERO);
@@ -3807,8 +3804,10 @@ fn submit_recovery_rpc_timeout_uses_remaining_deadline_budget() {
     let recovery_deadline = now + SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET;
     let lookup_deadline = super::submit_outcome_recovery_lookup_deadline(recovery_deadline, now);
     client.runtime.recovery_rpc_deadline = Some(lookup_deadline);
-    assert!(client.runtime.rpc_request_timeout().unwrap()
-        <= super::SUBMIT_OUTCOME_RECOVERY_LOOKUP_TIMEOUT);
+    assert!(
+        client.runtime.rpc_request_timeout().unwrap()
+            <= super::SUBMIT_OUTCOME_RECOVERY_LOOKUP_TIMEOUT
+    );
 
     client.runtime.recovery_rpc_deadline =
         Some(tokio::time::Instant::now() - std::time::Duration::from_millis(1));
@@ -3838,8 +3837,10 @@ fn submit_recovery_lookup_timeout_leaves_time_for_a_repeated_lookup() {
     // Even the maximum backoff still leaves a positive RPC window for the next lookup.
     let repeated_lookup_start = first_lookup_deadline + SUBMIT_OUTCOME_RECOVERY_DELAY_CAP;
     assert!(repeated_lookup_start < deadline);
-    assert!(super::submit_outcome_recovery_lookup_deadline(deadline, repeated_lookup_start)
-        > repeated_lookup_start);
+    assert!(
+        super::submit_outcome_recovery_lookup_deadline(deadline, repeated_lookup_start)
+            > repeated_lookup_start
+    );
 }
 
 #[tokio::test]
@@ -3908,11 +3909,9 @@ fn unresolved_submit_snapshot_tracks_stage_attempts_and_order() {
         &pending_submit_order("client-earlier"),
         UnixNanos::from(10_u64),
     );
-    client.runtime.touch_pending_submit_reconciliation(
-        "client-later",
-        3,
-        UnixNanos::from(25_u64),
-    );
+    client
+        .runtime
+        .touch_pending_submit_reconciliation("client-later", 3, UnixNanos::from(25_u64));
 
     let in_progress = client
         .unresolved_submits()

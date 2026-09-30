@@ -3,15 +3,11 @@ use super::{
     CANCEL_OUTCOME_RECOVERY_ATTEMPTS, MAX_UNRESOLVED_TRADE_FILLS_PER_ORDER,
     TBANK_CONFIRM_MARGIN_TRADE_PARAM, TbankFillProjection,
     activated_stop_child_status_report_with_context, buffer_unresolved_trade_fill,
-    canonicalize_reconciled_stop_fill,
-    current_utc_day_bounds, order_filter_windows, project_cumulative_order_fill,
-    project_managed_trade_fill_report, project_trade_fill_report, publish_reconnect_snapshot,
-    tbank_account_id,
+    canonicalize_reconciled_stop_fill, current_utc_day_bounds, order_filter_windows,
+    project_cumulative_order_fill, project_managed_trade_fill_report, project_trade_fill_report,
+    publish_reconnect_snapshot, tbank_account_id,
 };
-use crate::execution::{
-    TbankFillCommission, TbankFillCommissionSource,
-    events::TbankFillReport,
-};
+use crate::execution::{TbankFillCommission, TbankFillCommissionSource, events::TbankFillReport};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -28,7 +24,6 @@ use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     live::runner::replace_exec_event_sender,
-    msgbus::{self, switchboard},
     messages::{
         ExecutionEvent,
         execution::{
@@ -37,6 +32,7 @@ use nautilus_common::{
             SubmitOrderList,
         },
     },
+    msgbus::{self, switchboard},
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_execution::client::core::ExecutionClientCore;
@@ -57,8 +53,8 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TradeId,
         TraderId, Venue, VenueOrderId,
     },
-    orders::OrderList,
     instruments::Instrument,
+    orders::OrderList,
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
@@ -79,8 +75,7 @@ use crate::{
         OrderExecutionReportStatus, OrderIdType, OrderState, OrderTrade, OrderTrades,
         PortfolioPosition, PortfolioRequest, PortfolioResponse, PortfolioStreamResponse,
         PositionData, PositionsRequest, PositionsResponse, PositionsSecurities,
-        PositionsStreamResponse,
-        PostOrderAsyncRequest, PostOrderAsyncResponse, PostOrderRequest,
+        PositionsStreamResponse, PostOrderAsyncRequest, PostOrderAsyncResponse, PostOrderRequest,
         PostOrderResponse, PostStopOrderRequest, PostStopOrderResponse, Quotation,
         ReplaceOrderRequest, StopOrder, StopOrderDirection, StopOrderStatusOption, StopOrderType,
         TakeProfitType, TradesStreamRequest, TradesStreamResponse, TrailingValueType,
@@ -124,12 +119,14 @@ fn execution_client_subscribes_to_each_supported_public_venue() {
         &instrument,
     );
 
-    assert!(client
-        .runtime
-        .instruments
-        .lock()
-        .unwrap()
-        .contains_key("AAPL_SPBXM.SPBE"));
+    assert!(
+        client
+            .runtime
+            .instruments
+            .lock()
+            .unwrap()
+            .contains_key("AAPL_SPBXM.SPBE")
+    );
     client.unsubscribe_instrument_updates();
 }
 
@@ -283,6 +280,10 @@ fn activate_test_lifecycle(client: &TbankExecutionClient) {
         .runtime
         .lifecycle_active
         .store(true, std::sync::atomic::Ordering::Release);
+    client
+        .task_owner
+        .external_admission_open
+        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 fn order_stream_context(
@@ -304,7 +305,8 @@ fn order_stream_context(
         reconnect_policy: client.runtime.config.reconnect_policy.clone(),
         activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
         regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
-        reconciliation_tasks: client.runtime.reconciliation_tasks.clone(),
+        session_spawner: client.task_owner.session_tasks.spawner().unwrap(),
+        session_generation: client.task_owner.session_generation,
     }
 }
 
@@ -318,20 +320,24 @@ impl Drop for TaskDropSignal {
     }
 }
 
-#[test]
-fn disconnect_aborts_tracked_command_tasks_and_invalidates_clones() {
+#[tokio::test]
+async fn disconnect_drains_session_tasks_and_invalidates_clones() {
     let mut client = test_client(TbankExecutionClientConfig::default());
     client
         .runtime
         .lifecycle_active
+        .store(true, std::sync::atomic::Ordering::Release);
+    client
+        .task_owner
+        .external_admission_open
         .store(true, std::sync::atomic::Ordering::Release);
     let stale_clone = client.runtime.clone();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
 
     client
-        .runtime
-        .spawn_read_only_command_task(async move {
+        .task_owner
+        .spawn_read_only_command_task(&client.runtime, "test_read_only", async move {
             let _drop_signal = TaskDropSignal(Some(dropped_tx));
             let _ = started_tx.send(());
             std::future::pending::<()>().await;
@@ -342,19 +348,56 @@ fn disconnect_aborts_tracked_command_tasks_and_invalidates_clones() {
         .expect("command task did not start");
 
     client.disconnect();
+    client.disconnect_async().await.unwrap();
 
     dropped_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("command task was not aborted");
-    assert!(client.runtime.command_tasks.lock().unwrap().is_empty());
+    assert!(client.task_owner.session_tasks.is_empty());
     assert!(stale_clone.ensure_lifecycle_active().is_err());
     assert!(
         client
-            .runtime
-            .spawn_read_only_command_task(async {})
+            .task_owner
+            .spawn_read_only_command_task(&client.runtime, "late_read_only", async {})
             .is_err()
     );
-    assert!(client.runtime.command_tasks.lock().unwrap().is_empty());
+    assert!(client.task_owner.session_tasks.is_empty());
+}
+
+#[tokio::test]
+async fn old_session_spawner_cannot_spawn_after_reconnect() {
+    let mut client = test_client(TbankExecutionClientConfig {
+        token: Some("test-token".to_string()),
+        account_id: Some("account-1".to_string()),
+        ..TbankExecutionClientConfig::default()
+    });
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
+    let stale_spawner = client.task_owner.session_tasks.spawner().unwrap();
+    let stale_generation = client.task_owner.session_generation;
+
+    client.disconnect_async().await.unwrap();
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
+
+    assert_ne!(client.task_owner.session_generation, stale_generation);
+    assert!(
+        super::spawn_session_task(
+            &stale_spawner,
+            stale_generation,
+            "stale_session_child",
+            true,
+            async {},
+        )
+        .is_err()
+    );
+    client.disconnect_async().await.unwrap();
 }
 
 #[test]
@@ -372,7 +415,7 @@ fn disconnected_submit_is_rejected_before_registration_or_submitted_event() {
 
     assert!(result.is_err());
     assert!(receiver.try_recv().is_err());
-    assert!(client.runtime.command_tasks.lock().unwrap().is_empty());
+    assert!(client.task_owner.operation_tasks.is_empty());
     assert!(
         client
             .runtime
@@ -422,15 +465,15 @@ fn stale_read_generation_cannot_publish_after_reset_and_new_generation() {
         if stale_runtime.ensure_lifecycle_active().is_ok() {
             stale_runtime
                 .publish_account_state(AccountState::new(
-                stale_account_id,
-                AccountType::Margin,
-                Vec::new(),
-                Vec::new(),
-                true,
-                UUID4::new(),
-                UnixNanos::from(1_u64),
-                UnixNanos::from(1_u64),
-                None,
+                    stale_account_id,
+                    AccountType::Margin,
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                    UUID4::new(),
+                    UnixNanos::from(1_u64),
+                    UnixNanos::from(1_u64),
+                    None,
                 ))
                 .expect("active generation has a live execution event sender");
         }
@@ -527,18 +570,16 @@ fn inactive_order_state_does_not_commit_fill_projection() {
         Some(UUID4::new()),
     );
 
-    assert!(super::publish_order_state_report_with_fills(
-        &context,
-        report,
-        vec![unknown_fill_report(fill)],
-    )
-    .is_none());
+    assert!(
+        super::publish_order_state_report_with_fills(
+            &context,
+            report,
+            vec![unknown_fill_report(fill)],
+        )
+        .is_none()
+    );
     assert!(context.fill_projection.lock().unwrap().orders.is_empty());
-    assert!(context
-        .order_status_projection
-        .lock()
-        .unwrap()
-        .is_empty());
+    assert!(context.order_status_projection.lock().unwrap().is_empty());
     assert!(event_rx.try_recv().is_err());
 }
 
@@ -638,7 +679,10 @@ fn valid_order_state_trade_survives_status_mapping_error() {
             nanos: 0,
         }),
         trades: vec![OrderTrade {
-            price: Some(Quotation { units: 100, nano: 0 }),
+            price: Some(Quotation {
+                units: 100,
+                nano: 0,
+            }),
             quantity: 5,
             trade_id: "trade-1".to_string(),
             ..OrderTrade::default()
@@ -712,10 +756,7 @@ fn unresolved_portfolio_position_does_not_flatten_projection() {
                 account_id: "001".to_string(),
                 positions: vec![PortfolioPosition {
                     instrument_uid: "unknown-uid".to_string(),
-                    quantity: Some(Quotation {
-                        units: 10,
-                        nano: 0,
-                    }),
+                    quantity: Some(Quotation { units: 10, nano: 0 }),
                     ..PortfolioPosition::default()
                 }],
                 ..PortfolioResponse::default()
@@ -772,18 +813,12 @@ fn out_of_scope_portfolio_position_does_not_block_scoped_reconciliation() {
                         instrument_uid: sber_metadata().instrument_uid,
                         ticker: "SBER".to_string(),
                         class_code: "TQBR".to_string(),
-                        quantity: Some(Quotation {
-                            units: 10,
-                            nano: 0,
-                        }),
+                        quantity: Some(Quotation { units: 10, nano: 0 }),
                         ..PortfolioPosition::default()
                     },
                     PortfolioPosition {
                         instrument_uid: "outside-uid".to_string(),
-                        quantity: Some(Quotation {
-                            units: 10,
-                            nano: 0,
-                        }),
+                        quantity: Some(Quotation { units: 10, nano: 0 }),
                         ..PortfolioPosition::default()
                     },
                 ],
@@ -855,14 +890,14 @@ fn cached_out_of_scope_positions_are_not_published_by_any_position_stream_varian
     super::publish_positions_response(
         PositionsStreamResponse {
             payload: Some(positions_stream_response::Payload::Position(PositionData {
-                    account_id: "001".to_string(),
-                    securities: vec![PositionsSecurities {
-                        instrument_uid: "outside-uid".to_string(),
-                        balance: 10,
-                        ..PositionsSecurities::default()
-                    }],
-                    ..PositionData::default()
-                })),
+                account_id: "001".to_string(),
+                securities: vec![PositionsSecurities {
+                    instrument_uid: "outside-uid".to_string(),
+                    balance: 10,
+                    ..PositionsSecurities::default()
+                }],
+                ..PositionData::default()
+            })),
         },
         &emitter,
         &position_projection,
@@ -966,8 +1001,8 @@ fn reset_and_dispose_refuse_while_mutating_command_is_in_flight() {
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     client
-        .runtime
-        .spawn_mutating_command_task(async move {
+        .task_owner
+        .spawn_mutating_command_task(&client.runtime, "test_mutation", async move {
             let _ = started_tx.send(());
             let _ = release_rx.await;
             let _ = completed_tx.send(());
@@ -987,12 +1022,12 @@ fn reset_and_dispose_refuse_while_mutating_command_is_in_flight() {
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("mutating command was aborted by disconnect");
     for _ in 0..100 {
-        if !client.runtime.has_unfinished_mutating_tasks() {
+        if client.task_owner.operation_tasks.is_empty() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert!(!client.runtime.has_unfinished_mutating_tasks());
+    assert!(client.task_owner.operation_tasks.is_empty());
     let pending = TbankSubmitOrder {
         instrument_id: "SBER_TQBR.MOEX".to_string(),
         client_order_id: "uncertain-order".to_string(),
@@ -1021,6 +1056,43 @@ fn reset_and_dispose_refuse_while_mutating_command_is_in_flight() {
         TbankPendingSubmitStage::Accepted,
         None,
     );
+    ExecutionClient::reset(&mut client).unwrap();
+    assert!(client.runtime.instruments.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reset_requires_observing_session_task_failure() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    activate_test_lifecycle(&client);
+    client.task_owner.connected_generation = true;
+    client.task_owner.session_drain_completed = false;
+    client
+        .runtime
+        .instruments
+        .lock()
+        .unwrap()
+        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    let task = client
+        .task_owner
+        .session_tasks
+        .spawner()
+        .unwrap()
+        .spawn_named("test-session-panic", async {
+            panic!("session worker failed");
+        })
+        .unwrap();
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(ExecutionClient::reset(&mut client).is_err());
+    assert!(!client.runtime.instruments.lock().unwrap().is_empty());
+    let drain_error = client
+        .disconnect_async()
+        .await
+        .expect_err("async drain must report the session task panic");
+    assert!(drain_error.to_string().contains("task shutdown"));
+
     ExecutionClient::reset(&mut client).unwrap();
     assert!(client.runtime.instruments.lock().unwrap().is_empty());
 }
@@ -1091,9 +1163,10 @@ fn reset_refuses_while_a_submit_outcome_is_unresolved() {
         .lock()
         .unwrap()
         .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
-    client
-        .runtime
-        .record_pending_submit(&pending_submit_order("uncertain-order"), UnixNanos::from(1_u64));
+    client.runtime.record_pending_submit(
+        &pending_submit_order("uncertain-order"),
+        UnixNanos::from(1_u64),
+    );
 
     client.runtime.mark_pending_submit_terminal(
         "uncertain-order",
@@ -1352,7 +1425,15 @@ fn disconnected_reconnect_snapshot_does_not_project_or_settle_fills() {
     )
     .unwrap();
 
-    assert!(client.runtime.fill_projection.lock().unwrap().orders.is_empty());
+    assert!(
+        client
+            .runtime
+            .fill_projection
+            .lock()
+            .unwrap()
+            .orders
+            .is_empty()
+    );
     assert_eq!(
         client
             .runtime
@@ -1605,19 +1686,21 @@ fn reconnect_starts_a_new_futures_margin_freshness_generation() {
         .insert("Si-9.26_SPBFUT.MOEX".to_string(), std::time::Instant::now());
     let previous_cache = Arc::clone(&client.runtime.futures_margin_refreshed_at);
 
-    client.runtime.disconnect();
+    client.runtime.disconnect(&mut client.task_owner);
     client.runtime.begin_connection_generation();
 
     assert!(!Arc::ptr_eq(
         &previous_cache,
         &client.runtime.futures_margin_refreshed_at
     ));
-    assert!(client
-        .runtime
-        .futures_margin_refreshed_at
-        .lock()
-        .unwrap()
-        .is_empty());
+    assert!(
+        client
+            .runtime
+            .futures_margin_refreshed_at
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1665,7 +1748,11 @@ async fn reset_invalidates_stale_futures_margin_clone() {
 async fn concurrent_futures_margin_refreshes_share_one_request() {
     let server = start_futures_instruments_server().await;
     let mut client = live_query_client(server.endpoint.clone());
-    client.runtime.connect_for_queries().await.unwrap();
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let mut metadata = si_futures_metadata();
     metadata.instrument_type = crate::common::venue::TbankInstrumentType::Futures;
@@ -1692,7 +1779,10 @@ async fn concurrent_futures_margin_refreshes_share_one_request() {
     server.margin_release.notify_waiters();
     let first_result = first_future.await;
     let second_result = second_future.await;
-    assert!(first_result.is_ok(), "first refresh failed: {first_result:?}");
+    assert!(
+        first_result.is_ok(),
+        "first refresh failed: {first_result:?}"
+    );
     assert!(
         second_result.is_ok(),
         "second refresh failed: {second_result:?}"
@@ -1703,7 +1793,11 @@ async fn concurrent_futures_margin_refreshes_share_one_request() {
 async fn incomplete_cached_futures_metadata_is_replaced_by_future_by() {
     let server = start_futures_instruments_server().await;
     let mut client = live_query_client(server.endpoint.clone());
-    client.runtime.connect_for_queries().await.unwrap();
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let mut cached = si_futures_metadata();
     cached.instrument_type = crate::common::venue::TbankInstrumentType::Futures;
@@ -1718,10 +1812,7 @@ async fn incomplete_cached_futures_metadata_is_replaced_by_future_by() {
         .futures_margin_refreshed_at
         .lock()
         .unwrap()
-        .insert(
-            "Si-9.26_SPBFUT.MOEX".to_string(),
-            std::time::Instant::now(),
-        );
+        .insert("Si-9.26_SPBFUT.MOEX".to_string(), std::time::Instant::now());
 
     let mut load = Box::pin(
         client
@@ -1737,10 +1828,7 @@ async fn incomplete_cached_futures_metadata_is_replaced_by_future_by() {
     server.margin_release.notify_waiters();
 
     let resolved = load.await.unwrap();
-    assert_eq!(
-        resolved.instrument_uid,
-        "current-si-future-uid"
-    );
+    assert_eq!(resolved.instrument_uid, "current-si-future-uid");
     assert_eq!(
         resolved.initial_margin_rate_on_buy,
         Some(Decimal::new(10, 2))
@@ -1762,14 +1850,15 @@ fn reconnect_reconciliation_retries_only_transient_failures() {
     let rate_limited = anyhow::Error::new(TbankAdapterError::RateLimited("try later".to_string()));
     let permission_denied =
         anyhow::Error::new(TbankAdapterError::PermissionDenied("forbidden".to_string()));
-    let unresolved_metadata = anyhow::Error::new(
-        TbankAdapterError::InstrumentMetadataUnresolved("uid:pending".to_string()),
-    );
-    let unresolved_futures_margin = anyhow::Error::new(
-        TbankAdapterError::FuturesMarginUnresolved("Si-9.26_SPBFUT.MOEX".to_string()),
-    );
-    let out_of_scope =
-        anyhow::Error::new(TbankAdapterError::InstrumentOutOfScope("uid:outside".to_string()));
+    let unresolved_metadata = anyhow::Error::new(TbankAdapterError::InstrumentMetadataUnresolved(
+        "uid:pending".to_string(),
+    ));
+    let unresolved_futures_margin = anyhow::Error::new(TbankAdapterError::FuturesMarginUnresolved(
+        "Si-9.26_SPBFUT.MOEX".to_string(),
+    ));
+    let out_of_scope = anyhow::Error::new(TbankAdapterError::InstrumentOutOfScope(
+        "uid:outside".to_string(),
+    ));
     let invalid_event = anyhow::Error::new(TbankAdapterError::InvalidInstrumentIdentity(
         "ticker:AAPL:TQBR".to_string(),
     ));
@@ -1783,9 +1872,11 @@ fn reconnect_reconciliation_retries_only_transient_failures() {
     assert!(reconnect_reconciliation_error_is_transient(
         &unresolved_futures_margin
     ));
-    assert!(!super::TbankExecutionRuntime::metadata_error_is_event_rejection(
-        &TbankAdapterError::FuturesMarginUnresolved("Si-9.26_SPBFUT.MOEX".to_string())
-    ));
+    assert!(
+        !super::TbankExecutionRuntime::metadata_error_is_event_rejection(
+            &TbankAdapterError::FuturesMarginUnresolved("Si-9.26_SPBFUT.MOEX".to_string())
+        )
+    );
     assert!(!reconnect_reconciliation_error_is_transient(
         &permission_denied
     ));
@@ -1812,25 +1903,13 @@ fn event_identity_rejects_each_contradictory_partial_component() {
     metadata.figi = "sber-figi".to_string();
 
     assert!(super::metadata_matches_event_identity(
-        &metadata,
-        "sber-uid",
-        "",
-        "SBER",
-        "",
+        &metadata, "sber-uid", "", "SBER", "",
     ));
     assert!(!super::metadata_matches_event_identity(
-        &metadata,
-        "sber-uid",
-        "",
-        "AAPL",
-        "",
+        &metadata, "sber-uid", "", "AAPL", "",
     ));
     assert!(!super::metadata_matches_event_identity(
-        &metadata,
-        "sber-uid",
-        "",
-        "",
-        "SPBXM",
+        &metadata, "sber-uid", "", "", "SPBXM",
     ));
     assert!(!super::metadata_matches_event_identity(
         &metadata,
@@ -1869,7 +1948,9 @@ async fn missing_instrument_identity_is_rejected_without_retry() {
         TbankAdapterError::InvalidInstrumentIdentity(identity)
             if identity.starts_with("broker instrument identity:")
     ));
-    assert!(!reconnect_reconciliation_error_is_transient(&anyhow::Error::new(error)));
+    assert!(!reconnect_reconciliation_error_is_transient(
+        &anyhow::Error::new(error)
+    ));
 }
 
 #[test]
@@ -1947,9 +2028,9 @@ async fn uncached_share_by_resolution_classifies_out_of_scope() {
         ),
         "unexpected metadata resolution error: {error:?}"
     );
-    assert!(!reconnect_reconciliation_error_is_transient(&anyhow::Error::new(
-        error
-    )));
+    assert!(!reconnect_reconciliation_error_is_transient(
+        &anyhow::Error::new(error)
+    ));
 }
 
 #[tokio::test]
@@ -1998,9 +2079,9 @@ async fn malformed_share_metadata_classifies_out_of_scope_without_retry() {
         TbankAdapterError::InstrumentOutOfScope(identity)
             if identity == "ticker:BROKEN:TQBR"
     ));
-    assert!(!reconnect_reconciliation_error_is_transient(&anyhow::Error::new(
-        error
-    )));
+    assert!(!reconnect_reconciliation_error_is_transient(
+        &anyhow::Error::new(error)
+    ));
 }
 
 #[test]
@@ -2141,6 +2222,7 @@ fn executed_stop_is_triggered_until_activated_child_finishes() {
 #[derive(Clone, Default)]
 struct MockOrdersService {
     calls: Arc<Mutex<Vec<PostOrderRequest>>>,
+    post_gate: Arc<Mutex<Option<MockPostOrderGate>>>,
     post_error: Arc<Mutex<Option<(Code, String)>>>,
     post_response: Arc<Mutex<Option<PostOrderResponse>>>,
     cancel_calls: Arc<Mutex<Vec<CancelOrderRequest>>>,
@@ -2148,11 +2230,18 @@ struct MockOrdersService {
     state_calls: Arc<Mutex<Vec<GetOrderStateRequest>>>,
     state_delay: Arc<Mutex<std::time::Duration>>,
     state_error: Arc<Mutex<Option<(Code, String)>>>,
+    state_error_responses: Arc<Mutex<VecDeque<(Code, String)>>>,
     state_response: Arc<Mutex<Option<OrderState>>>,
     get_orders_calls: Arc<AtomicU64>,
     get_orders_requests: Arc<Mutex<Vec<GetOrdersRequest>>>,
     get_orders_response: Arc<Mutex<Option<GetOrdersResponse>>>,
     get_orders_unfiltered_response: Arc<Mutex<Option<GetOrdersResponse>>>,
+}
+
+#[derive(Clone)]
+struct MockPostOrderGate {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -2220,14 +2309,10 @@ where
                     share: Option<crate::grpc::generated::Share>,
                 }
 
-                impl tonic::server::UnaryService<crate::grpc::generated::InstrumentRequest>
-                    for ShareByService
-                {
+                impl tonic::server::UnaryService<crate::grpc::generated::InstrumentRequest> for ShareByService {
                     type Response = crate::grpc::generated::ShareResponse;
-                    type Future = tonic::codegen::BoxFuture<
-                        tonic::Response<Self::Response>,
-                        tonic::Status,
-                    >;
+                    type Future =
+                        tonic::codegen::BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
 
                     fn call(
                         &mut self,
@@ -2251,9 +2336,7 @@ where
 
                 Box::pin(async move {
                     let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
-                    Ok(grpc
-                        .unary(ShareByService { share }, request)
-                        .await)
+                    Ok(grpc.unary(ShareByService { share }, request).await)
                 })
             }
             "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy" => {
@@ -2263,10 +2346,8 @@ where
                     for GetInstrumentByService
                 {
                     type Response = crate::grpc::generated::InstrumentResponse;
-                    type Future = tonic::codegen::BoxFuture<
-                        tonic::Response<Self::Response>,
-                        tonic::Status,
-                    >;
+                    type Future =
+                        tonic::codegen::BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
 
                     fn call(
                         &mut self,
@@ -2286,22 +2367,16 @@ where
                         lookup_started.store(true, Ordering::SeqCst);
                     }
                     let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
-                    Ok(grpc
-                        .unary(GetInstrumentByService, request)
-                        .await)
+                    Ok(grpc.unary(GetInstrumentByService, request).await)
                 })
             }
             "/tinkoff.public.invest.api.contract.v1.InstrumentsService/FutureBy" => {
                 struct FutureByService;
 
-                impl tonic::server::UnaryService<crate::grpc::generated::InstrumentRequest>
-                    for FutureByService
-                {
+                impl tonic::server::UnaryService<crate::grpc::generated::InstrumentRequest> for FutureByService {
                     type Response = crate::grpc::generated::FutureResponse;
-                    type Future = tonic::codegen::BoxFuture<
-                        tonic::Response<Self::Response>,
-                        tonic::Status,
-                    >;
+                    type Future =
+                        tonic::codegen::BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
 
                     fn call(
                         &mut self,
@@ -2369,14 +2444,10 @@ where
                 calls: Arc<AtomicU64>,
             }
 
-            impl tonic::server::UnaryService<crate::grpc::generated::InstrumentRequest>
-                for FutureByService
-            {
+            impl tonic::server::UnaryService<crate::grpc::generated::InstrumentRequest> for FutureByService {
                 type Response = crate::grpc::generated::FutureResponse;
-                type Future = tonic::codegen::BoxFuture<
-                    tonic::Response<Self::Response>,
-                    tonic::Status,
-                >;
+                type Future =
+                    tonic::codegen::BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
 
                 fn call(
                     &mut self,
@@ -2385,9 +2456,11 @@ where
                     let future = self.future.clone();
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async move {
-                        Ok(tonic::Response::new(crate::grpc::generated::FutureResponse {
-                            instrument: Some(future),
-                        }))
+                        Ok(tonic::Response::new(
+                            crate::grpc::generated::FutureResponse {
+                                instrument: Some(future),
+                            },
+                        ))
                     })
                 }
             }
@@ -2532,7 +2605,11 @@ async fn reconnect_stop_query_keeps_active_orders_and_bounds_terminal_history() 
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
     let from_seconds = chrono::Utc::now().timestamp() - 60;
 
     let response = client
@@ -2588,7 +2665,11 @@ async fn unbounded_stop_query_recovers_from_response_limit_in_bounded_windows() 
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let response = client
         .runtime
@@ -2600,9 +2681,11 @@ async fn unbounded_stop_query_recovers_from_response_limit_in_bounded_windows() 
     let calls = get_calls.lock().unwrap();
     assert!(calls.len() > 2, "expected fallback windows after 30261");
     assert!(calls[0].from.is_none() && calls[0].to.is_none());
-    assert!(calls[1..]
-        .iter()
-        .all(|request| request.from.is_some() && request.to.is_some()));
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|request| request.from.is_some() && request.to.is_some())
+    );
 }
 
 #[tokio::test]
@@ -2963,20 +3046,18 @@ async fn run_order_status_report_query_test(
 }
 
 use super::{
-    SUBMIT_OUTCOME_RECOVERY_ATTEMPTS, SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET,
-    SUBMIT_OUTCOME_RECOVERY_DELAY_CAP,
-    TbankBrokerOrderIdentity, TbankBrokerOrderIndex,
-    TbankBrokerOrderRoute, TbankCancelTarget, TbankExecutionClient, TbankManagedOrderContext,
-    TbankPendingSubmit, TbankPendingSubmitStage, TbankSubmitResponse, TbankTimeInForceType,
-    confirm_margin_trade_for_submit, current_unix_nanos, fill_report_from_order_trade,
-    classify_fill_operation_type, next_submit_outcome_recovery_delay, project_order_status_report,
-    TbankFillOperationKind,
-    reconnect_reconciliation_error_is_transient, resolve_stream_order_venue_id,
-    settle_order_report_mutation_state, settle_reconciled_buffered_trade_fill,
-    stream_order_state_client_order_id, stream_order_status_report_from_state,
-    submit_outcome_recovery_budget,
-    stream_stop_order_status_report_from_state, submit_nautilus_order_reports,
-    submit_nautilus_order_reports_with_recovery, tbank_broker_request_id_for_client_order_id,
+    SUBMIT_OUTCOME_RECOVERY_ATTEMPTS, SUBMIT_OUTCOME_RECOVERY_DELAY_CAP,
+    SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET, TbankBrokerOrderIdentity, TbankBrokerOrderIndex,
+    TbankBrokerOrderRoute, TbankCancelTarget, TbankExecutionClient, TbankFillOperationKind,
+    TbankManagedOrderContext, TbankPendingSubmit, TbankPendingSubmitStage, TbankSubmitResponse,
+    TbankTimeInForceType, classify_fill_operation_type, confirm_margin_trade_for_submit,
+    current_unix_nanos, fill_report_from_order_trade, next_submit_outcome_recovery_delay,
+    project_order_status_report, reconnect_reconciliation_error_is_transient,
+    resolve_stream_order_venue_id, settle_order_report_mutation_state,
+    settle_reconciled_buffered_trade_fill, stream_order_state_client_order_id,
+    stream_order_status_report_from_state, stream_stop_order_status_report_from_state,
+    submit_nautilus_order_reports, submit_nautilus_order_reports_with_recovery,
+    submit_outcome_recovery_budget, tbank_broker_request_id_for_client_order_id,
     trailing_stop_params,
 };
 
@@ -2991,10 +3072,8 @@ fn metadata_lookup_preserves_transient_fallback_error() {
         message: "future lookup unavailable".to_string(),
     };
 
-    let selected = super::TbankExecutionRuntime::select_metadata_lookup_error(
-        share_error,
-        future_error,
-    );
+    let selected =
+        super::TbankExecutionRuntime::select_metadata_lookup_error(share_error, future_error);
 
     assert!(matches!(
         selected,

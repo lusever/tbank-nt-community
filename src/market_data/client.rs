@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
@@ -9,6 +10,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::watch;
 
 use crate::{
     common::venue::TbankVenue,
@@ -50,14 +52,11 @@ use crate::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use futures_util::future::join_all;
+use futures_util::{FutureExt, future::join_all};
 use nautilus_common::{
     cache::CacheView,
     clients::DataClient,
-    live::{
-        runner::{get_data_event_sender, try_get_data_event_sender},
-        runtime::get_runtime,
-    },
+    live::runner::{get_data_event_sender, try_get_data_event_sender},
     messages::{
         DataEvent,
         data::{
@@ -70,6 +69,9 @@ use nautilus_common::{
     providers::InstrumentProvider,
 };
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_live::task::{
+    TaskGroup, TaskGroupGuard, TaskJoinOutcome, TaskSlot, TaskSpawner, finish_task,
+};
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, DEPTH10_LEN, Data, OrderBookDepth10, QuoteTick, TradeTick},
     enums::{AggregationSource, AggressorSide, BarAggregation, BookType, OrderSide},
@@ -78,7 +80,6 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
-use tokio::task::{JoinHandle, JoinSet};
 
 type MarketDataStreamClient =
     crate::grpc::generated::market_data_stream_service_client::MarketDataStreamServiceClient<
@@ -89,6 +90,220 @@ const MAX_QUOTES_PER_STREAM: usize = 300;
 const MAX_PRE_ACK_MESSAGES: usize = 2_048;
 type SharedInstrumentMetadata = Arc<RwLock<HashMap<String, MarketDataInstrumentMetadata>>>;
 type SharedInstrumentStreamIds = Arc<RwLock<HashMap<String, String>>>;
+
+#[derive(Debug, Default)]
+struct SessionPublicationFence {
+    generation: AtomicU64,
+    publication_gate: std::sync::Mutex<()>,
+}
+
+/// Cancellation for replaceable work; `session_tasks` retains its join ownership.
+#[derive(Clone, Debug)]
+struct TaskCancellation(watch::Sender<bool>);
+
+struct SingularStreamTask {
+    cancellation: TaskCancellation,
+    task: TaskSlot<()>,
+}
+
+impl TaskCancellation {
+    fn new() -> Self {
+        Self(watch::channel(false).0)
+    }
+
+    fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    #[cfg(test)]
+    fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        loop {
+            if *receiver.borrow() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn spawn_task_in_generation<F>(
+    spawner: &TaskSpawner,
+    name: &'static str,
+    cancellation: TaskCancellation,
+    future: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let generation_cancellation = spawner.cancellation_token();
+    spawner
+        .spawn_named(name, async move {
+            tokio::select! {
+                biased;
+                () = generation_cancellation.cancelled() => {},
+                () = cancellation.cancelled() => {},
+                () = future => {},
+            }
+        })
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+fn spawn_task_in_scoped_generation<F>(
+    spawner: &TaskSpawner,
+    session_cancellation: TaskCancellation,
+    name: &'static str,
+    cancellation: TaskCancellation,
+    future: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let snapshot_cancellation = spawner.cancellation_token();
+    spawner
+        .spawn_named(name, async move {
+            tokio::select! {
+                biased;
+                () = session_cancellation.cancelled() => {},
+                () = snapshot_cancellation.cancelled() => {},
+                () = cancellation.cancelled() => {},
+                () = future => {},
+            }
+        })
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+fn spawn_snapshot_task<F>(
+    spawner: &TaskSpawner,
+    session_cancellation: TaskCancellation,
+    name: &'static str,
+    future: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let snapshot_cancellation = spawner.cancellation_token();
+    spawner
+        .spawn_named(name, async move {
+            tokio::select! {
+                biased;
+                () = session_cancellation.cancelled() => {},
+                () = snapshot_cancellation.cancelled() => {},
+                () = future => {},
+            }
+        })
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+fn retire_snapshot_group(tasks: &mut TaskGroup, active: &mut bool, retired: &mut Vec<TaskGroup>) {
+    if !*active {
+        return;
+    }
+    let previous = std::mem::replace(tasks, TaskGroup::new());
+    previous.begin_shutdown();
+    retired.push(previous);
+    *active = false;
+}
+
+fn spawn_singular_task<F>(
+    spawner: &TaskSpawner,
+    name: &'static str,
+    cancellation: TaskCancellation,
+    future: F,
+) -> anyhow::Result<TaskSlot<()>>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let session_cancellation = spawner.cancellation_token();
+    let mut task = TaskSlot::new();
+    task.spawn(async move {
+        tokio::select! {
+            biased;
+            () = session_cancellation.cancelled() => {},
+            () = cancellation.cancelled() => {},
+            () = future => {},
+        }
+    })
+    .map_err(anyhow::Error::from)
+    .map_err(|error| anyhow::anyhow!("failed to start {name}: {error}"))?;
+    Ok(task)
+}
+
+fn drain_singular_task(
+    spawner: &TaskSpawner,
+    mut task: TaskSlot<()>,
+    name: &'static str,
+    incomplete_tasks: Arc<tokio::sync::Mutex<Vec<TaskSlot<()>>>>,
+    failures: Arc<Mutex<Vec<String>>>,
+) -> anyhow::Result<()> {
+    spawner
+        .spawn_named(name, async move {
+            match finish_task(&mut task, Duration::from_secs(1), Duration::from_secs(2)).await {
+                Some(TaskJoinOutcome::Completed(())) | Some(TaskJoinOutcome::Aborted) | None => {}
+                Some(TaskJoinOutcome::Failed(error)) => {
+                    tracing::error!(task = name, %error, "T-Bank stream task failed during drain");
+                    failures
+                        .lock()
+                        .expect("market-data task failures lock")
+                        .push(format!("{name}: {error}"));
+                }
+                Some(TaskJoinOutcome::Incomplete) => {
+                    tracing::error!(task = name, "T-Bank stream task exceeded its bounded drain");
+                    incomplete_tasks.lock().await.push(task);
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+impl SessionPublicationFence {
+    fn advance(&self) -> u64 {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .expect("market-data session publication lock");
+        self.generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
+    }
+
+    fn current(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn if_current(&self, generation: u64, publish: impl FnOnce()) -> bool {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .expect("market-data session publication lock");
+        if self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        publish();
+        true
+    }
+}
+
 /// The continuity cursor belongs to the stable Nautilus subscription, not to a broker route.
 /// Broker instrument UIDs can change after catalogue refresh while `BarType` retains the
 /// InstrumentId that owns the subscription.
@@ -353,23 +568,30 @@ impl MarketDataStreamHealth {
         &self,
         parent_task_key: &str,
         child_task_key: &str,
+        spawner: &TaskSpawner,
         spawn: F,
-    ) -> Option<JoinHandle<()>>
+    ) -> anyhow::Result<bool>
     where
-        F: FnOnce() -> JoinHandle<()>,
+        F: FnOnce(&TaskSpawner) -> anyhow::Result<()>,
     {
         let mut state = self.state.lock().expect("market-data lifecycle lock");
         if !task_key_is_current(&state, parent_task_key) {
-            return None;
+            return Ok(false);
         }
         Self::register_task_key(&mut state, child_task_key);
         if !task_key_is_current(&state, parent_task_key) {
             state.current_task_keys.remove(child_task_key);
             state.expected_groups.remove(child_task_key);
             state.non_operational_groups.remove(child_task_key);
-            return None;
+            return Ok(false);
         }
-        Some(spawn())
+        if let Err(error) = spawn(spawner) {
+            state.current_task_keys.remove(child_task_key);
+            state.expected_groups.remove(child_task_key);
+            state.non_operational_groups.remove(child_task_key);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -569,20 +791,21 @@ async fn refresh_published_instrument_catalogue(
     configured_stream_ids: &HashMap<String, String>,
     resolved_stream_ids: &SharedInstrumentStreamIds,
     instrument_metadata: &SharedInstrumentMetadata,
-) -> Result<()> {
+    lifecycle: &SessionPublicationFence,
+    generation: u64,
+) -> Result<bool> {
     let (provider, refreshed_stream_ids, resolved_metadata) =
         load_resolved_instrument_catalogue(config, configured_stream_ids).await?;
 
-    // Merge successful refreshes so a transiently unresolved auto-discovered contract cannot
-    // remove either decoder metadata or its canonical stream route from an already active
-    // subscription. Full connect remains the owner of routing-map replacement.
-    merge_resolved_instrument_stream_ids(resolved_stream_ids, refreshed_stream_ids);
-    instrument_metadata
-        .write()
-        .expect("market-data metadata lock")
-        .extend(resolved_metadata);
-    publish_instrument_definitions(&provider);
-    Ok(())
+    Ok(lifecycle.if_current(generation, || {
+        // Successful refreshes merge so a transient miss cannot remove an active route.
+        merge_resolved_instrument_stream_ids(resolved_stream_ids, refreshed_stream_ids);
+        instrument_metadata
+            .write()
+            .expect("market-data metadata lock")
+            .extend(resolved_metadata);
+        publish_instrument_definitions(&provider);
+    }))
 }
 
 async fn load_resolved_instrument_catalogue(
@@ -658,11 +881,24 @@ pub struct TbankDataClient {
     instrument_metadata: SharedInstrumentMetadata,
     instrument_subscriptions: Vec<(Venue, TypedHandler<InstrumentAny>)>,
     clients: Option<TbankGrpcClients<TbankAuthInterceptor>>,
-    stream_tasks: HashMap<String, JoinHandle<()>>,
-    bar_stream_task: Option<JoinHandle<()>>,
-    quote_stream_task: Option<JoinHandle<()>>,
-    instrument_refresh_task: Option<JoinHandle<()>>,
-    request_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Owns every data worker in the current connection generation. Drop closes admission and
+    /// requests abort; `disconnect_async` is required to observe bounded completion.
+    session_tasks: TaskGroup,
+    /// Singular workers use TaskSlot; their bounded drain futures belong to the session group.
+    stream_tasks: HashMap<String, SingularStreamTask>,
+    /// Current multi-worker subscription snapshots.
+    bar_snapshot_tasks: TaskGroup,
+    quote_snapshot_tasks: TaskGroup,
+    /// Retains replaced groups until an async lifecycle boundary drains them.
+    retired_snapshot_tasks: Vec<TaskGroup>,
+    bar_snapshot_active: bool,
+    quote_snapshot_active: bool,
+    session_cancellation: TaskCancellation,
+    /// Retains TaskSlots whose bounded drain needs a later retry.
+    incomplete_stream_tasks: Arc<tokio::sync::Mutex<Vec<TaskSlot<()>>>>,
+    stream_task_failures: Arc<Mutex<Vec<String>>>,
+    instrument_refresh_task: Option<TaskCancellation>,
+    session_publication: Arc<SessionPublicationFence>,
     message_sequence: Arc<AtomicU64>,
     /// Desired Nautilus subscriptions. Broker stream IDs are derived only while building a
     /// concrete stream request, because catalogue discovery can change them between sessions.
@@ -700,11 +936,18 @@ impl TbankDataClient {
             instrument_metadata: Arc::new(RwLock::new(HashMap::new())),
             instrument_subscriptions: Vec::new(),
             clients: None,
+            session_tasks: TaskGroup::new(),
             stream_tasks: HashMap::new(),
-            bar_stream_task: None,
-            quote_stream_task: None,
+            bar_snapshot_tasks: TaskGroup::new(),
+            quote_snapshot_tasks: TaskGroup::new(),
+            retired_snapshot_tasks: Vec::new(),
+            bar_snapshot_active: false,
+            quote_snapshot_active: false,
+            session_cancellation: TaskCancellation::new(),
+            incomplete_stream_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            stream_task_failures: Arc::new(Mutex::new(Vec::new())),
             instrument_refresh_task: None,
-            request_tasks: Arc::new(Mutex::new(Vec::new())),
+            session_publication: Arc::new(SessionPublicationFence::default()),
             message_sequence: Arc::new(AtomicU64::new(0)),
             bar_subscriptions: HashMap::new(),
             scheduled_bar_continuity_keys: HashMap::new(),
@@ -730,6 +973,151 @@ impl TbankDataClient {
     pub(crate) fn with_cache(mut self, cache: CacheView) -> Self {
         self.cache = Some(cache);
         self
+    }
+
+    fn spawn_session_task<F>(
+        &self,
+        spawner: &TaskSpawner,
+        name: &'static str,
+        cancellation: TaskCancellation,
+        future: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        spawn_task_in_generation(spawner, name, cancellation, future)
+    }
+
+    async fn prepare_session_generation(&mut self) -> anyhow::Result<()> {
+        if self.clients.is_some() {
+            self.begin_background_shutdown("replacing T-Bank market-data session", false);
+        }
+        if !self.session_tasks.is_open() {
+            self.finish_session_tasks().await?;
+            self.session_tasks.start_generation().map_err(|error| {
+                anyhow::anyhow!("failed to open T-Bank data session generation: {error}")
+            })?;
+            self.bar_snapshot_tasks
+                .start_generation()
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to open T-Bank bar snapshot generation: {error}")
+                })?;
+            self.quote_snapshot_tasks
+                .start_generation()
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to open T-Bank quote snapshot generation: {error}")
+                })?;
+            self.bar_snapshot_active = false;
+            self.quote_snapshot_active = false;
+            self.session_cancellation = TaskCancellation::new();
+        }
+        Ok(())
+    }
+
+    async fn finish_session_tasks(&mut self) -> anyhow::Result<()> {
+        let (session, bars, quotes) = tokio::join!(
+            self.session_tasks
+                .finish_shutdown(Duration::from_secs(5), Duration::from_secs(1)),
+            self.bar_snapshot_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+            self.quote_snapshot_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+        );
+        let mut errors = Vec::new();
+        if let Err(error) = session {
+            errors.push(format!(
+                "failed to finish T-Bank data session tasks: {error}"
+            ));
+        }
+        if let Err(error) = bars {
+            errors.push(format!(
+                "failed to finish T-Bank bar snapshot tasks: {error}"
+            ));
+        }
+        if let Err(error) = quotes {
+            errors.push(format!(
+                "failed to finish T-Bank quote snapshot tasks: {error}"
+            ));
+        }
+
+        let retired =
+            join_all(self.retired_snapshot_tasks.iter().map(|tasks| {
+                tasks.finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            }))
+            .await;
+        for result in retired {
+            if let Err(error) = result {
+                errors.push(format!(
+                    "failed to finish a retired T-Bank snapshot task group: {error}"
+                ));
+            }
+        }
+        self.retired_snapshot_tasks
+            .retain(|tasks| !tasks.is_empty());
+
+        let mut incomplete = {
+            let mut tasks = self.incomplete_stream_tasks.lock().await;
+            std::mem::take(&mut *tasks)
+        };
+        let outcomes = join_all(
+            incomplete
+                .iter_mut()
+                .map(|task| finish_task(task, Duration::from_secs(1), Duration::from_secs(2))),
+        )
+        .await;
+        let mut still_incomplete = Vec::new();
+        for (task, outcome) in incomplete.into_iter().zip(outcomes) {
+            match outcome {
+                Some(TaskJoinOutcome::Completed(())) | Some(TaskJoinOutcome::Aborted) | None => {}
+                Some(TaskJoinOutcome::Failed(error)) => {
+                    errors.push(format!(
+                        "T-Bank singular stream task failed during retry drain: {error}"
+                    ));
+                }
+                Some(TaskJoinOutcome::Incomplete) => still_incomplete.push(task),
+            }
+        }
+        let incomplete_count = still_incomplete.len();
+        self.incomplete_stream_tasks
+            .lock()
+            .await
+            .extend(still_incomplete);
+        errors.extend(std::mem::take(
+            &mut *self
+                .stream_task_failures
+                .lock()
+                .expect("market-data task failures lock"),
+        ));
+        if incomplete_count > 0 {
+            errors.push(format!(
+                "{incomplete_count} T-Bank singular stream task(s) remain owned after bounded drain"
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(errors.join("; ")))
+        }
+    }
+
+    fn begin_background_shutdown(&mut self, reason: &str, terminal: bool) {
+        self.session_publication.advance();
+        self.session_cancellation.cancel();
+        self.stop_market_data_streams(reason, terminal);
+        if let Some(task) = self.instrument_refresh_task.take() {
+            task.cancel();
+        }
+        self.bar_snapshot_tasks.begin_shutdown();
+        self.quote_snapshot_tasks.begin_shutdown();
+        self.bar_snapshot_active = false;
+        self.quote_snapshot_active = false;
+        self.session_tasks.begin_shutdown();
+        self.unsubscribe_instrument_updates();
+        self.clients = None;
+        *self
+            .resolved_instrument_stream_ids
+            .write()
+            .expect("market-data stream IDs lock") = self.config.instrument_stream_ids.clone();
     }
 
     fn subscribe_instrument_updates(&mut self) {
@@ -805,6 +1193,9 @@ impl TbankDataClient {
             return Ok(());
         }
         let replacing_clients = self.clients.is_some();
+        self.prepare_session_generation()
+            .await
+            .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
         self.config.validate()?;
         let (instrument_provider, instrument_stream_ids, instrument_metadata) =
             load_resolved_instrument_catalogue(&self.config, &self.config.instrument_stream_ids)
@@ -813,34 +1204,72 @@ impl TbankDataClient {
         let endpoint = self.config.endpoint_uri()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(&token)?;
-        self.stop_market_data_streams(
-            "market data clients are being replaced",
-            replacing_clients && !self.config.subscriptions_on_reconnect,
+
+        let stream_health = Arc::clone(&self.stream_health);
+        let setup_guard = TaskGroupGuard::new(
+            &[
+                &self.session_tasks,
+                &self.bar_snapshot_tasks,
+                &self.quote_snapshot_tasks,
+            ],
+            move || {
+                stream_health.retire_all(
+                    "stream_subscriptions_stopped",
+                    "T-Bank data session setup rolled back",
+                );
+            },
         );
-        *self
-            .resolved_instrument_stream_ids
-            .write()
-            .expect("market-data stream IDs lock") = instrument_stream_ids;
-        *self
-            .instrument_metadata
-            .write()
-            .expect("market-data metadata lock") = instrument_metadata;
+
+        let catalogue_generation = self.session_publication.advance();
+        let session_publication = Arc::clone(&self.session_publication);
+        session_publication.if_current(catalogue_generation, || {
+            *self
+                .resolved_instrument_stream_ids
+                .write()
+                .expect("market-data stream IDs lock") = instrument_stream_ids;
+            *self
+                .instrument_metadata
+                .write()
+                .expect("market-data metadata lock") = instrument_metadata;
+            publish_instrument_definitions(&instrument_provider);
+        });
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
-        self.subscribe_instrument_updates();
-        publish_instrument_definitions(&instrument_provider);
-        self.schedule_instrument_refresh();
-        if should_restore_market_data_streams(
-            replacing_clients,
-            self.config.subscriptions_on_reconnect,
-        ) {
-            self.restore_market_data_streams()
-                .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
-        } else if replacing_clients {
-            // `subscriptions_on_reconnect = false` is an explicit opt-out, not merely a
-            // request to delay the old streams. Drop the desired state as well, otherwise the
-            // next unrelated subscribe command would reschedule every pre-reconnect stream.
-            self.clear_market_data_subscription_state();
+        let setup_result = (|| -> anyhow::Result<()> {
+            self.subscribe_instrument_updates();
+            let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
+            self.schedule_instrument_refresh(&spawner, catalogue_generation)?;
+            if should_restore_market_data_streams(
+                replacing_clients,
+                self.config.subscriptions_on_reconnect,
+            ) {
+                self.restore_market_data_streams()?;
+            } else if replacing_clients {
+                // Explicit opt-out also drops the desired state so later subscriptions do not
+                // resurrect streams from before the reconnect.
+                self.clear_market_data_subscription_state();
+            }
+            Ok(())
+        })();
+        if let Err(error) = setup_result {
+            self.session_publication.advance();
+            self.session_cancellation.cancel();
+            self.stop_market_data_streams("T-Bank data session setup rolled back", false);
+            if let Some(task) = self.instrument_refresh_task.take() {
+                task.cancel();
+            }
+            drop(setup_guard);
+            self.unsubscribe_instrument_updates();
+            self.clients = None;
+            self.finish_session_tasks()
+                .await
+                .map_err(|shutdown_error| {
+                    TbankAdapterError::ConfigError(format!(
+                        "{error}; setup rollback drain failed: {shutdown_error}"
+                    ))
+                })?;
+            return Err(TbankAdapterError::ConfigError(error.to_string()));
         }
+        setup_guard.disarm();
         tracing::info!(
             environment = ?self.config.environment,
             endpoint = endpoint.as_str(),
@@ -850,49 +1279,21 @@ impl TbankDataClient {
         Ok(())
     }
 
-    /// Disconnects the client and aborts its background tasks.
+    /// Disconnects and requests nonblocking cancellation of its background tasks.
     pub fn disconnect(&mut self) {
-        drop(self.abort_background_tasks("market data client disconnected", false));
-        self.unsubscribe_instrument_updates();
-        self.clients = None;
-        *self
-            .resolved_instrument_stream_ids
-            .write()
-            .expect("market-data stream IDs lock") = self.config.instrument_stream_ids.clone();
+        self.begin_background_shutdown("market data client disconnected", false);
         tracing::info!("disconnected T-Bank data client");
     }
 
-    /// Disconnects the client and joins every task owned by its async lifecycle.
-    pub async fn disconnect_async(&mut self) {
-        let tasks = self.abort_background_tasks("market data client disconnected", false);
-        self.unsubscribe_instrument_updates();
-        self.clients = None;
-        *self
-            .resolved_instrument_stream_ids
-            .write()
-            .expect("market-data stream IDs lock") = self.config.instrument_stream_ids.clone();
-        for task in tasks {
-            let _ = task.await;
-        }
+    /// Disconnects the client and observes bounded completion of every session task.
+    pub async fn disconnect_async(&mut self) -> anyhow::Result<()> {
+        self.begin_background_shutdown("market data client disconnected", false);
+        self.finish_session_tasks().await?;
         tracing::info!("disconnected T-Bank data client");
+        Ok(())
     }
 
-    fn abort_background_tasks(&mut self, reason: &str, terminal: bool) -> Vec<JoinHandle<()>> {
-        let mut tasks = self.stop_market_data_streams(reason, terminal);
-        if let Some(task) = self.instrument_refresh_task.take() {
-            task.abort();
-            tasks.push(task);
-        }
-        let mut request_tasks = self.request_tasks.lock().expect("request_tasks lock");
-        for task in request_tasks.drain(..) {
-            task.abort();
-            tasks.push(task);
-        }
-        tasks
-    }
-
-    fn stop_market_data_streams(&mut self, reason: &str, terminal: bool) -> Vec<JoinHandle<()>> {
-        let mut tasks = Vec::new();
+    fn stop_market_data_streams(&mut self, reason: &str, terminal: bool) {
         let stage = if terminal {
             "stream_subscriptions_disabled"
         } else {
@@ -900,20 +1301,26 @@ impl TbankDataClient {
         };
         self.advance_bar_stream_generation_with_stage(Some(stage), reason);
         self.stream_health.retire_all(stage, reason);
-        for (_, task) in self.stream_tasks.drain() {
-            task.abort();
-            tasks.push(task);
+        let session_spawner = self.session_tasks.spawner().ok();
+        for (_, mut owner) in self.stream_tasks.drain() {
+            owner.cancellation.cancel();
+            if let Some(spawner) = session_spawner.as_ref()
+                && let Err(error) = drain_singular_task(
+                    spawner,
+                    std::mem::take(&mut owner.task),
+                    "market-data-stream-task-drain",
+                    Arc::clone(&self.incomplete_stream_tasks),
+                    Arc::clone(&self.stream_task_failures),
+                )
+            {
+                tracing::error!(%error, "failed to register T-Bank stream task drain");
+            }
         }
         self.active_stream_task_keys.clear();
-        if let Some(task) = self.bar_stream_task.take() {
-            task.abort();
-            tasks.push(task);
-        }
-        if let Some(task) = self.quote_stream_task.take() {
-            task.abort();
-            tasks.push(task);
-        }
-        tasks
+        self.bar_snapshot_tasks.begin_shutdown();
+        self.quote_snapshot_tasks.begin_shutdown();
+        self.bar_snapshot_active = false;
+        self.quote_snapshot_active = false;
     }
 
     fn advance_bar_stream_generation_with_stage(
@@ -969,19 +1376,26 @@ impl TbankDataClient {
         Ok(())
     }
 
-    fn schedule_instrument_refresh(&mut self) {
+    fn schedule_instrument_refresh(
+        &mut self,
+        spawner: &TaskSpawner,
+        generation: u64,
+    ) -> anyhow::Result<()> {
         if let Some(task) = self.instrument_refresh_task.take() {
-            task.abort();
+            task.cancel();
         }
         let refresh_interval = self.config.instrument_refresh_interval;
         if refresh_interval.is_zero() {
-            return;
+            return Ok(());
         }
         let config = self.config.clone();
         let configured_stream_ids = config.instrument_stream_ids.clone();
         let resolved_stream_ids = Arc::clone(&self.resolved_instrument_stream_ids);
         let instrument_metadata = Arc::clone(&self.instrument_metadata);
-        self.instrument_refresh_task = Some(get_runtime().spawn(async move {
+        let session_publication = Arc::clone(&self.session_publication);
+        let cancellation = TaskCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let future = async move {
             let mut interval = tokio::time::interval(refresh_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // The connect path has just loaded and published the same authoritative catalogue.
@@ -993,6 +1407,8 @@ impl TbankDataClient {
                     &configured_stream_ids,
                     &resolved_stream_ids,
                     &instrument_metadata,
+                    &session_publication,
+                    generation,
                 )
                 .await
                 {
@@ -1003,7 +1419,15 @@ impl TbankDataClient {
                     );
                 }
             }
-        }));
+        };
+        self.spawn_session_task(
+            spawner,
+            "instrument-catalogue-refresh",
+            task_cancellation,
+            future,
+        )?;
+        self.instrument_refresh_task = Some(cancellation);
+        Ok(())
     }
 
     /// Returns whether the client is connected.
@@ -1382,14 +1806,19 @@ impl TbankDataClient {
     }
 
     fn schedule_bar_streams(&mut self) -> anyhow::Result<()> {
+        let session_cancellation = self.session_cancellation.clone();
+        if self.bar_snapshot_active {
+            retire_snapshot_group(
+                &mut self.bar_snapshot_tasks,
+                &mut self.bar_snapshot_active,
+                &mut self.retired_snapshot_tasks,
+            );
+        }
         let generation = self.invalidate_bar_snapshot("bar stream snapshot was replaced");
         if self.bar_subscriptions.is_empty() {
             self.scheduled_bar_continuity_keys.clear();
             self.stream_health
                 .replace_expected("bars:", std::iter::empty());
-            if let Some(existing) = self.bar_stream_task.take() {
-                existing.abort();
-            }
             return Ok(());
         }
 
@@ -1515,11 +1944,12 @@ impl TbankDataClient {
             }
         }
         self.scheduled_bar_continuity_keys = next_continuity_keys;
-        if let Some(existing) = self.bar_stream_task.take() {
-            existing.abort();
-        }
-
         if !groups.is_empty() || !poll_subscriptions.is_empty() {
+            let spawner = self
+                .bar_snapshot_tasks
+                .spawner()
+                .map_err(anyhow::Error::from)?;
+            self.bar_snapshot_active = true;
             let stream_market_data_client = market_data_client.clone();
             let stream_config = config.clone();
             let stream_sender = sender.clone();
@@ -1530,78 +1960,89 @@ impl TbankDataClient {
             let stream_bar_watermarks = self.bar_watermarks.clone();
             let poll_watermarks =
                 bar_watermarks_for_streams(&poll_subscriptions, &initial_bar_watermarks);
-            let task = get_runtime().spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                tracing::info!(
-                    stream_subscriptions = stream_subscriptions.len(),
-                    poll_subscriptions = poll_subscriptions.len(),
-                    groups = groups.len(),
-                    max_candle_instruments_per_stream = batch_size,
-                    "starting batched T-Bank candle subscription snapshot"
-                );
-                let stream_future = async {
-                    let futures = groups
-                        .into_iter()
-                        .map(|(task_key, request, kind)| {
-                            run_market_data_stream(MarketDataStreamContext {
-                                market_data_stream: market_data_stream.clone(),
-                                market_data_client: stream_market_data_client.clone(),
-                                sender: stream_sender.clone(),
-                                request,
-                                kind,
-                                config: stream_config.clone(),
-                                historical_request_limiter: stream_historical_request_limiter
-                                    .clone(),
-                                instrument_metadata: stream_instrument_metadata.clone(),
-                                task_key,
-                                bar_watermarks: stream_bar_watermarks.clone(),
-                                bar_continuity_key_overrides: HashMap::new(),
-                                reconnect_attempt: Arc::new(AtomicU32::new(0)),
-                                message_sequence: stream_message_sequence.clone(),
-                                stream_health: stream_health.clone(),
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    join_all(futures).await;
+            tracing::info!(
+                stream_subscriptions = stream_subscriptions.len(),
+                poll_subscriptions = poll_subscriptions.len(),
+                groups = groups.len(),
+                max_candle_instruments_per_stream = batch_size,
+                "starting batched T-Bank candle subscription snapshot"
+            );
+            for (task_key, request, kind) in groups {
+                let future = run_market_data_stream(MarketDataStreamContext {
+                    market_data_stream: market_data_stream.clone(),
+                    market_data_client: stream_market_data_client.clone(),
+                    sender: stream_sender.clone(),
+                    request,
+                    kind,
+                    config: stream_config.clone(),
+                    historical_request_limiter: stream_historical_request_limiter.clone(),
+                    instrument_metadata: stream_instrument_metadata.clone(),
+                    task_key,
+                    bar_watermarks: stream_bar_watermarks.clone(),
+                    bar_continuity_key_overrides: HashMap::new(),
+                    reconnect_attempt: Arc::new(AtomicU32::new(0)),
+                    message_sequence: stream_message_sequence.clone(),
+                    stream_health: stream_health.clone(),
+                    task_spawner: spawner.clone(),
+                    session_cancellation: session_cancellation.clone(),
+                });
+                let future = async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    future.await;
                 };
-                if poll_subscriptions.is_empty() {
-                    stream_future.await;
-                } else {
-                    let poll_stream_health = stream_health.clone();
-                    let poll_bar_watermarks = stream_bar_watermarks.clone();
-                    tokio::join!(
-                        stream_future,
-                        run_periodic_candle_poll(
-                            market_data_client,
-                            sender,
-                            timestamp_mode,
-                            config,
-                            historical_request_limiter,
-                            instrument_metadata,
-                            poll_subscriptions,
-                            poll_watermarks,
-                            poll_bar_watermarks,
-                            HashMap::new(),
-                            generation,
-                            poll_stream_health,
-                        )
-                    );
-                }
-            });
-            self.bar_stream_task = Some(task);
+                spawn_snapshot_task(
+                    &spawner,
+                    session_cancellation.clone(),
+                    "market-data-bar-stream-supervisor",
+                    future,
+                )?;
+            }
+            if !poll_subscriptions.is_empty() {
+                let poll_stream_health = stream_health;
+                let poll_bar_watermarks = stream_bar_watermarks;
+                let future = async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    run_periodic_candle_poll(
+                        market_data_client,
+                        sender,
+                        timestamp_mode,
+                        config,
+                        historical_request_limiter,
+                        instrument_metadata,
+                        poll_subscriptions,
+                        poll_watermarks,
+                        poll_bar_watermarks,
+                        HashMap::new(),
+                        generation,
+                        poll_stream_health,
+                    )
+                    .await;
+                };
+                spawn_snapshot_task(
+                    &spawner,
+                    session_cancellation,
+                    "market-data-periodic-candle-poll",
+                    future,
+                )?;
+            }
         }
         Ok(())
     }
 
     fn schedule_quote_stream(&mut self) -> anyhow::Result<()> {
+        let session_cancellation = self.session_cancellation.clone();
+        if self.quote_snapshot_active {
+            retire_snapshot_group(
+                &mut self.quote_snapshot_tasks,
+                &mut self.quote_snapshot_active,
+                &mut self.retired_snapshot_tasks,
+            );
+        }
         self.stream_health.retire_prefix(
             "quotes:",
             None,
             "quote stream subscription snapshot was replaced",
         );
-        if let Some(existing) = self.quote_stream_task.take() {
-            existing.abort();
-        }
         let generation = self.next_stream_generation("quotes:snapshot");
         if self.quote_subscriptions.is_empty() {
             return Ok(());
@@ -1641,47 +2082,56 @@ impl TbankDataClient {
         let message_sequence = self.message_sequence.clone();
         let stream_health = self.stream_health.clone();
         let bar_watermarks = self.bar_watermarks.clone();
-        self.quote_stream_task = Some(get_runtime().spawn(async move {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let futures = groups.into_iter().enumerate().map(
-                |(group_index, (stream_ids, instrument_ids))| {
-                    let request = MarketDataServerSideStreamRequest {
-                        subscribe_order_book_request: Some(SubscribeOrderBookRequest {
-                            subscription_action: SubscriptionAction::Subscribe as i32,
-                            instruments: stream_ids
-                                .into_iter()
-                                .map(|instrument_id| OrderBookInstrument {
-                                    instrument_id,
-                                    depth: 1,
-                                    order_book_type: OrderBookType::OrderbookTypeExchange as i32,
-                                    ..OrderBookInstrument::default()
-                                })
-                                .collect(),
-                        }),
-                        ..MarketDataServerSideStreamRequest::default()
-                    };
-                    run_market_data_stream(MarketDataStreamContext {
-                        market_data_stream: market_data_stream.clone(),
-                        market_data_client: market_data_client.clone(),
-                        sender: sender.clone(),
-                        request,
-                        kind: TbankStreamKind::Quotes { instrument_ids },
-                        config: config.clone(),
-                        historical_request_limiter: historical_request_limiter.clone(),
-                        instrument_metadata: instrument_metadata.clone(),
-                        task_key: format!(
-                            "quotes:generation:{generation}:group:{group_index}:depth1"
-                        ),
-                        bar_watermarks: bar_watermarks.clone(),
-                        bar_continuity_key_overrides: HashMap::new(),
-                        reconnect_attempt: Arc::new(AtomicU32::new(0)),
-                        message_sequence: message_sequence.clone(),
-                        stream_health: stream_health.clone(),
-                    })
-                },
-            );
-            join_all(futures).await;
-        }));
+        let spawner = self
+            .quote_snapshot_tasks
+            .spawner()
+            .map_err(anyhow::Error::from)?;
+        self.quote_snapshot_active = true;
+        for (group_index, (stream_ids, instrument_ids)) in groups.into_iter().enumerate() {
+            let request = MarketDataServerSideStreamRequest {
+                subscribe_order_book_request: Some(SubscribeOrderBookRequest {
+                    subscription_action: SubscriptionAction::Subscribe as i32,
+                    instruments: stream_ids
+                        .into_iter()
+                        .map(|instrument_id| OrderBookInstrument {
+                            instrument_id,
+                            depth: 1,
+                            order_book_type: OrderBookType::OrderbookTypeExchange as i32,
+                            ..OrderBookInstrument::default()
+                        })
+                        .collect(),
+                }),
+                ..MarketDataServerSideStreamRequest::default()
+            };
+            let future = run_market_data_stream(MarketDataStreamContext {
+                market_data_stream: market_data_stream.clone(),
+                market_data_client: market_data_client.clone(),
+                sender: sender.clone(),
+                request,
+                kind: TbankStreamKind::Quotes { instrument_ids },
+                config: config.clone(),
+                historical_request_limiter: historical_request_limiter.clone(),
+                instrument_metadata: instrument_metadata.clone(),
+                task_key: format!("quotes:generation:{generation}:group:{group_index}:depth1"),
+                bar_watermarks: bar_watermarks.clone(),
+                bar_continuity_key_overrides: HashMap::new(),
+                reconnect_attempt: Arc::new(AtomicU32::new(0)),
+                message_sequence: message_sequence.clone(),
+                stream_health: stream_health.clone(),
+                task_spawner: spawner.clone(),
+                session_cancellation: session_cancellation.clone(),
+            });
+            let future = async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                future.await;
+            };
+            spawn_snapshot_task(
+                &spawner,
+                session_cancellation.clone(),
+                "market-data-quote-stream-supervisor",
+                future,
+            )?;
+        }
         Ok(())
     }
 
@@ -1743,27 +2193,33 @@ impl TbankDataClient {
         request: MarketDataServerSideStreamRequest,
         kind: TbankStreamKind,
     ) -> anyhow::Result<()> {
+        let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
+        let (market_data_stream, market_data_client) = self
+            .clients
+            .as_ref()
+            .map(|clients| {
+                (
+                    clients.market_data_stream.clone(),
+                    clients.market_data.clone(),
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?;
         if let Some(previous_task_key) = self.active_stream_task_keys.remove(&logical_task_key) {
             self.stream_health.retire_task_key(
                 &previous_task_key,
                 "logical market-data stream generation was replaced",
             );
-            if let Some(existing) = self.stream_tasks.remove(&previous_task_key) {
-                existing.abort();
+            if let Some(mut existing) = self.stream_tasks.remove(&previous_task_key) {
+                existing.cancellation.cancel();
+                drain_singular_task(
+                    &spawner,
+                    std::mem::take(&mut existing.task),
+                    "market-data-stream-task-drain",
+                    Arc::clone(&self.incomplete_stream_tasks),
+                    Arc::clone(&self.stream_task_failures),
+                )?;
             }
         }
-        let market_data_stream = self
-            .clients
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
-            .market_data_stream
-            .clone();
-        let market_data_client = self
-            .clients
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
-            .market_data
-            .clone();
         let generation = self.next_stream_generation(&logical_task_key);
         let task_key = Self::generation_task_key(&logical_task_key, generation);
         // Ownership is established before the task is spawned. A stale supervisor can therefore
@@ -1775,7 +2231,8 @@ impl TbankDataClient {
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
         let message_sequence = self.message_sequence.clone();
-        let task = get_runtime().spawn(run_market_data_stream(MarketDataStreamContext {
+        let cancellation = TaskCancellation::new();
+        let future = run_market_data_stream(MarketDataStreamContext {
             market_data_stream,
             market_data_client,
             sender,
@@ -1790,22 +2247,47 @@ impl TbankDataClient {
             reconnect_attempt: Arc::new(AtomicU32::new(0)),
             message_sequence,
             stream_health: self.stream_health.clone(),
-        }));
-        self.stream_tasks.insert(task_key.clone(), task);
+            task_spawner: spawner.clone(),
+            session_cancellation: self.session_cancellation.clone(),
+        });
+        let task = match spawn_singular_task(
+            &spawner,
+            "market-data-stream-supervisor",
+            cancellation.clone(),
+            future,
+        ) {
+            Ok(task) => task,
+            Err(error) => {
+                self.stream_health
+                    .retire_task_key(&task_key, "market-data stream admission was rejected");
+                return Err(error);
+            }
+        };
+        self.stream_tasks
+            .insert(task_key.clone(), SingularStreamTask { cancellation, task });
         self.active_stream_task_keys
             .insert(logical_task_key, task_key);
         Ok(())
     }
 
-    fn abort_stream(&mut self, logical_task_key: &str) {
+    fn abort_stream(&mut self, logical_task_key: &str) -> anyhow::Result<()> {
         let Some(task_key) = self.active_stream_task_keys.remove(logical_task_key) else {
-            return;
+            return Ok(());
         };
         self.stream_health
             .retire_task_key(&task_key, "market-data stream subscription was removed");
-        if let Some(task) = self.stream_tasks.remove(&task_key) {
-            task.abort();
+        if let Some(mut owner) = self.stream_tasks.remove(&task_key) {
+            owner.cancellation.cancel();
+            let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
+            drain_singular_task(
+                &spawner,
+                std::mem::take(&mut owner.task),
+                "market-data-stream-task-drain",
+                Arc::clone(&self.incomplete_stream_tasks),
+                Arc::clone(&self.stream_task_failures),
+            )?;
         }
+        Ok(())
     }
 }
 
@@ -1859,62 +2341,26 @@ fn market_data_stream_idle_timeout_reason(timeout: Duration) -> String {
     )
 }
 
-struct AbortableTask {
-    task: JoinHandle<()>,
-    health_cleanup: Option<(Arc<MarketDataStreamHealth>, String)>,
-}
-
-impl AbortableTask {
-    fn retire_health_key(&mut self, reason: &str) {
-        if let Some((health, task_key)) = self.health_cleanup.take() {
-            health.retire_task_key(&task_key, reason);
-        }
-    }
-}
-
 #[derive(Default)]
-struct AbortTasksOnDrop(Vec<AbortableTask>);
+struct CancelTasksOnDrop(Vec<(TaskCancellation, Arc<MarketDataStreamHealth>, String)>);
 
-impl Drop for AbortTasksOnDrop {
-    fn drop(&mut self) {
-        for mut task in self.0.drain(..) {
-            task.retire_health_key("isolated stream task owner exited");
-            task.task.abort();
-        }
-    }
-}
-
-impl AbortTasksOnDrop {
-    #[cfg(test)]
-    fn push(&mut self, task: JoinHandle<()>) {
-        self.0.push(AbortableTask {
-            task,
-            health_cleanup: None,
-        });
-    }
-
+impl CancelTasksOnDrop {
     fn push_with_health_cleanup(
         &mut self,
-        task: JoinHandle<()>,
+        task: TaskCancellation,
         health: Arc<MarketDataStreamHealth>,
         task_key: String,
     ) {
-        self.0.push(AbortableTask {
-            task,
-            health_cleanup: Some((health, task_key)),
-        });
+        self.0.push((task, health, task_key));
     }
+}
 
-    async fn wait_for_completion(&mut self) {
-        // Keep handles owned by the guard while awaiting so aborting the parent subscription
-        // still aborts every isolated child instead of detaching the currently awaited task.
-        for task in &mut self.0 {
-            let _ = (&mut task.task).await;
+impl Drop for CancelTasksOnDrop {
+    fn drop(&mut self) {
+        for (task, health, task_key) in &self.0 {
+            task.cancel();
+            health.retire_task_key(task_key, "isolated stream task owner exited");
         }
-        for task in &mut self.0 {
-            task.retire_health_key("isolated stream task completed");
-        }
-        self.0.clear();
     }
 }
 
@@ -2117,6 +2563,8 @@ struct MarketDataStreamContext {
     reconnect_attempt: Arc<AtomicU32>,
     message_sequence: Arc<AtomicU64>,
     stream_health: Arc<MarketDataStreamHealth>,
+    task_spawner: TaskSpawner,
+    session_cancellation: TaskCancellation,
 }
 
 fn run_market_data_stream(
@@ -2139,15 +2587,12 @@ fn run_market_data_stream(
         );
         let mut restart_after_worker_exit = false;
         loop {
-            let mut workers = JoinSet::new();
-            workers.spawn(run_market_data_stream_worker(
+            match std::panic::AssertUnwindSafe(run_market_data_stream_worker(
                 context.clone(),
                 restart_after_worker_exit,
-            ));
-            match workers
-                .join_next()
-                .await
-                .expect("stream worker is registered")
+            ))
+            .catch_unwind()
+            .await
             {
                 Ok(Ok(())) => {
                     context.stream_health.mark_reconnecting(&context.task_key);
@@ -2197,9 +2642,12 @@ fn run_market_data_stream(
                     );
                     return;
                 }
-                Err(error) if error.is_panic() => {
+                Err(error) => {
                     context.stream_health.mark_reconnecting(&context.task_key);
-                    let reason = error.to_string();
+                    let reason = format!(
+                        "stream worker panicked: {}",
+                        panic_payload_message(error.as_ref())
+                    );
                     tracing::error!(
                         task_key = context.task_key.as_str(),
                         %reason,
@@ -2219,15 +2667,6 @@ fn run_market_data_stream(
                         },
                     );
                     restart_after_worker_exit = true;
-                }
-                Err(error) => {
-                    context.stream_health.mark_terminal(&context.task_key);
-                    tracing::error!(
-                        task_key = context.task_key.as_str(),
-                        error = %error,
-                        "T-Bank market data stream worker failed"
-                    );
-                    return;
                 }
             }
         }
@@ -2265,6 +2704,8 @@ fn run_market_data_stream_worker(
             message_sequence: message_sequence_counter,
             stream_health,
             bar_watermarks,
+            task_spawner,
+            session_cancellation,
         } = context;
         let timestamp_mode = config.candle_timestamp_mode;
         let mut instrument_count = kind.instrument_count();
@@ -2307,7 +2748,7 @@ fn run_market_data_stream_worker(
             }
         }
         let mut attempt = reconnect_attempt.load(Ordering::Relaxed);
-        let mut isolated_subscription_tasks = AbortTasksOnDrop::default();
+        let mut isolated_subscription_tasks = CancelTasksOnDrop::default();
         let initial_bar_watermarks = snapshot_bar_watermarks(&bar_watermarks);
         let mut continuity = continuity_from_bar_watermarks(&kind, &initial_bar_watermarks);
         // Never let historical recovery prevent the real-time stream from opening. The broker
@@ -2471,64 +2912,81 @@ fn run_market_data_stream_worker(
                                                 bar_type,
                                             );
                                             let isolated_stream_kind = isolated_kind.name();
-                                            let Some(isolated_task) = stream_health
-                                                .spawn_child_if_current(
-                                                    &task_key,
-                                                    &isolated_task_key,
-                                                    || {
-                                                        trace_market_data_stream_event(
-                                                            &stream_health,
-                                                            MarketDataStreamEventInput {
-                                                                stage: "subscription_retry_isolated",
-                                                                task_key: &isolated_task_key,
-                                                                stream_kind: isolated_stream_kind,
-                                                                instrument_count: 1,
-                                                                status: None,
-                                                                reason: failure.reason,
-                                                                delay_ms: None,
-                                                                attempt,
-                                                            },
-                                                            Vec::new(),
-                                                        );
-                                                        get_runtime().spawn(run_market_data_stream(
-                                                            MarketDataStreamContext {
-                                                                market_data_stream:
-                                                                    market_data_stream.clone(),
-                                                                market_data_client:
-                                                                    market_data_client.clone(),
-                                                                sender: sender.clone(),
-                                                                request: isolated_request,
-                                                                kind: isolated_kind,
-                                                                config: config.clone(),
-                                                                historical_request_limiter:
-                                                                    historical_request_limiter.clone(),
-                                                                instrument_metadata:
-                                                                    instrument_metadata.clone(),
-                                                                task_key: isolated_task_key.clone(),
-                                                                bar_watermarks: bar_watermarks.clone(),
-                                                                bar_continuity_key_overrides:
-                                                                    isolated_continuity_keys,
-                                                                reconnect_attempt:
-                                                                    Arc::new(AtomicU32::new(0)),
-                                                                message_sequence:
-                                                                    message_sequence_counter.clone(),
-                                                                stream_health: stream_health.clone(),
-                                                            },
-                                                        ))
-                                                    },
-                                                )
-                                            else {
+                                            let isolated_cancellation = TaskCancellation::new();
+                                            let task_cancellation = isolated_cancellation.clone();
+                                            let spawned = stream_health.spawn_child_if_current(
+                                                &task_key,
+                                                &isolated_task_key,
+                                                &task_spawner,
+                                                |spawner| {
+                                                    trace_market_data_stream_event(
+                                                        &stream_health,
+                                                        MarketDataStreamEventInput {
+                                                            stage: "subscription_retry_isolated",
+                                                            task_key: &isolated_task_key,
+                                                            stream_kind: isolated_stream_kind,
+                                                            instrument_count: 1,
+                                                            status: None,
+                                                            reason: failure.reason,
+                                                            delay_ms: None,
+                                                            attempt,
+                                                        },
+                                                        Vec::new(),
+                                                    );
+                                                    let future = run_market_data_stream(
+                                                        MarketDataStreamContext {
+                                                            market_data_stream: market_data_stream
+                                                                .clone(),
+                                                            market_data_client: market_data_client
+                                                                .clone(),
+                                                            sender: sender.clone(),
+                                                            request: isolated_request,
+                                                            kind: isolated_kind,
+                                                            config: config.clone(),
+                                                            historical_request_limiter:
+                                                                historical_request_limiter.clone(),
+                                                            instrument_metadata:
+                                                                instrument_metadata.clone(),
+                                                            task_key: isolated_task_key.clone(),
+                                                            bar_watermarks: bar_watermarks.clone(),
+                                                            bar_continuity_key_overrides:
+                                                                isolated_continuity_keys,
+                                                            reconnect_attempt: Arc::new(
+                                                                AtomicU32::new(0),
+                                                            ),
+                                                            message_sequence:
+                                                                message_sequence_counter.clone(),
+                                                            stream_health: stream_health.clone(),
+                                                            task_spawner: spawner.clone(),
+                                                            session_cancellation: session_cancellation
+                                                                .clone(),
+                                                        },
+                                                    );
+                                                    spawn_task_in_scoped_generation(
+                                                        spawner,
+                                                        session_cancellation.clone(),
+                                                        "market-data-isolated-bar-retry",
+                                                        task_cancellation,
+                                                        future,
+                                                    )
+                                                },
+                                            )
+                                            .map_err(|error| {
+                                                StreamWorkerExit::Permanent(format!(
+                                                    "failed to admit isolated retry worker: {error}"
+                                                ))
+                                            })?;
+                                            if !spawned {
                                                 continue;
-                                            };
+                                            }
                                             isolated_subscription_tasks.push_with_health_cleanup(
-                                                isolated_task,
+                                                isolated_cancellation,
                                                 stream_health.clone(),
                                                 isolated_task_key,
                                             );
                                         }
                                         if instrument_count == 0 {
                                             stream_health.mark_terminal(&task_key);
-                                            isolated_subscription_tasks.wait_for_completion().await;
                                             return Err(StreamWorkerExit::Permanent(
                                                 "all instruments in the stream group were rejected"
                                                     .to_string(),
@@ -2622,7 +3080,6 @@ fn run_market_data_stream_worker(
                                                 attempt,
                                             },
                                         );
-                                        isolated_subscription_tasks.wait_for_completion().await;
                                         stream_health.mark_terminal(&task_key);
                                         return Err(StreamWorkerExit::Permanent(reason));
                                     }
@@ -2896,7 +3353,7 @@ fn run_market_data_stream_worker(
                 // Retryable instruments removed from `request` and `kind` are owned by the
                 // isolated supervisors. Reconnect-budget exhaustion is recoverable for the
                 // parent, so keep those supervisors alive while this owner re-arms its probe.
-                // `AbortTasksOnDrop` still cancels them when the owner is actually torn down.
+                // The owner cancellation scope keeps isolated retries alive until teardown.
                 let catch_up = reconnect_catch_up_bars(
                     RecoveryCause::Reconnect,
                     &task_key,
@@ -4652,21 +5109,198 @@ mod tests {
         assert!(!health.is_operational());
     }
 
+    #[tokio::test]
+    async fn setup_guard_closes_admission_and_old_spawner_stays_closed_after_reopen() {
+        let tasks = TaskGroup::new();
+        let old_spawner = tasks.spawner().unwrap();
+        let rolled_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let rollback_state = Arc::clone(&rolled_back);
+            let _guard = TaskGroupGuard::new(&[&tasks], move || {
+                rollback_state.store(true, Ordering::Release);
+            });
+            spawn_task_in_generation(
+                &old_spawner,
+                "test-setup-task",
+                TaskCancellation::new(),
+                std::future::pending(),
+            )
+            .unwrap();
+        }
+
+        assert!(rolled_back.load(Ordering::Acquire));
+        assert!(old_spawner.spawn(async {}).is_err());
+        tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+        tasks.start_generation().unwrap();
+        assert!(old_spawner.spawn(async {}).is_err());
+        tasks.spawner().unwrap().spawn(async {}).unwrap();
+        tasks.begin_shutdown();
+        tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_group_observes_graceful_replacement_and_drains_children() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let session_cancellation = TaskCancellation::new();
+        let mut snapshot_tasks = TaskGroup::new();
+        let snapshot_spawner = snapshot_tasks.spawner().unwrap();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        spawn_snapshot_task(
+            &snapshot_spawner,
+            session_cancellation,
+            "test-bar-snapshot-worker",
+            async move {
+                let _notify = NotifyOnDrop(Some(dropped_sender));
+                let _ = started_sender.send(());
+                std::future::pending::<()>().await;
+            },
+        )
+        .unwrap();
+        started_receiver.await.unwrap();
+
+        let mut retired = Vec::new();
+        let mut active = true;
+        retire_snapshot_group(&mut snapshot_tasks, &mut active, &mut retired);
+        assert!(!active);
+        retired[0]
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), dropped_receiver)
+            .await
+            .expect("snapshot worker ignored graceful TaskGroup cancellation")
+            .expect("snapshot worker drop notification was lost");
+
+        snapshot_tasks.begin_shutdown();
+        snapshot_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retired_snapshot_drain_reports_task_failure() {
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let spawner = client.bar_snapshot_tasks.spawner().unwrap();
+        spawner
+            .spawn_named("test-retired-snapshot-failure", async {
+                panic!("snapshot worker failed");
+            })
+            .unwrap();
+        client.bar_snapshot_active = true;
+        retire_snapshot_group(
+            &mut client.bar_snapshot_tasks,
+            &mut client.bar_snapshot_active,
+            &mut client.retired_snapshot_tasks,
+        );
+        client.begin_background_shutdown("test snapshot failure", false);
+
+        let error = client
+            .finish_session_tasks()
+            .await
+            .expect_err("retired snapshot task failure must be observed");
+
+        assert!(error.to_string().contains("retired T-Bank snapshot"));
+        assert!(client.retired_snapshot_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn singular_stream_taskslot_observes_session_cancel_and_is_joined() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let session_tasks = TaskGroup::new();
+        let spawner = session_tasks.spawner().unwrap();
+        let cancellation = TaskCancellation::new();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let task = spawn_singular_task(
+            &spawner,
+            "test-singular-stream",
+            cancellation.clone(),
+            async move {
+                let _notify = NotifyOnDrop(Some(dropped_sender));
+                let _ = started_sender.send(());
+                std::future::pending::<()>().await;
+            },
+        )
+        .unwrap();
+        started_receiver.await.unwrap();
+
+        drain_singular_task(
+            &spawner,
+            task,
+            "test-singular-stream-drain",
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .unwrap();
+        session_tasks.begin_shutdown();
+        tokio::time::timeout(Duration::from_millis(500), dropped_receiver)
+            .await
+            .expect("TaskSlot worker ignored its generation-bound graceful token")
+            .expect("TaskSlot worker drop notification was lost");
+
+        session_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
     #[test]
-    fn retry_child_registration_and_spawn_share_parent_lifecycle_lock() {
+    fn stale_catalogue_refresh_cannot_commit_or_publish_after_generation_advance() {
+        let lifecycle = SessionPublicationFence::default();
+        let old_generation = lifecycle.advance();
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let old_commit = Arc::clone(&committed);
+
+        lifecycle.advance();
+        assert!(!lifecycle.if_current(old_generation, || {
+            old_commit.store(true, Ordering::Release);
+        }));
+        assert!(!committed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn retry_child_registration_and_spawn_share_parent_lifecycle_lock() {
         let health = Arc::new(MarketDataStreamHealth::default());
         let parent_key = "bars:generation:1:group:0:1m";
         let child_key = "bars:generation:1:group:0:1m:retry:uid";
+        let tasks = TaskGroup::new();
+        let spawner = tasks.spawner().unwrap();
         health.register(parent_key);
 
         let (spawn_started_tx, spawn_started_rx) = std::sync::mpsc::sync_channel(0);
         let (spawn_release_tx, spawn_release_rx) = std::sync::mpsc::sync_channel(0);
         let spawning_health = health.clone();
         let spawn_thread = std::thread::spawn(move || {
-            spawning_health.spawn_child_if_current(parent_key, child_key, || {
+            spawning_health.spawn_child_if_current(parent_key, child_key, &spawner, |spawner| {
                 spawn_started_tx.send(()).unwrap();
                 spawn_release_rx.recv().unwrap();
-                get_runtime().spawn(async {})
+                spawner.spawn(async {}).map_err(anyhow::Error::from)
             })
         });
         spawn_started_rx.recv().unwrap();
@@ -4687,12 +5321,13 @@ mod tests {
         );
 
         spawn_release_tx.send(()).unwrap();
-        let child = spawn_thread
-            .join()
-            .unwrap()
-            .expect("child should be spawned");
+        assert!(spawn_thread.join().unwrap().unwrap());
         replacement_thread.join().unwrap();
-        child.abort();
+        tasks.begin_shutdown();
+        tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
 
         assert!(!health.is_current_task_key(parent_key));
         assert!(!health.is_current_task_key(child_key));
@@ -5426,14 +6061,17 @@ mod tests {
 
     #[tokio::test]
     async fn managed_stream_task_reports_panic_to_supervisor() {
-        let mut tasks = JoinSet::new();
-        tasks.spawn(async {
+        let result = std::panic::AssertUnwindSafe(async {
             panic!("synthetic stream panic");
-        });
-        let error = tasks.join_next().await.unwrap().unwrap_err();
+        })
+        .catch_unwind()
+        .await;
 
-        assert!(error.is_panic());
-        assert!(error.to_string().contains("synthetic stream panic"));
+        let payload = result.unwrap_err();
+        assert_eq!(
+            panic_payload_message(payload.as_ref()),
+            "synthetic stream panic"
+        );
     }
 
     #[test]
@@ -5547,21 +6185,25 @@ mod tests {
             instrument_refresh_interval: Duration::ZERO,
             ..TbankDataClientConfig::default()
         });
-        disabled.schedule_instrument_refresh();
+        let spawner = disabled.session_tasks.spawner().unwrap();
+        disabled.schedule_instrument_refresh(&spawner, 1).unwrap();
         assert!(disabled.instrument_refresh_task.is_none());
 
         let mut enabled = TbankDataClient::new(TbankDataClientConfig {
             instrument_refresh_interval: Duration::from_secs(60 * 60),
             ..TbankDataClientConfig::default()
         });
-        enabled.schedule_instrument_refresh();
-        assert!(enabled.instrument_refresh_task.is_some());
+        let spawner = enabled.session_tasks.spawner().unwrap();
+        enabled.schedule_instrument_refresh(&spawner, 1).unwrap();
+        let cancellation = enabled.instrument_refresh_task.clone().unwrap();
         enabled.disconnect();
+        assert!(cancellation.is_cancelled());
         assert!(enabled.instrument_refresh_task.is_none());
+        enabled.disconnect_async().await.unwrap();
     }
 
     #[tokio::test]
-    async fn async_disconnect_aborts_and_joins_owned_request_tasks() {
+    async fn async_disconnect_drains_session_tasks_and_old_spawners_cannot_cross_generations() {
         struct DropGuard(Arc<std::sync::atomic::AtomicBool>);
 
         impl Drop for DropGuard {
@@ -5576,23 +6218,34 @@ mod tests {
         let task_started = Arc::clone(&started);
         let started_notification = started.notified();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-        let task = get_runtime().spawn(async move {
-            let _guard = DropGuard(task_dropped);
-            task_started.notify_one();
-            std::future::pending::<()>().await;
-        });
+        let old_spawner = client.session_tasks.spawner().unwrap();
+        let old_cancellation = client.session_cancellation.clone();
         client
-            .request_tasks
-            .lock()
-            .expect("request_tasks lock")
-            .push(task);
+            .spawn_session_task(
+                &old_spawner,
+                "test-historical-request",
+                TaskCancellation::new(),
+                async move {
+                    let _guard = DropGuard(task_dropped);
+                    task_started.notify_one();
+                    std::future::pending::<()>().await;
+                },
+            )
+            .unwrap();
         started_notification.await;
 
-        client.disconnect_async().await;
+        client.disconnect_async().await.unwrap();
 
         assert!(dropped.load(Ordering::Acquire));
-        assert!(client.request_tasks.lock().unwrap().is_empty());
+        assert!(old_cancellation.is_cancelled());
         assert!(client.is_disconnected());
+
+        client.prepare_session_generation().await.unwrap();
+        assert!(old_spawner.spawn(async {}).is_err());
+        assert!(!client.session_cancellation.is_cancelled());
+        let new_spawner = client.session_tasks.spawner().unwrap();
+        new_spawner.spawn(async {}).unwrap();
+        client.disconnect_async().await.unwrap();
     }
 
     #[test]
@@ -5992,63 +6645,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn isolated_subscription_owner_waits_for_children_before_normal_exit() {
-        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let completed_by_task = completed.clone();
-        let mut tasks = AbortTasksOnDrop::default();
-        tasks.push(tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            completed_by_task.store(true, std::sync::atomic::Ordering::Release);
-        }));
-
-        tasks.wait_for_completion().await;
-
-        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn isolated_subscription_owner_wait_clears_health_key() {
-        let health = Arc::new(MarketDataStreamHealth::default());
-        let task_key = "bars:group:0:1m:retry:uid-completed".to_string();
-        health.register(&task_key);
-
-        let mut tasks = AbortTasksOnDrop::default();
-        tasks.push_with_health_cleanup(tokio::spawn(async {}), health.clone(), task_key);
-        tasks.wait_for_completion().await;
-
-        assert!(health.is_operational());
-    }
-
-    #[tokio::test]
-    async fn isolated_subscription_child_survives_parent_reconnect_budget_exhaustion() {
+    async fn task_group_drains_isolated_child_after_parent_retry_budget_exhaustion() {
         let health = Arc::new(MarketDataStreamHealth::default());
         let parent_key = "bars:group:0:1m";
         let child_key = "bars:group:0:1m:retry:uid-retry";
         health.register(parent_key);
         health.register(child_key);
 
+        let tasks = TaskGroup::new();
+        let spawner = tasks.spawner().unwrap();
         let child_reconnected = Arc::new(tokio::sync::Notify::new());
         let child_reconnected_task = child_reconnected.clone();
         let child_health = health.clone();
-        let child = tokio::spawn(async move {
-            child_reconnected_task.notified().await;
-            child_health.mark_operational(child_key);
-        });
-        let mut isolated_tasks = AbortTasksOnDrop::default();
-        isolated_tasks.push(child);
+        let (child_completed_sender, child_completed_receiver) = tokio::sync::oneshot::channel();
+        spawner
+            .spawn(async move {
+                child_reconnected_task.notified().await;
+                child_health.mark_operational(child_key);
+                let _ = child_completed_sender.send(());
+            })
+            .unwrap();
 
-        // Parent budget exhaustion re-arms only the parent probe. The child supervisor must
-        // remain alive long enough to acknowledge its own subscription and clear its health key.
         health.mark_reconnecting(parent_key);
         child_reconnected.notify_one();
         health.mark_operational(parent_key);
-        tokio::task::yield_now().await;
-
+        child_completed_receiver.await.unwrap();
         assert!(health.is_operational());
+
+        tasks.begin_shutdown();
+        tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn aborting_isolated_subscription_owner_aborts_awaited_child() {
+    async fn subscription_scope_cancels_child_while_task_group_retains_join_ownership() {
         struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
 
         impl Drop for NotifyOnDrop {
@@ -6059,41 +6691,42 @@ mod tests {
             }
         }
 
+        let health = Arc::new(MarketDataStreamHealth::default());
+        let task_key = "bars:generation:1:retry:uid".to_string();
+        health.register(&task_key);
+        let tasks = TaskGroup::new();
+        let spawner = tasks.spawner().unwrap();
+        let cancellation = TaskCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
         let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
-        let child = tokio::spawn(async move {
-            let _notify = NotifyOnDrop(Some(dropped_sender));
-            std::future::pending::<()>().await;
-        });
-        tokio::task::yield_now().await;
-        let owner = tokio::spawn(async move {
-            let mut tasks = AbortTasksOnDrop::default();
-            tasks.push(child);
-            tasks.wait_for_completion().await;
-        });
-        tokio::task::yield_now().await;
+        spawn_task_in_generation(
+            &spawner,
+            "market-data-isolated-bar-retry",
+            task_cancellation,
+            async move {
+                let _notify = NotifyOnDrop(Some(dropped_sender));
+                let _ = started_sender.send(());
+                std::future::pending::<()>().await;
+            },
+        )
+        .unwrap();
+        let mut owner = CancelTasksOnDrop::default();
+        owner.push_with_health_cleanup(cancellation, health.clone(), task_key.clone());
+        started_receiver.await.unwrap();
 
-        owner.abort();
-        let _ = owner.await;
-
+        drop(owner);
         tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
             .await
-            .expect("isolated child was not aborted with its owner")
-            .expect("isolated child drop notification was lost");
-    }
+            .expect("subscription cancellation did not stop its child")
+            .expect("child drop notification was lost");
+        assert!(!health.is_current_task_key(&task_key));
 
-    #[tokio::test]
-    async fn aborting_isolated_subscription_child_clears_health_key() {
-        let health = Arc::new(MarketDataStreamHealth::default());
-        let task_key = "bars:group:0:1m:retry:uid-retry".to_string();
-        health.register(&task_key);
-
-        let child = tokio::spawn(std::future::pending::<()>());
-        let mut tasks = AbortTasksOnDrop::default();
-        tasks.push_with_health_cleanup(child, health.clone(), task_key);
-
-        drop(tasks);
-
-        assert!(health.is_operational());
+        tasks.begin_shutdown();
+        tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[test]

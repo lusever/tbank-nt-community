@@ -40,6 +40,7 @@ pub(super) enum TbankCancelTarget {
     Pending {
         route: TbankBrokerOrderRoute,
         client_order_id: String,
+        owner: bool,
     },
 }
 
@@ -421,10 +422,16 @@ impl TbankBrokerOrderIndex {
         self.stop_broker_order_ids.contains(venue_order_id)
     }
 
-    pub(super) fn record_pending_cancel(&mut self, client_order_id: &str) {
+    pub(super) fn record_pending_cancel(&mut self, client_order_id: &str) -> bool {
         if !client_order_id.is_empty() {
             self.pending_cancel_client_order_ids
-                .insert(client_order_id.to_string());
+                .insert(client_order_id.to_string())
+        } else {
+            false
         }
+    }
+
+    pub(super) fn has_pending_cancels(&self) -> bool {
+        !self.pending_cancel_client_order_ids.is_empty()
     }
 }

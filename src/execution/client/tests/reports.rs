@@ -11,9 +11,7 @@ fn si_futures_metadata() -> crate::instruments::TbankInstrumentMetadata {
     metadata
 }
 
-fn futures_order_report_command(
-    open_only: bool,
-) -> GenerateOrderStatusReports {
+fn futures_order_report_command(open_only: bool) -> GenerateOrderStatusReports {
     GenerateOrderStatusReports::new(
         UUID4::new(),
         UnixNanos::from(300),
@@ -105,7 +103,9 @@ fn active_stop_and_child_reports_ignore_create_date_windows() {
         status: StopOrderStatusOption::StopOrderStatusActive as i32,
         ..StopOrder::default()
     };
-    assert!(super::nautilus::stop_order_matches_report_command(&old_active_stop, &cmd, None).unwrap());
+    assert!(
+        super::nautilus::stop_order_matches_report_command(&old_active_stop, &cmd, None).unwrap()
+    );
 
     let terminal_parent = StopOrder {
         status: StopOrderStatusOption::StopOrderStatusExecuted as i32,
@@ -124,12 +124,14 @@ fn active_stop_and_child_reports_ignore_create_date_windows() {
         lots_requested: 1,
         ..OrderState::default()
     };
-    assert!(super::nautilus::stop_order_matches_report_command(
-        &terminal_parent,
-        &cmd,
-        Some(&active_child)
-    )
-    .unwrap());
+    assert!(
+        super::nautilus::stop_order_matches_report_command(
+            &terminal_parent,
+            &cmd,
+            Some(&active_child)
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -160,12 +162,10 @@ fn terminal_stop_reports_use_child_time_and_inclusive_window_bounds() {
         lots_executed: 1,
         ..OrderState::default()
     };
-    assert!(super::nautilus::stop_order_matches_report_command(
-        &stop,
-        &cmd,
-        Some(&child_at_start)
-    )
-    .unwrap());
+    assert!(
+        super::nautilus::stop_order_matches_report_command(&stop, &cmd, Some(&child_at_start))
+            .unwrap()
+    );
     let child_after_end = OrderState {
         order_date: Some(prost_types::Timestamp {
             seconds: 0,
@@ -173,12 +173,10 @@ fn terminal_stop_reports_use_child_time_and_inclusive_window_bounds() {
         }),
         ..child_at_start
     };
-    assert!(!super::nautilus::stop_order_matches_report_command(
-        &stop,
-        &cmd,
-        Some(&child_after_end)
-    )
-    .unwrap());
+    assert!(
+        !super::nautilus::stop_order_matches_report_command(&stop, &cmd, Some(&child_after_end))
+            .unwrap()
+    );
 }
 
 #[test]
@@ -308,9 +306,7 @@ fn activated_stop_parent_is_kept_when_its_child_matches_the_report_window() {
     };
 
     assert!(super::nautilus::stop_order_links_to_state(&stop, &child));
-    assert!(
-        super::nautilus::stop_order_matches_report_command(&stop, &cmd, Some(&child)).unwrap()
-    );
+    assert!(super::nautilus::stop_order_matches_report_command(&stop, &cmd, Some(&child)).unwrap());
 }
 
 #[test]
@@ -1673,7 +1669,11 @@ fn operation_cursor_skips_zero_quantity_and_keeps_valid_trade_with_negative_row(
         .iter()
         .find_map(|report| report.as_ref().err())
         .expect("negative quantity must be reported as malformed");
-    assert!(invalid.downcast_ref::<super::TbankFillQuantityInvalid>().is_some());
+    assert!(
+        invalid
+            .downcast_ref::<super::TbankFillQuantityInvalid>()
+            .is_some()
+    );
 
     let mut zero_only = operation;
     zero_only.trades_info = Some(OperationItemTrades {
@@ -1688,14 +1688,16 @@ fn operation_cursor_skips_zero_quantity_and_keeps_valid_trade_with_negative_row(
             ..OperationItemTrade::default()
         }],
     });
-    assert!(super::fill_reports_from_cursor_operation_with_instruments(
-        "TBANK-001".into(),
-        &zero_only,
-        super::current_unix_nanos(),
-        Some(&instruments),
-        Some(&broker_order_index),
-    )
-    .is_empty());
+    assert!(
+        super::fill_reports_from_cursor_operation_with_instruments(
+            "TBANK-001".into(),
+            &zero_only,
+            super::current_unix_nanos(),
+            Some(&instruments),
+            Some(&broker_order_index),
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -1928,17 +1930,15 @@ fn order_status_fill_projection_dedupes_late_stream_fill() {
 
     let projected = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &report,
-                "exchange-order-1",
-                "SUBMIT-exchange-order-1-10",
-                ts_init,
-                Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
-                None,
-                TbankFillCommissionSource::SubmitResponse,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &report,
+            "exchange-order-1",
+            "SUBMIT-exchange-order-1-10",
+            ts_init,
+            Some("524b1a03-efdd-4cd0-bd56-7cc6570c7156"),
+            None,
+            TbankFillCommissionSource::SubmitResponse,
+        ))
         .unwrap()
         .unwrap();
     assert_eq!(projected.last_qty.as_decimal(), Decimal::from(10));
@@ -2000,17 +2000,15 @@ fn order_status_fill_projection_requires_execution_average_price() {
     assert!(
         client
             .runtime
-            .project_order_status_fill_report(
-                super::TbankOrderStatusFillProjection::new(
-                    &report,
-                    "venue-order-1",
-                    "synthetic-trade-stream",
-                    ts,
-                    Some("client-order-1"),
-                    None,
-                    TbankFillCommissionSource::OrderStateQuery,
-                ),
-            )
+            .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+                &report,
+                "venue-order-1",
+                "synthetic-trade-stream",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateQuery,
+            ),)
             .unwrap()
             .is_none()
     );
@@ -2048,17 +2046,15 @@ fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
     .with_avg_px(Decimal::from(100));
     let first_fill = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &first,
-                "venue-order-1",
-                "synthetic-trade-1",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateQuery,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &first,
+            "venue-order-1",
+            "synthetic-trade-1",
+            ts,
+            Some("client-order-1"),
+            None,
+            TbankFillCommissionSource::OrderStateQuery,
+        ))
         .unwrap()
         .unwrap();
     assert_eq!(first_fill.last_qty.as_decimal(), Decimal::from(5));
@@ -2083,17 +2079,15 @@ fn cumulative_order_status_fill_uses_incremental_cumulative_notional() {
     .with_avg_px(Decimal::from(105));
     let second_fill = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &second,
-                "venue-order-1",
-                "synthetic-trade-2",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateQuery,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &second,
+            "venue-order-1",
+            "synthetic-trade-2",
+            ts,
+            Some("client-order-1"),
+            None,
+            TbankFillCommissionSource::OrderStateQuery,
+        ))
         .unwrap()
         .unwrap();
 
@@ -2128,17 +2122,15 @@ fn repeated_cumulative_snapshot_corrects_unknown_commission_provenance() {
 
     let first = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &report,
-                "venue-order-1",
-                "synthetic-trade-stream",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateStream,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &report,
+            "venue-order-1",
+            "synthetic-trade-stream",
+            ts,
+            Some("client-order-1"),
+            None,
+            TbankFillCommissionSource::OrderStateStream,
+        ))
         .unwrap()
         .expect("the initial cumulative snapshot emits the fill");
     assert!(!first.provenance_only);
@@ -2154,17 +2146,15 @@ fn repeated_cumulative_snapshot_corrects_unknown_commission_provenance() {
 
     let correction = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &report,
-                "venue-order-1",
-                "synthetic-trade-submit",
-                ts,
-                Some("client-order-1"),
-                Some(Money::from("1.25 RUB")),
-                TbankFillCommissionSource::SubmitResponse,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &report,
+            "venue-order-1",
+            "synthetic-trade-submit",
+            ts,
+            Some("client-order-1"),
+            Some(Money::from("1.25 RUB")),
+            TbankFillCommissionSource::SubmitResponse,
+        ))
         .unwrap()
         .expect("a later cumulative commission must produce a provenance correction");
     assert!(correction.provenance_only);
@@ -2200,7 +2190,10 @@ fn repeated_cumulative_snapshot_corrects_unknown_commission_provenance() {
 #[test]
 fn fill_snapshot_does_not_overwrite_live_commission_with_unknown() {
     let client = test_client(TbankExecutionClientConfig::default());
-    client.runtime.lifecycle_active.store(true, Ordering::Release);
+    client
+        .runtime
+        .lifecycle_active
+        .store(true, Ordering::Release);
     let ts = super::current_unix_nanos();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     nautilus_common::live::runner::replace_data_event_sender(sender);
@@ -2224,17 +2217,15 @@ fn fill_snapshot_does_not_overwrite_live_commission_with_unknown() {
     .with_avg_px(Decimal::from(100));
     let live_fill = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &order,
-                "venue-order-1",
-                "trade-1",
-                ts,
-                Some("client-order-1"),
-                Some(Money::from("1 RUB")),
-                TbankFillCommissionSource::OrderStateQuery,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &order,
+            "venue-order-1",
+            "trade-1",
+            ts,
+            Some("client-order-1"),
+            Some(Money::from("1 RUB")),
+            TbankFillCommissionSource::OrderStateQuery,
+        ))
         .unwrap()
         .expect("live fill provenance is tracked");
     let _ = client.runtime.publish_order_status_fill_report(live_fill);
@@ -2287,7 +2278,10 @@ fn fill_snapshot_does_not_overwrite_live_commission_with_unknown() {
 #[test]
 fn fill_snapshot_upgrade_prevents_later_cumulative_commission_downgrade() {
     let client = test_client(TbankExecutionClientConfig::default());
-    client.runtime.lifecycle_active.store(true, Ordering::Release);
+    client
+        .runtime
+        .lifecycle_active
+        .store(true, Ordering::Release);
     let mut receiver = bind_test_data_event_sender(&client.runtime);
     let ts = super::current_unix_nanos();
     let order = OrderStatusReport::new(
@@ -2310,20 +2304,20 @@ fn fill_snapshot_upgrade_prevents_later_cumulative_commission_downgrade() {
 
     let live_unknown = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &order,
-                "venue-order-1",
-                "trade-1",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateStream,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &order,
+            "venue-order-1",
+            "trade-1",
+            ts,
+            Some("client-order-1"),
+            None,
+            TbankFillCommissionSource::OrderStateStream,
+        ))
         .unwrap()
         .expect("live unknown commission is tracked");
-    let _ = client.runtime.publish_order_status_fill_report(live_unknown);
+    let _ = client
+        .runtime
+        .publish_order_status_fill_report(live_unknown);
     assert!(matches!(
         receiver.try_recv().expect("live unknown provenance"),
         nautilus_common::messages::DataEvent::Data(
@@ -2379,10 +2373,10 @@ fn fill_snapshot_upgrade_prevents_later_cumulative_commission_downgrade() {
         )
     ));
 
-    assert!(client
-        .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
+    assert!(
+        client
+            .runtime
+            .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
                 &order,
                 "venue-order-1",
                 "query-trade-1",
@@ -2390,10 +2384,10 @@ fn fill_snapshot_upgrade_prevents_later_cumulative_commission_downgrade() {
                 Some("client-order-1"),
                 Some(Money::from("1 RUB")),
                 TbankFillCommissionSource::OrderStateQuery,
-            ),
-        )
-        .unwrap()
-        .is_none());
+            ),)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         receiver.try_recv().is_err(),
         "a cumulative query must not publish Allocated after the venue-reported snapshot upgrade"
@@ -2422,10 +2416,10 @@ fn inactive_lifecycle_does_not_publish_snapshot_fill_provenance() {
         Some(UUID4::new()),
     )
     .with_avg_px(Decimal::from(100));
-    assert!(client
-        .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
+    assert!(
+        client
+            .runtime
+            .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
                 &order,
                 "venue-order-1",
                 "trade-1",
@@ -2433,12 +2427,15 @@ fn inactive_lifecycle_does_not_publish_snapshot_fill_provenance() {
                 Some("client-order-1"),
                 None,
                 TbankFillCommissionSource::OrderStateStream,
-            ),
-        )
-        .unwrap()
-        .is_some());
+            ),)
+            .unwrap()
+            .is_some()
+    );
 
-    client.runtime.lifecycle_active.store(false, Ordering::Release);
+    client
+        .runtime
+        .lifecycle_active
+        .store(false, Ordering::Release);
     let snapshot_fill = TbankFillReport::new(
         FillReport::new(
             "TBANK-001".into(),
@@ -2493,17 +2490,15 @@ fn cumulative_commission_corrects_single_unknown_partial_fill_with_new_snapshot_
     .with_avg_px(Decimal::from(100));
     let known = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &partial,
-                "venue-order-1",
-                "known-partial-fill",
-                ts,
-                Some("client-order-1"),
-                Some(Money::from("0.25 RUB")),
-                TbankFillCommissionSource::OrderStateStream,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &partial,
+            "venue-order-1",
+            "known-partial-fill",
+            ts,
+            Some("client-order-1"),
+            Some(Money::from("0.25 RUB")),
+            TbankFillCommissionSource::OrderStateStream,
+        ))
         .unwrap()
         .expect("known partial fill emits once");
     let known = client
@@ -2531,17 +2526,15 @@ fn cumulative_commission_corrects_single_unknown_partial_fill_with_new_snapshot_
     .with_avg_px(Decimal::new(1_025, 1));
     let unknown = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &filled,
-                "venue-order-1",
-                "unknown-partial-fill",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateStream,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &filled,
+            "venue-order-1",
+            "unknown-partial-fill",
+            ts,
+            Some("client-order-1"),
+            None,
+            TbankFillCommissionSource::OrderStateStream,
+        ))
         .unwrap()
         .expect("unknown partial fill emits once");
     let unknown = client
@@ -2553,17 +2546,15 @@ fn cumulative_commission_corrects_single_unknown_partial_fill_with_new_snapshot_
 
     let correction = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &filled,
-                "venue-order-1",
-                "new-cumulative-query-id",
-                ts,
-                Some("client-order-1"),
-                Some(Money::from("1.25 RUB")),
-                TbankFillCommissionSource::OrderStateQuery,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &filled,
+            "venue-order-1",
+            "new-cumulative-query-id",
+            ts,
+            Some("client-order-1"),
+            Some(Money::from("1.25 RUB")),
+            TbankFillCommissionSource::OrderStateQuery,
+        ))
         .unwrap()
         .expect("the sole unknown partial fill is corrected from the cumulative commission");
     assert!(correction.provenance_only);
@@ -2661,17 +2652,15 @@ fn submit_commission_correction_cannot_overtake_stream_provenance_publication() 
             .lifecycle_active
             .run_if_active(|| {
                 let fill = stream_runtime
-                    .project_order_status_fill_report(
-                        super::TbankOrderStatusFillProjection::new(
-                            &stream_report,
-                            "venue-order-1",
-                            "stream-fill",
-                            ts,
-                            Some("client-order-1"),
-                            None,
-                            TbankFillCommissionSource::OrderStateStream,
-                        ),
-                    )
+                    .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+                        &stream_report,
+                        "venue-order-1",
+                        "stream-fill",
+                        ts,
+                        Some("client-order-1"),
+                        None,
+                        TbankFillCommissionSource::OrderStateStream,
+                    ))
                     .unwrap()
                     .expect("stream fill is projected");
                 projected_tx.send(()).unwrap();
@@ -2720,7 +2709,10 @@ fn submit_commission_correction_cannot_overtake_stream_provenance_publication() 
         !completed_before_stream_publish,
         "submit must wait until the earlier stream transition and event are published"
     );
-    assert!(submit_fill.is_none(), "a provenance correction is not a second fill");
+    assert!(
+        submit_fill.is_none(),
+        "a provenance correction is not a second fill"
+    );
 
     let stream_event = receiver.try_recv().expect("stream provenance event");
     assert!(matches!(
@@ -2738,7 +2730,9 @@ fn submit_commission_correction_cannot_overtake_stream_provenance_publication() 
             }) if trade_id == "stream-fill"
         )
     ));
-    let submit_event = receiver.try_recv().expect("submit commission correction event");
+    let submit_event = receiver
+        .try_recv()
+        .expect("submit commission correction event");
     assert!(matches!(
         submit_event,
         nautilus_common::messages::DataEvent::Data(
@@ -2783,17 +2777,15 @@ fn unknown_order_side_does_not_advance_fill_projection() {
     assert!(
         client
             .runtime
-            .project_order_status_fill_report(
-                super::TbankOrderStatusFillProjection::new(
-                    &unknown_side,
-                    "venue-order-1",
-                    "synthetic-trade-unknown-side",
-                    ts,
-                    Some("client-order-1"),
-                    None,
-                    TbankFillCommissionSource::OrderStateQuery,
-                ),
-            )
+            .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+                &unknown_side,
+                "venue-order-1",
+                "synthetic-trade-unknown-side",
+                ts,
+                Some("client-order-1"),
+                None,
+                TbankFillCommissionSource::OrderStateQuery,
+            ),)
             .unwrap()
             .is_none()
     );
@@ -2826,17 +2818,15 @@ fn unknown_order_side_does_not_advance_fill_projection() {
     .with_avg_px(Decimal::from(100));
     let fill = client
         .runtime
-        .project_order_status_fill_report(
-            super::TbankOrderStatusFillProjection::new(
-                &known_side,
-                "venue-order-1",
-                "synthetic-trade-known-side",
-                ts,
-                Some("client-order-1"),
-                None,
-                TbankFillCommissionSource::OrderStateQuery,
-            ),
-        )
+        .project_order_status_fill_report(super::TbankOrderStatusFillProjection::new(
+            &known_side,
+            "venue-order-1",
+            "synthetic-trade-known-side",
+            ts,
+            Some("client-order-1"),
+            None,
+            TbankFillCommissionSource::OrderStateQuery,
+        ))
         .unwrap()
         .expect("known side should publish the previously unprojected fill");
 
@@ -3101,6 +3091,11 @@ impl OrdersService for MockOrdersService {
     ) -> std::result::Result<Response<PostOrderResponse>, Status> {
         let request = request.into_inner();
         self.calls.lock().unwrap().push(request.clone());
+        let post_gate = self.post_gate.lock().unwrap().clone();
+        if let Some(gate) = post_gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
         if let Some((code, message)) = self.post_error.lock().unwrap().clone() {
             return Err(Status::new(code, message));
         }
@@ -3147,6 +3142,9 @@ impl OrdersService for MockOrdersService {
         let state_delay = *self.state_delay.lock().unwrap();
         if !state_delay.is_zero() {
             tokio::time::sleep(state_delay).await;
+        }
+        if let Some((code, message)) = self.state_error_responses.lock().unwrap().pop_front() {
+            return Err(Status::new(code, message));
         }
         if let Some((code, message)) = self.state_error.lock().unwrap().clone() {
             return Err(Status::new(code, message));
@@ -3366,7 +3364,11 @@ async fn submit_market_live_calls_orders_service() {
         allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let client_order_id = "524b1a03-efdd-4cd0-bd56-7cc6570c7156";
     let broker_request_id = tbank_broker_request_id_for_client_order_id(client_order_id);
@@ -3432,7 +3434,11 @@ async fn repeated_nautilus_submit_reuses_deterministic_broker_request_id() {
         .lock()
         .unwrap()
         .insert(metadata.instrument_id.clone(), metadata);
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let cmd = submit_order_cmd(None);
     let broker_request_id =
@@ -3509,7 +3515,11 @@ async fn generate_order_status_report_routes_known_stop_venue_order_id_to_stop_o
     client
         .runtime
         .record_broker_order_id(TbankBrokerOrderRoute::StopOrder, "stop-order-1");
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let report =
         <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_order_status_report(
@@ -3559,7 +3569,11 @@ async fn generate_order_status_report_recovers_stop_route_when_local_index_is_em
         ..TbankExecutionClientConfig::default()
     });
     seed_sber_metadata(&mut client);
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let report =
         <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_order_status_report(
@@ -3624,7 +3638,11 @@ async fn generate_order_status_report_resolves_executed_stop_child_after_restart
         ..TbankExecutionClientConfig::default()
     });
     seed_sber_metadata(&mut client);
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let report =
         <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_order_status_report(
@@ -3709,7 +3727,11 @@ async fn generate_order_status_reports_recovers_old_stop_parent_before_window_fi
         ..TbankExecutionClientConfig::default()
     });
     seed_sber_metadata(&mut client);
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let cmd = GenerateOrderStatusReports::new(
         UUID4::new(),
@@ -3775,7 +3797,11 @@ async fn generate_order_status_report_routes_known_stop_request_id_to_stop_order
         "524b1a03-efdd-4cd0-bd56-7cc6570c7156",
         "stop-order-1",
     );
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let report =
         <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_order_status_report(
@@ -3942,7 +3968,7 @@ async fn reconcile_order_by_request_id_maps_remote_open_order_to_accepted_report
         "exchange-order-1"
     );
     assert!(reports.fill_reports.is_empty());
-    assert!(client.runtime.stream_tasks.lock().unwrap().is_empty());
+    assert!(client.task_owner.session_tasks.is_empty());
     let state_calls = state_calls.lock().unwrap();
     assert_eq!(state_calls.len(), 1);
     assert_eq!(
@@ -4047,7 +4073,7 @@ async fn reconcile_order_by_request_id_maps_remote_fill_to_fill_report_once() {
         reports.fill_reports[0].last_px.as_decimal(),
         Decimal::new(1375, 1)
     );
-    assert!(client.runtime.stream_tasks.lock().unwrap().is_empty());
+    assert!(client.task_owner.session_tasks.is_empty());
 
     let second = client
         .runtime
@@ -4234,7 +4260,11 @@ async fn cancel_stop_order_live_calls_stop_orders_service() {
         allow_live_trading: true,
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     client
         .runtime
@@ -4297,6 +4327,7 @@ async fn pending_stop_order_cancel_waits_for_broker_stop_order_id() {
         TbankCancelTarget::Pending {
             route: TbankBrokerOrderRoute::StopOrder,
             client_order_id: "stop-request-1".to_string(),
+            owner: true,
         }
     );
     assert!(client.runtime.record_broker_order_mapping(
@@ -4393,7 +4424,10 @@ fn closed_cumulative_provenance_channel_does_not_block_fill_projection() {
         .expect("closed provenance channel must not suppress the execution fill");
     assert!(!fill.provenance_only);
     assert_eq!(fill.report.trade_id.to_string(), "synthetic-trade-1");
-    assert_eq!(client.runtime.fill_projection.lock().unwrap().orders.len(), 1);
+    assert_eq!(
+        client.runtime.fill_projection.lock().unwrap().orders.len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -4405,8 +4439,11 @@ async fn submit_route_is_visible_before_async_broker_submit() {
     let mut future_runtime = runtime.clone();
     let route_runtime = runtime.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    runtime
+    client
+        .task_owner
         .spawn_mutating_command_task_with(
+            &runtime,
+            "test_submit_route",
             async move {
                 assert_eq!(
                     future_runtime
@@ -4416,6 +4453,7 @@ async fn submit_route_is_visible_before_async_broker_submit() {
                     TbankCancelTarget::Pending {
                         route: TbankBrokerOrderRoute::StopOrder,
                         client_order_id: client_order_id.to_string(),
+                        owner: true,
                     }
                 );
                 ready_tx.send(()).unwrap();
@@ -4423,6 +4461,7 @@ async fn submit_route_is_visible_before_async_broker_submit() {
             move || {
                 route_runtime.prepare_submit_route(&client_order_id, OrderType::StopMarket);
             },
+            || {},
         )
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), ready_rx)
@@ -4543,7 +4582,11 @@ async fn stop_order_cancel_route_recovers_from_broker_after_restart() {
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let target = client
         .runtime
@@ -4585,7 +4628,11 @@ async fn activated_stop_recovery_uses_order_request_id_without_exchange_order_id
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.connect_for_queries().await.unwrap();
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let (stop, client_order_id) = client
         .runtime
@@ -4647,7 +4694,11 @@ async fn query_fills_pages_until_cursor_exhausted() {
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
-    client.runtime.connect().await.unwrap();
+    client
+        .runtime
+        .connect(&mut client.task_owner)
+        .await
+        .unwrap();
 
     let response = client
         .runtime
@@ -4963,7 +5014,10 @@ async fn generate_fill_reports_returns_operation_history_trades() {
             )
         ));
     }
-    assert!(receiver.try_recv().is_err(), "the replaced sender must stay unused");
+    assert!(
+        receiver.try_recv().is_err(),
+        "the replaced sender must stay unused"
+    );
     assert!(late_receiver.try_recv().is_err());
     assert!(stale_receiver.try_recv().is_err());
 
@@ -5014,33 +5068,32 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
         .lock()
         .unwrap()
         .push_back(GetOperationsByCursorResponse::default());
-    *operations_service.positions_response.lock().unwrap() =
-        Some(PositionsResponse::default());
+    *operations_service.positions_response.lock().unwrap() = Some(PositionsResponse::default());
 
     let orders_service = MockOrdersService::default();
     let order_requests = Arc::clone(&orders_service.get_orders_requests);
-    *orders_service.get_orders_response.lock().unwrap() =
-        Some(GetOrdersResponse::default());
+    *orders_service.get_orders_response.lock().unwrap() = Some(GetOrdersResponse::default());
     let (today, _) = super::current_utc_day_bounds();
-    *orders_service.get_orders_unfiltered_response.lock().unwrap() =
-        Some(GetOrdersResponse {
-            orders: vec![OrderState {
-                order_id: "previous-day-working-order".to_string(),
-                ticker: "SBER".to_string(),
-                class_code: "TQBR".to_string(),
-                instrument_uid: "sber-uid".to_string(),
-                order_date: Some(prost_types::Timestamp {
-                    seconds: today.seconds - 3_600,
-                    nanos: 0,
-                }),
-                direction: OrderDirection::Buy as i32,
-                order_type: crate::grpc::generated::OrderType::Market as i32,
-                execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew
-                    as i32,
-                lots_requested: 1,
-                ..OrderState::default()
-            }],
-        });
+    *orders_service
+        .get_orders_unfiltered_response
+        .lock()
+        .unwrap() = Some(GetOrdersResponse {
+        orders: vec![OrderState {
+            order_id: "previous-day-working-order".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            instrument_uid: "sber-uid".to_string(),
+            order_date: Some(prost_types::Timestamp {
+                seconds: today.seconds - 3_600,
+                nanos: 0,
+            }),
+            direction: OrderDirection::Buy as i32,
+            order_type: crate::grpc::generated::OrderType::Market as i32,
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
+            lots_requested: 1,
+            ..OrderState::default()
+        }],
+    });
     let stop_orders_service = MockStopOrdersService::default();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5067,13 +5120,14 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
     client.runtime.cache_instrument_metadata(metadata);
     client.connect_for_queries().await.unwrap();
 
-    let status = <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_mass_status(
-        &client,
-        Some(1_500),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let status =
+        <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_mass_status(
+            &client,
+            Some(1_500),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
     let day_start = UnixNanos::from(status.ts_init.as_u64() / NANOS_PER_DAY * NANOS_PER_DAY);
     assert_eq!(status.lookback_start(), Some(day_start));
@@ -5119,10 +5173,7 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
     assert_eq!(operation_calls.len(), 1);
     assert_eq!(
         operation_calls[0].from,
-        Some(
-            crate::common::time::unix_nanos_to_timestamp(i128::from(day_start.as_u64()))
-                .unwrap()
-        ),
+        Some(crate::common::time::unix_nanos_to_timestamp(i128::from(day_start.as_u64())).unwrap()),
         "fill identity recovery and order history must share the clipped day boundary"
     );
 }
@@ -5135,55 +5186,55 @@ async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_
         let mut pages = operations_service.pages.lock().unwrap();
         pages.push_back(GetOperationsByCursorResponse {
             items: vec![
-            OperationItem {
-                id: "operation-with-order-identity".to_string(),
-                r#type: TbankOperationType::Buy as i32,
-                state: OperationState::Executed as i32,
-                instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
-                figi: "BBG004730N88".to_string(),
-                ticker: "SBER".to_string(),
-                class_code: "TQBR".to_string(),
-                commission: Some(MoneyValue {
-                    currency: "rub".to_string(),
-                    units: 1,
-                    nano: 0,
-                }),
-                trades_info: Some(OperationItemTrades {
-                    trades: vec![OperationItemTrade {
-                        num: "mapped-trade".to_string(),
-                        quantity: 1,
-                        price: Some(MoneyValue {
-                            currency: "rub".to_string(),
-                            units: 275,
-                            nano: 0,
-                        }),
-                        ..OperationItemTrade::default()
-                    }],
-                }),
-                ..OperationItem::default()
-            },
-            OperationItem {
-                id: "operation-without-order-identity".to_string(),
-                r#type: TbankOperationType::Buy as i32,
-                state: OperationState::Executed as i32,
-                instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
-                figi: "BBG004730N88".to_string(),
-                ticker: "SBER".to_string(),
-                class_code: "TQBR".to_string(),
-                trades_info: Some(OperationItemTrades {
-                    trades: vec![OperationItemTrade {
-                        num: "unmapped-trade".to_string(),
-                        quantity: 1,
-                        price: Some(MoneyValue {
-                            currency: "rub".to_string(),
-                            units: 275,
-                            nano: 0,
-                        }),
-                        ..OperationItemTrade::default()
-                    }],
-                }),
-                ..OperationItem::default()
-            },
+                OperationItem {
+                    id: "operation-with-order-identity".to_string(),
+                    r#type: TbankOperationType::Buy as i32,
+                    state: OperationState::Executed as i32,
+                    instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
+                    figi: "BBG004730N88".to_string(),
+                    ticker: "SBER".to_string(),
+                    class_code: "TQBR".to_string(),
+                    commission: Some(MoneyValue {
+                        currency: "rub".to_string(),
+                        units: 1,
+                        nano: 0,
+                    }),
+                    trades_info: Some(OperationItemTrades {
+                        trades: vec![OperationItemTrade {
+                            num: "mapped-trade".to_string(),
+                            quantity: 1,
+                            price: Some(MoneyValue {
+                                currency: "rub".to_string(),
+                                units: 275,
+                                nano: 0,
+                            }),
+                            ..OperationItemTrade::default()
+                        }],
+                    }),
+                    ..OperationItem::default()
+                },
+                OperationItem {
+                    id: "operation-without-order-identity".to_string(),
+                    r#type: TbankOperationType::Buy as i32,
+                    state: OperationState::Executed as i32,
+                    instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
+                    figi: "BBG004730N88".to_string(),
+                    ticker: "SBER".to_string(),
+                    class_code: "TQBR".to_string(),
+                    trades_info: Some(OperationItemTrades {
+                        trades: vec![OperationItemTrade {
+                            num: "unmapped-trade".to_string(),
+                            quantity: 1,
+                            price: Some(MoneyValue {
+                                currency: "rub".to_string(),
+                                units: 275,
+                                nano: 0,
+                            }),
+                            ..OperationItemTrade::default()
+                        }],
+                    }),
+                    ..OperationItem::default()
+                },
             ],
             ..GetOperationsByCursorResponse::default()
         });
@@ -5223,20 +5274,19 @@ async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
     });
-    client
-        .runtime
-        .cache_instrument_metadata(sber_metadata());
+    client.runtime.cache_instrument_metadata(sber_metadata());
     client.connect_for_queries().await.unwrap();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     nautilus_common::live::runner::replace_data_event_sender(sender);
 
-    let status = <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_mass_status(
-        &client,
-        Some(60),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let status =
+        <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_mass_status(
+            &client,
+            Some(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
     assert_eq!(operation_calls.lock().unwrap().len(), 1);
     assert!(!status.reports_complete());

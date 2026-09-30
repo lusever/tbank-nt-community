@@ -40,6 +40,7 @@ impl DataClient for TbankDataClient {
         Ok(())
     }
 
+    // These synchronous hooks request cancellation; async disconnect observes bounded completion.
     fn stop(&mut self) -> anyhow::Result<()> {
         self.disconnect();
         Ok(())
@@ -71,8 +72,7 @@ impl DataClient for TbankDataClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        TbankDataClient::disconnect_async(self).await;
-        Ok(())
+        TbankDataClient::disconnect_async(self).await
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
@@ -136,7 +136,7 @@ impl DataClient for TbankDataClient {
             "trades",
             &cmd.instrument_id.to_string(),
             "all",
-        ));
+        ))?;
         Ok(())
     }
 
@@ -159,16 +159,19 @@ impl DataClient for TbankDataClient {
             "depth10",
             &cmd.instrument_id.to_string(),
             "book",
-        ));
+        ))?;
         Ok(())
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
         let clients = self
             .clients
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .clone();
+        let publication = Arc::clone(&self.session_publication);
+        let session_generation = publication.current();
         let timestamp_mode = self.config.candle_timestamp_mode;
         let request_timeout = self.config.historical_candle_request_timeout;
         let indicative_instruments = self.config.indicative_instruments.clone();
@@ -187,66 +190,73 @@ impl DataClient for TbankDataClient {
             .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
             .transpose()?;
 
-        let task = get_runtime().spawn(async move {
-            let result = async {
-                let mut historical = crate::historical::TbankHistoricalClient::new(
-                    clients,
-                    timestamp_mode,
-                    request_timeout,
-                    indicative_instruments,
-                );
-                let resolved = historical.resolve_instrument(instrument_id).await?;
-                let from = request_timestamp_to_datetime(
-                    start.ok_or_else(|| anyhow::anyhow!("request_trades requires start"))?,
-                )?;
-                let to = request_timestamp_to_datetime(
-                    end.ok_or_else(|| anyhow::anyhow!("request_trades requires end"))?,
-                )?;
-                historical
-                    .request_trades(
-                        &resolved,
-                        instrument_id,
-                        from,
-                        to,
-                        crate::historical::DEFAULT_TRADE_SOURCE,
-                        limit,
-                    )
-                    .await
-            }
-            .await;
-
-            match result {
-                Ok(trades) => {
-                    let response = DataResponse::Trades(TradesResponse::new(
-                        request_id,
-                        resolved_client_id,
-                        instrument_id,
-                        trades,
-                        start_nanos,
-                        end_nanos,
-                        now_unix_nanos(),
-                        params,
-                    ));
-                    if let Err(error) = sender.send(DataEvent::Response(response)) {
-                        tracing::error!(%error, "failed to publish T-Bank trades response");
-                    }
+        self.spawn_session_task(
+            &spawner,
+            "historical-trades-request",
+            TaskCancellation::new(),
+            async move {
+                let result = async {
+                    let mut historical = crate::historical::TbankHistoricalClient::new(
+                        clients,
+                        timestamp_mode,
+                        request_timeout,
+                        indicative_instruments,
+                    );
+                    let resolved = historical.resolve_instrument(instrument_id).await?;
+                    let from = request_timestamp_to_datetime(
+                        start.ok_or_else(|| anyhow::anyhow!("request_trades requires start"))?,
+                    )?;
+                    let to = request_timestamp_to_datetime(
+                        end.ok_or_else(|| anyhow::anyhow!("request_trades requires end"))?,
+                    )?;
+                    historical
+                        .request_trades(
+                            &resolved,
+                            instrument_id,
+                            from,
+                            to,
+                            crate::historical::DEFAULT_TRADE_SOURCE,
+                            limit,
+                        )
+                        .await
                 }
-                Err(error) => tracing::error!(%error, "T-Bank request_trades failed"),
-            }
-        });
-        let mut request_tasks = self.request_tasks.lock().expect("request_tasks lock");
-        request_tasks.retain(|task| !task.is_finished());
-        request_tasks.push(task);
+                .await;
+
+                match result {
+                    Ok(trades) => {
+                        let response = DataResponse::Trades(TradesResponse::new(
+                            request_id,
+                            resolved_client_id,
+                            instrument_id,
+                            trades,
+                            start_nanos,
+                            end_nanos,
+                            now_unix_nanos(),
+                            params,
+                        ));
+                        publication.if_current(session_generation, || {
+                            if let Err(error) = sender.send(DataEvent::Response(response)) {
+                                tracing::error!(%error, "failed to publish T-Bank trades response");
+                            }
+                        });
+                    }
+                    Err(error) => tracing::error!(%error, "T-Bank request_trades failed"),
+                }
+            },
+        )?;
 
         Ok(())
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
+        let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
         let clients = self
             .clients
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .clone();
+        let publication = Arc::clone(&self.session_publication);
+        let session_generation = publication.current();
         let timestamp_mode = self.config.candle_timestamp_mode;
         let request_timeout = self.config.historical_candle_request_timeout;
         let retries = self.config.historical_candle_max_retries as usize;
@@ -268,49 +278,53 @@ impl DataClient for TbankDataClient {
             .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
             .transpose()?;
 
-        let task = get_runtime().spawn(async move {
-            let result = async {
-                let mut historical = crate::historical::TbankHistoricalClient::new(
-                    clients,
-                    timestamp_mode,
-                    request_timeout,
-                    indicative_instruments,
-                );
-                let resolved = historical.resolve_instrument(instrument_id).await?;
-                let from = request_timestamp_to_datetime(
-                    start.ok_or_else(|| anyhow::anyhow!("request_bars requires start"))?,
-                )?;
-                let to = request_timestamp_to_datetime(
-                    end.ok_or_else(|| anyhow::anyhow!("request_bars requires end"))?,
-                )?;
-                historical
-                    .request_bars(&resolved, bar_type, interval, from, to, limit, retries)
-                    .await
-            }
-            .await;
-
-            match result {
-                Ok(bars) => {
-                    let response = DataResponse::Bars(BarsResponse::new(
-                        request_id,
-                        resolved_client_id,
-                        bar_type,
-                        bars,
-                        start_nanos,
-                        end_nanos,
-                        now_unix_nanos(),
-                        params,
-                    ));
-                    if let Err(error) = sender.send(DataEvent::Response(response)) {
-                        tracing::error!(%error, "failed to publish T-Bank bars response");
-                    }
+        self.spawn_session_task(
+            &spawner,
+            "historical-bars-request",
+            TaskCancellation::new(),
+            async move {
+                let result = async {
+                    let mut historical = crate::historical::TbankHistoricalClient::new(
+                        clients,
+                        timestamp_mode,
+                        request_timeout,
+                        indicative_instruments,
+                    );
+                    let resolved = historical.resolve_instrument(instrument_id).await?;
+                    let from = request_timestamp_to_datetime(
+                        start.ok_or_else(|| anyhow::anyhow!("request_bars requires start"))?,
+                    )?;
+                    let to = request_timestamp_to_datetime(
+                        end.ok_or_else(|| anyhow::anyhow!("request_bars requires end"))?,
+                    )?;
+                    historical
+                        .request_bars(&resolved, bar_type, interval, from, to, limit, retries)
+                        .await
                 }
-                Err(error) => tracing::error!(%error, "T-Bank request_bars failed"),
-            }
-        });
-        let mut request_tasks = self.request_tasks.lock().expect("request_tasks lock");
-        request_tasks.retain(|task| !task.is_finished());
-        request_tasks.push(task);
+                .await;
+
+                match result {
+                    Ok(bars) => {
+                        let response = DataResponse::Bars(BarsResponse::new(
+                            request_id,
+                            resolved_client_id,
+                            bar_type,
+                            bars,
+                            start_nanos,
+                            end_nanos,
+                            now_unix_nanos(),
+                            params,
+                        ));
+                        publication.if_current(session_generation, || {
+                            if let Err(error) = sender.send(DataEvent::Response(response)) {
+                                tracing::error!(%error, "failed to publish T-Bank bars response");
+                            }
+                        });
+                    }
+                    Err(error) => tracing::error!(%error, "T-Bank request_bars failed"),
+                }
+            },
+        )?;
 
         Ok(())
     }

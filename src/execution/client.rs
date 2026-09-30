@@ -54,18 +54,20 @@ use crate::execution::events::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures_util::FutureExt;
 use nautilus_common::{
     clients::ExecutionClient,
-    live::{
-        runner::{get_exec_event_sender, try_get_data_event_sender},
-        runtime::get_runtime,
-    },
+    live::runner::{get_exec_event_sender, try_get_data_event_sender},
     messages::{DataEvent, execution::ExecutionReport},
     msgbus::{self, TypedHandler, switchboard},
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_execution::client::core::ExecutionClientCore;
-use nautilus_live::{ExecutionEventEmitter, execution::failure::CommandFailure};
+use nautilus_live::{
+    ExecutionEventEmitter,
+    execution::failure::CommandFailure,
+    task::{TaskGroup, TaskGroupGuard, TaskRef, TaskShutdownError, TaskSpawnError, TaskSpawner},
+};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
@@ -79,7 +81,7 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::sync::watch;
 
 mod nautilus;
 mod reconciliation;
@@ -168,12 +170,17 @@ fn log_tbank_rpc_failure(rpc: &'static str, error: &TbankAdapterError) {
     }
 }
 
+type TbankPendingCancelWaiter =
+    tokio::sync::oneshot::Sender<std::result::Result<TbankBrokerOrderIdentity, String>>;
+type TbankPendingCancelWaiters = Arc<Mutex<HashMap<String, Vec<TbankPendingCancelWaiter>>>>;
+
 #[derive(Clone)]
 struct TbankExecutionRuntime {
     client_id: ClientId,
     account_id: AccountId,
     pub config: TbankExecutionClientConfig,
     clients: Option<TbankGrpcClients<TbankAuthInterceptor>>,
+    connected: Arc<AtomicBool>,
     data_event_sender: Arc<Mutex<Option<TbankDataEventSender>>>,
     instruments: Arc<Mutex<HashMap<String, TbankInstrumentMetadata>>>,
     futures_margin_refreshed_at: Arc<Mutex<HashMap<String, Instant>>>,
@@ -188,9 +195,7 @@ struct TbankExecutionRuntime {
     recovery_rpc_deadline: Option<tokio::time::Instant>,
     unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     unresolved_cancellations: Arc<Mutex<HashSet<TbankBrokerOrderIdentity>>>,
-    stream_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    reconciliation_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    command_tasks: Arc<Mutex<Vec<TbankCommandTask>>>,
+    pending_cancel_waiters: TbankPendingCancelWaiters,
     lifecycle_active: Arc<TbankLifecycleToken>,
     emitter: ExecutionEventEmitter,
 }
@@ -258,22 +263,295 @@ fn metadata_matches_event_identity(
     uid_matches && figi_matches && ticker_matches && class_code_matches
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TbankCommandTaskKind {
-    ReadOnly,
-    Mutating,
+struct TbankExecutionTaskOwner {
+    session_tasks: TaskGroup,
+    operation_tasks: TaskGroup,
+    operation_admission: Mutex<()>,
+    external_admission_open: AtomicBool,
+    session_generation: u64,
+    session_drain_completed: bool,
+    connected_generation: bool,
 }
 
-#[derive(Debug)]
-struct TbankCommandTask {
-    kind: TbankCommandTaskKind,
-    handle: JoinHandle<()>,
+impl TbankExecutionTaskOwner {
+    fn new() -> Self {
+        Self {
+            session_tasks: TaskGroup::new(),
+            operation_tasks: TaskGroup::new(),
+            operation_admission: Mutex::new(()),
+            external_admission_open: AtomicBool::new(false),
+            session_generation: 0,
+            session_drain_completed: true,
+            connected_generation: false,
+        }
+    }
+
+    fn spawn_read_only_command_task<F>(
+        &self,
+        runtime: &TbankExecutionRuntime,
+        name: &'static str,
+        future: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let _admission = self
+            .operation_admission
+            .lock()
+            .expect("operation_admission lock");
+        if !self.external_admission_open.load(Ordering::Acquire) {
+            return Err(TbankAdapterError::ConfigError(
+                "T-Bank execution client is not ready for commands".to_string(),
+            ));
+        }
+        runtime.ensure_lifecycle_active()?;
+        spawn_session_task(
+            &self.session_tasks.spawner().map_err(task_spawn_error)?,
+            self.session_generation,
+            name,
+            true,
+            future,
+        )
+        .map(|_| ())
+        .map_err(task_spawn_error)
+    }
+
+    fn spawn_mutating_command_task<F>(
+        &self,
+        runtime: &TbankExecutionRuntime,
+        name: &'static str,
+        future: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_mutating_command_task_with(runtime, name, future, || {}, || {})
+    }
+
+    fn spawn_mutating_command_task_with<F, C, P>(
+        &self,
+        runtime: &TbankExecutionRuntime,
+        name: &'static str,
+        future: F,
+        on_registered: C,
+        on_panic: P,
+    ) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        C: FnOnce(),
+        P: FnOnce() + Send + 'static,
+    {
+        let _admission = self
+            .operation_admission
+            .lock()
+            .expect("operation_admission lock");
+        if !self.external_admission_open.load(Ordering::Acquire) {
+            return Err(TbankAdapterError::ConfigError(
+                "T-Bank execution client is not ready for commands".to_string(),
+            ));
+        }
+        runtime.ensure_lifecycle_active()?;
+        let spawner = self.operation_tasks.spawner().map_err(task_spawn_error)?;
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        spawn_operation_task(
+            &spawner,
+            name,
+            async move {
+                if start_rx.await.is_ok() {
+                    future.await;
+                }
+            },
+            on_panic,
+        )
+        .map_err(task_spawn_error)?;
+
+        on_registered();
+        start_tx.send(()).map_err(|()| {
+            TbankAdapterError::ConfigError(format!(
+                "T-Bank execution task {name} stopped before admission completed"
+            ))
+        })?;
+        Ok(())
+    }
+
+    async fn prepare_session_generation(&mut self) -> Result<u64> {
+        if !self.session_tasks.is_open() || !self.session_tasks.is_empty() {
+            if self.session_tasks.is_open() {
+                self.session_tasks.begin_shutdown();
+            }
+            self.session_tasks
+                .finish_shutdown(TASK_SHUTDOWN_GRACE, TASK_SHUTDOWN_ABORT)
+                .await
+                .map_err(task_shutdown_error)?;
+            self.session_tasks
+                .start_generation()
+                .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
+            self.session_drain_completed = true;
+        }
+        self.session_generation = self.session_generation.saturating_add(1);
+        Ok(self.session_generation)
+    }
+
+    async fn prepare_operation_generation(&self) -> Result<()> {
+        if !self.operation_tasks.is_open() {
+            self.operation_tasks
+                .finish_shutdown(TASK_SHUTDOWN_GRACE, TASK_SHUTDOWN_ABORT)
+                .await
+                .map_err(task_shutdown_error)?;
+            self.operation_tasks
+                .start_generation()
+                .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn mark_ready(&mut self, runtime: &mut TbankExecutionRuntime) {
+        let _admission = self
+            .operation_admission
+            .lock()
+            .expect("operation_admission lock");
+        self.external_admission_open.store(true, Ordering::Release);
+        runtime.connected.store(true, Ordering::Release);
+    }
+
+    fn begin_disconnect(&mut self, runtime: &mut TbankExecutionRuntime) -> bool {
+        let _admission = self
+            .operation_admission
+            .lock()
+            .expect("operation_admission lock");
+        let should_drain = self.connected_generation
+            || !self.session_tasks.is_open()
+            || !self.session_tasks.is_empty();
+        runtime.lifecycle_active.store(false, Ordering::Release);
+        runtime.connected.store(false, Ordering::Release);
+        self.external_admission_open.store(false, Ordering::Release);
+        if should_drain && (self.session_tasks.is_open() || !self.session_drain_completed) {
+            self.session_tasks.begin_shutdown();
+            self.session_drain_completed = false;
+        }
+        self.connected_generation = false;
+        runtime.clients = None;
+        should_drain
+    }
+
+    fn can_reset(&self) -> bool {
+        self.session_drain_completed
+            && self.operation_tasks.is_empty()
+            && self.session_tasks.is_empty()
+    }
+}
+
+impl Drop for TbankExecutionTaskOwner {
+    fn drop(&mut self) {
+        // TaskGroup drop closes admission and requests abort, but cannot prove async completion.
+        let session_tasks = self.session_tasks.len();
+        let operation_tasks = self.operation_tasks.len();
+        if session_tasks > 0 || operation_tasks > 0 {
+            tracing::warn!(
+                session_tasks,
+                operation_tasks,
+                "dropping T-Bank execution owner with tasks still active; cancellation is best effort"
+            );
+        }
+    }
+}
+
+const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+const TASK_SHUTDOWN_ABORT: Duration = Duration::from_secs(2);
+
+fn task_spawn_error(error: TaskSpawnError) -> TbankAdapterError {
+    TbankAdapterError::ConfigError(format!("T-Bank execution task admission failed: {error}"))
+}
+
+fn task_shutdown_error(error: TaskShutdownError) -> TbankAdapterError {
+    let summary = match error {
+        TaskShutdownError::StillOpen => "admission remained open".to_string(),
+        TaskShutdownError::Join(failures) => {
+            format!("all tasks drained with {} task failure(s)", failures.len())
+        }
+        TaskShutdownError::Timeout {
+            failures,
+            incomplete,
+        } => format!(
+            "timed out with {incomplete} task(s) still owned and {} task failure(s)",
+            failures.len()
+        ),
+    };
+    TbankAdapterError::ConfigError(format!("T-Bank execution task shutdown {summary}"))
+}
+
+pub(super) fn spawn_session_task<F>(
+    spawner: &TaskSpawner,
+    generation: u64,
+    name: &'static str,
+    normal_exit_expected: bool,
+    future: F,
+) -> std::result::Result<TaskRef, TaskSpawnError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let cancellation = spawner.cancellation_token();
+    let future = Box::pin(future);
+    let task = spawner.spawn_named(name, async move {
+        let outcome = std::panic::AssertUnwindSafe(async move {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => false,
+                () = future => true,
+            }
+        })
+        .catch_unwind()
+        .await;
+        match outcome {
+            Ok(true) if !normal_exit_expected => tracing::warn!(
+                task = name,
+                generation,
+                "T-Bank execution session worker exited unexpectedly"
+            ),
+            Ok(_) => {}
+            Err(_) => {
+                tracing::error!(
+                    task = name,
+                    generation,
+                    "T-Bank execution session worker panicked"
+                );
+                std::panic::resume_unwind(Box::new("T-Bank execution worker panicked"));
+            }
+        }
+    })?;
+    tracing::debug!(task = name, generation, task_id = %task.id(), "started T-Bank execution task");
+    Ok(task)
+}
+
+fn spawn_operation_task<F, P>(
+    spawner: &TaskSpawner,
+    name: &'static str,
+    future: F,
+    on_panic: P,
+) -> std::result::Result<TaskRef, TaskSpawnError>
+where
+    F: Future<Output = ()> + Send + 'static,
+    P: FnOnce() + Send + 'static,
+{
+    let task = spawner.spawn_named(name, async move {
+        match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+            Ok(()) => {}
+            Err(_) => {
+                on_panic();
+                tracing::error!(task = name, "T-Bank admitted execution operation panicked");
+                std::panic::resume_unwind(Box::new("T-Bank execution operation panicked"));
+            }
+        }
+    })?;
+    tracing::debug!(task = name, task_id = %task.id(), "admitted T-Bank execution operation");
+    Ok(task)
 }
 
 /// Nautilus execution client backed by T-Bank order and operation services.
 pub struct TbankExecutionClient {
     core: ExecutionClientCore,
     runtime: TbankExecutionRuntime,
+    task_owner: TbankExecutionTaskOwner,
     instrument_subscriptions: Vec<(Venue, TypedHandler<InstrumentAny>)>,
 }
 
@@ -293,6 +571,7 @@ impl TbankExecutionClient {
         Self {
             core,
             runtime,
+            task_owner: TbankExecutionTaskOwner::new(),
             instrument_subscriptions: Vec::new(),
         }
     }
@@ -348,11 +627,14 @@ impl TbankExecutionClient {
 
     /// Connects the client to the configured T-Bank endpoint.
     pub async fn connect(&mut self) -> Result<()> {
-        self.runtime.connect().await?;
+        self.runtime.connect_for_node(&mut self.task_owner).await?;
         if let Err(error) = self.await_account_registered().await {
-            self.runtime.disconnect();
+            if let Err(cleanup_error) = self.disconnect_async().await {
+                tracing::error!(%cleanup_error, "T-Bank account-registration rollback drain failed");
+            }
             return Err(error);
         }
+        self.task_owner.mark_ready(&mut self.runtime);
         self.core.set_connected();
         Ok(())
     }
@@ -377,15 +659,23 @@ impl TbankExecutionClient {
 
     /// Connects only the query services required for reconciliation.
     pub async fn connect_for_queries(&mut self) -> Result<()> {
-        self.runtime.connect_for_queries().await?;
+        self.runtime
+            .connect_for_queries(&mut self.task_owner)
+            .await?;
         self.core.set_connected();
         Ok(())
     }
 
     /// Disconnects the client and stops its background tasks.
     pub fn disconnect(&mut self) {
-        self.runtime.disconnect();
+        self.runtime.disconnect(&mut self.task_owner);
         self.core.set_disconnected();
+    }
+
+    async fn disconnect_async(&mut self) -> Result<()> {
+        let result = self.runtime.disconnect_async(&mut self.task_owner).await;
+        self.core.set_disconnected();
+        result
     }
 
     /// Returns whether the client is connected.
@@ -419,7 +709,8 @@ struct TbankOrderStreamContext {
     reconnect_policy: crate::config::TbankReconnectPolicy,
     activated_stop_reconciliations: Arc<Mutex<HashSet<String>>>,
     regular_order_reconciliations: Arc<Mutex<HashSet<String>>>,
-    reconciliation_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    session_spawner: TaskSpawner,
+    session_generation: u64,
 }
 
 struct TbankOrderStatusFillProjection<'a> {
@@ -850,6 +1141,7 @@ impl TbankExecutionRuntime {
             account_id,
             config,
             clients: None,
+            connected: Arc::new(AtomicBool::new(false)),
             data_event_sender: Arc::new(Mutex::new(try_get_data_event_sender())),
             instruments: Arc::new(Mutex::new(HashMap::new())),
             futures_margin_refreshed_at: Arc::new(Mutex::new(HashMap::new())),
@@ -864,9 +1156,7 @@ impl TbankExecutionRuntime {
             recovery_rpc_deadline: None,
             unresolved_trade_fills: Arc::new(Mutex::new(HashMap::new())),
             unresolved_cancellations: Arc::new(Mutex::new(HashSet::new())),
-            stream_tasks: Arc::new(Mutex::new(Vec::new())),
-            reconciliation_tasks: Arc::new(Mutex::new(Vec::new())),
-            command_tasks: Arc::new(Mutex::new(Vec::new())),
+            pending_cancel_waiters: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_active: Arc::new(TbankLifecycleToken::new(false)),
             emitter,
         }
@@ -880,6 +1170,82 @@ impl TbankExecutionRuntime {
                 "T-Bank execution client is disconnected".to_string(),
             ))
         }
+    }
+
+    fn register_pending_cancel_waiter(
+        &self,
+        client_order_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<std::result::Result<TbankBrokerOrderIdentity, String>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut waiters = self
+            .pending_cancel_waiters
+            .lock()
+            .expect("pending_cancel_waiters lock");
+        let order_waiters = waiters.entry(client_order_id.to_string()).or_default();
+        order_waiters.retain(|waiter| !waiter.is_closed());
+        order_waiters.push(sender);
+        receiver
+    }
+
+    fn remove_closed_pending_cancel_waiters(&self, client_order_id: &str) {
+        let mut waiters = self
+            .pending_cancel_waiters
+            .lock()
+            .expect("pending_cancel_waiters lock");
+        let remove_key = if let Some(order_waiters) = waiters.get_mut(client_order_id) {
+            order_waiters.retain(|waiter| !waiter.is_closed());
+            order_waiters.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            waiters.remove(client_order_id);
+        }
+    }
+
+    fn notify_pending_cancel(&self, client_order_id: &str, identity: TbankBrokerOrderIdentity) {
+        self.unresolved_cancellations
+            .lock()
+            .expect("unresolved_cancellations lock")
+            .insert(identity.clone());
+        let waiters = self
+            .pending_cancel_waiters
+            .lock()
+            .expect("pending_cancel_waiters lock")
+            .remove(client_order_id)
+            .unwrap_or_default();
+        let mut delivered = false;
+        for waiter in waiters {
+            if waiter.send(Ok(identity.clone())).is_ok() {
+                delivered = true;
+            }
+        }
+        if !delivered {
+            tracing::warn!(
+                broker_order_id = %identity.broker_order_id,
+                "retained resolved T-Bank cancel for reconnect reconciliation"
+            );
+        }
+    }
+
+    fn reject_pending_cancel_waiters(&self, client_order_id: &str, reason: &str) {
+        let waiters = self
+            .pending_cancel_waiters
+            .lock()
+            .expect("pending_cancel_waiters lock")
+            .remove(client_order_id)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(Err(reason.to_string()));
+        }
+    }
+
+    fn has_pending_cancel_waiters(&self) -> bool {
+        self.pending_cancel_waiters
+            .lock()
+            .expect("pending_cancel_waiters lock")
+            .values()
+            .any(|waiters| waiters.iter().any(|waiter| !waiter.is_closed()))
     }
 
     fn refresh_data_event_sender(&self) {
@@ -935,89 +1301,6 @@ impl TbankExecutionRuntime {
         });
     }
 
-    fn spawn_read_only_command_task<F>(&self, future: F) -> Result<()>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
-        self.ensure_lifecycle_active()?;
-        tasks.retain(|task| !task.handle.is_finished());
-        tasks.push(TbankCommandTask {
-            kind: TbankCommandTaskKind::ReadOnly,
-            handle: get_runtime().spawn(future),
-        });
-        Ok(())
-    }
-
-    fn spawn_mutating_command_task<F>(&self, future: F) -> Result<()>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.spawn_mutating_command_task_with(future, || {})
-    }
-
-    fn spawn_mutating_followup_task<F>(&self, future: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
-        tasks.retain(|task| !task.handle.is_finished());
-        tasks.push(TbankCommandTask {
-            kind: TbankCommandTaskKind::Mutating,
-            handle: get_runtime().spawn(future),
-        });
-    }
-
-    fn spawn_mutating_followup_task_if_active<F>(&self, future: F) -> bool
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
-        self.lifecycle_active
-            .run_if_active(|| {
-                tasks.retain(|task| !task.handle.is_finished());
-                tasks.push(TbankCommandTask {
-                    kind: TbankCommandTaskKind::Mutating,
-                    handle: get_runtime().spawn(future),
-                });
-            })
-            .is_some()
-    }
-
-    fn spawn_mutating_command_task_with<F, C>(&self, future: F, on_registered: C) -> Result<()>
-    where
-        F: Future<Output = ()> + Send + 'static,
-        C: FnOnce(),
-    {
-        let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
-        self.ensure_lifecycle_active()?;
-        tasks.retain(|task| !task.handle.is_finished());
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-        let handle = get_runtime().spawn(async move {
-            if start_rx.await.is_ok() {
-                future.await;
-            }
-        });
-        tasks.push(TbankCommandTask {
-            kind: TbankCommandTaskKind::Mutating,
-            handle,
-        });
-        // Keep the registry lock held until externally visible acceptance is published. A
-        // concurrent disconnect can invalidate the lifecycle, but cannot observe an accepted
-        // submit without also observing its registered mutating task.
-        on_registered();
-        let _ = start_tx.send(());
-        Ok(())
-    }
-
-    fn has_unfinished_mutating_tasks(&self) -> bool {
-        let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
-        tasks.retain(|task| !task.handle.is_finished());
-        tasks
-            .iter()
-            .any(|task| task.kind == TbankCommandTaskKind::Mutating)
-    }
-
     fn has_unresolved_mutation_outcomes(&self) -> bool {
         let unresolved_submit = self
             .pending_submits
@@ -1037,11 +1320,16 @@ impl TbankExecutionRuntime {
                 .expect("unresolved_trade_fills lock")
                 .values()
                 .all(Vec::is_empty)
+            || self.has_pending_cancel_waiters()
+            || self
+                .broker_order_index
+                .lock()
+                .expect("broker_order_index lock")
+                .has_pending_cancels()
     }
 
     fn reset_state(&mut self) {
-        // Install fresh state containers so an already-polled task racing with abort cannot
-        // repopulate the state used by the next lifecycle run.
+        // Reset is admitted only after both task groups are drained and mutation outcomes settle.
         let generation = {
             let mut generation = self
                 .futures_margin_generation
@@ -1061,9 +1349,8 @@ impl TbankExecutionRuntime {
         self.pending_submits = Arc::new(Mutex::new(HashMap::new()));
         self.unresolved_trade_fills = Arc::new(Mutex::new(HashMap::new()));
         self.unresolved_cancellations = Arc::new(Mutex::new(HashSet::new()));
-        self.stream_tasks = Arc::new(Mutex::new(Vec::new()));
-        self.reconciliation_tasks = Arc::new(Mutex::new(Vec::new()));
-        self.command_tasks = Arc::new(Mutex::new(Vec::new()));
+        self.pending_cancel_waiters = Arc::new(Mutex::new(HashMap::new()));
+        self.connected.store(false, Ordering::Release);
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(false));
     }
 
@@ -1082,6 +1369,7 @@ impl TbankExecutionRuntime {
             .lock()
             .expect("futures_margin_generation lock") = generation;
         self.futures_margin_generation_id = generation;
+        self.connected = Arc::new(AtomicBool::new(false));
         self.futures_margin_refreshed_at = Arc::new(Mutex::new(HashMap::new()));
         self.futures_margin_inflight = Arc::new(Mutex::new(HashMap::new()));
     }
@@ -1098,11 +1386,24 @@ impl TbankExecutionRuntime {
     }
 
     /// Connects the client to the configured T-Bank endpoint.
-    pub async fn connect(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub async fn connect(&mut self, task_owner: &mut TbankExecutionTaskOwner) -> Result<()> {
+        self.connect_for_node(task_owner).await?;
+        task_owner.mark_ready(self);
+        Ok(())
+    }
+
+    async fn connect_for_node(&mut self, task_owner: &mut TbankExecutionTaskOwner) -> Result<()> {
         self.refresh_data_event_sender();
-        if self.is_connected() {
+        if self.is_connected()
+            && self.lifecycle_active.load(Ordering::Acquire)
+            && task_owner.session_tasks.is_open()
+        {
             return Ok(());
         }
+        task_owner.prepare_operation_generation().await?;
+        task_owner.prepare_session_generation().await?;
+        self.clients = None;
         self.config.validate()?;
         let token = self.config.resolve_token_secret()?;
         let endpoint = self.config.endpoint_uri()?;
@@ -1110,20 +1411,27 @@ impl TbankExecutionRuntime {
         let interceptor = TbankAuthInterceptor::new(&token)?;
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
         self.begin_connection_generation();
-        // A new token is a lifecycle generation. Clones from a previous connection retain the
-        // invalidated token and cannot become active again after reconnect.
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
-        if let Err(error) = self
-            .spawn_execution_streams()
-            .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))
-        {
-            self.disconnect();
+        task_owner.connected_generation = true;
+        task_owner.session_drain_completed = false;
+        let rollback_lifecycle = self.lifecycle_active.clone();
+        let setup_guard = TaskGroupGuard::new(&[&task_owner.session_tasks], move || {
+            rollback_lifecycle.store(false, Ordering::Release);
+        });
+        let setup_result = async {
+            self.spawn_execution_streams(task_owner)
+                .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
+            self.publish_startup_account_state().await
+        }
+        .await;
+        if let Err(error) = setup_result {
+            drop(setup_guard);
+            if let Err(cleanup_error) = self.disconnect_async(task_owner).await {
+                tracing::error!(%cleanup_error, "T-Bank execution setup rollback drain failed");
+            }
             return Err(error);
         }
-        if let Err(error) = self.publish_startup_account_state().await {
-            self.disconnect();
-            return Err(error);
-        }
+        setup_guard.disarm();
         tracing::info!(
             environment = ?self.config.environment,
             endpoint = endpoint.as_str(),
@@ -1135,11 +1443,20 @@ impl TbankExecutionRuntime {
     }
 
     /// Connects only the query services required for reconciliation.
-    pub async fn connect_for_queries(&mut self) -> Result<()> {
+    pub async fn connect_for_queries(
+        &mut self,
+        task_owner: &mut TbankExecutionTaskOwner,
+    ) -> Result<()> {
         self.refresh_data_event_sender();
-        if self.is_connected() {
+        if self.is_connected()
+            && self.lifecycle_active.load(Ordering::Acquire)
+            && task_owner.session_tasks.is_open()
+        {
             return Ok(());
         }
+        task_owner.prepare_operation_generation().await?;
+        task_owner.prepare_session_generation().await?;
+        self.clients = None;
         self.config.validate()?;
         let token = self.config.resolve_token_secret()?;
         let endpoint = self.config.endpoint_uri()?;
@@ -1148,6 +1465,18 @@ impl TbankExecutionRuntime {
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
         self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
+        task_owner.connected_generation = true;
+        task_owner.session_drain_completed = false;
+        {
+            let _admission = task_owner
+                .operation_admission
+                .lock()
+                .expect("operation_admission lock");
+            task_owner
+                .external_admission_open
+                .store(true, Ordering::Release);
+            self.connected.store(true, Ordering::Release);
+        }
         tracing::info!(
             environment = ?self.config.environment,
             endpoint = endpoint.as_str(),
@@ -1158,59 +1487,48 @@ impl TbankExecutionRuntime {
         Ok(())
     }
 
-    fn abort_background_tasks(&self) -> Vec<JoinHandle<()>> {
-        let mut aborted = Vec::new();
-        self.lifecycle_active.store(false, Ordering::Release);
-        {
-            let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
-            let mut retained = Vec::with_capacity(tasks.len());
-            for task in tasks.drain(..) {
-                if task.handle.is_finished() {
-                } else if task.kind == TbankCommandTaskKind::ReadOnly {
-                    task.handle.abort();
-                    aborted.push(task.handle);
-                } else {
-                    retained.push(task);
-                }
-            }
-            *tasks = retained;
-        }
-        aborted.extend(
-            self.stream_tasks
-                .lock()
-                .expect("stream_tasks lock")
-                .drain(..)
-                .inspect(|task| task.abort()),
-        );
-        aborted.extend(
-            self.reconciliation_tasks
-                .lock()
-                .expect("reconciliation_tasks lock")
-                .drain(..)
-                .inspect(|task| task.abort()),
-        );
-        aborted
-    }
-
     /// Disconnects the client and stops its background tasks.
-    pub fn disconnect(&mut self) {
-        drop(self.abort_background_tasks());
-        self.clients = None;
-        tracing::info!("disconnected T-Bank execution client");
+    fn disconnect(&mut self, task_owner: &mut TbankExecutionTaskOwner) {
+        task_owner.begin_disconnect(self);
+        tracing::info!("disconnected T-Bank execution client; session task shutdown requested");
     }
 
-    async fn disconnect_async(&mut self) {
-        let tasks = self.abort_background_tasks();
-        self.clients = None;
-        for task in tasks {
-            let _ = task.await;
+    async fn disconnect_async(&mut self, task_owner: &mut TbankExecutionTaskOwner) -> Result<()> {
+        let should_drain = task_owner.begin_disconnect(self);
+        if should_drain {
+            let result = task_owner
+                .session_tasks
+                .finish_shutdown(TASK_SHUTDOWN_GRACE, TASK_SHUTDOWN_ABORT)
+                .await;
+            if task_owner.session_tasks.is_empty()
+                && !matches!(result, Err(TaskShutdownError::Timeout { .. }))
+            {
+                task_owner.session_drain_completed = true;
+            }
+            result.map_err(task_shutdown_error)?;
+        }
+        if task_owner.operation_tasks.is_open() && task_owner.operation_tasks.is_empty() {
+            task_owner.operation_tasks.begin_shutdown();
+            task_owner
+                .operation_tasks
+                .finish_shutdown(TASK_SHUTDOWN_GRACE, TASK_SHUTDOWN_ABORT)
+                .await
+                .map_err(task_shutdown_error)?;
+        }
+        let pending_operations = task_owner.operation_tasks.len();
+        if pending_operations > 0 {
+            tracing::warn!(
+                pending_operations,
+                "T-Bank transport disconnected while admitted broker operations remain owned"
+            );
         }
         tracing::info!("disconnected T-Bank execution client");
+        Ok(())
     }
 
     /// Returns whether the client is connected.
     pub fn is_connected(&self) -> bool {
-        self.clients.is_some()
+        self.connected.load(Ordering::Acquire)
     }
 
     fn record_broker_order_mapping(
@@ -1219,10 +1537,21 @@ impl TbankExecutionRuntime {
         client_order_id: &str,
         venue_order_id: &str,
     ) -> bool {
-        self.broker_order_index
+        let should_cancel = self
+            .broker_order_index
             .lock()
             .expect("broker_order_index lock")
-            .record_mapping(route, client_order_id, venue_order_id)
+            .record_mapping(route, client_order_id, venue_order_id);
+        if should_cancel {
+            self.notify_pending_cancel(
+                client_order_id,
+                TbankBrokerOrderIdentity {
+                    route,
+                    broker_order_id: venue_order_id.to_string(),
+                },
+            );
+        }
+        should_cancel
     }
 
     fn record_activated_stop_child_mapping(
@@ -1245,27 +1574,13 @@ impl TbankExecutionRuntime {
         drop(projection);
         drop(index);
         if should_cancel {
-            let mut cancel_client = self.detached_query_clone();
-            let child_order_id = child_order_id.to_string();
-            let mut tasks = self
-                .reconciliation_tasks
-                .lock()
-                .expect("reconciliation_tasks lock");
-            tasks.retain(|task| !task.is_finished());
-            let task = get_runtime().spawn(async move {
-                let identity = TbankBrokerOrderIdentity {
+            self.notify_pending_cancel(
+                client_order_id,
+                TbankBrokerOrderIdentity {
                     route: TbankBrokerOrderRoute::RegularOrder,
-                    broker_order_id: child_order_id.clone(),
-                };
-                if let Err(error) = cancel_client.cancel_resolved_broker_order(identity).await {
-                    tracing::error!(
-                        %error,
-                        %child_order_id,
-                        "failed to drain pending T-Bank cancel after activated-stop child resolution"
-                    );
-                }
-            });
-            tasks.push(task);
+                    broker_order_id: child_order_id.to_string(),
+                },
+            );
         }
         should_cancel
     }
@@ -1282,72 +1597,27 @@ impl TbankExecutionRuntime {
         );
     }
 
-    async fn record_activated_stop_child_mapping_and_drain_cancel(
+    fn record_activated_stop_child_mapping_and_notify_cancel(
         &mut self,
         client_order_id: &str,
         stop_order_id: &str,
         child_order_id: &str,
     ) {
-        let should_cancel = {
-            let mut index = self
-                .broker_order_index
-                .lock()
-                .expect("broker_order_index lock");
-            let should_cancel = index.record_activated_stop_child_mapping(
-                client_order_id,
-                stop_order_id,
-                child_order_id,
-            );
-            merge_fill_projection_alias(
-                &mut self.fill_projection.lock().expect("fill_projection lock"),
-                child_order_id,
-                stop_order_id,
-            );
-            should_cancel
-        };
+        self.record_activated_stop_child_mapping(client_order_id, stop_order_id, child_order_id);
         self.record_pending_submit_venue_order_id(client_order_id, child_order_id);
-        if should_cancel {
-            let identity = TbankBrokerOrderIdentity {
-                route: TbankBrokerOrderRoute::RegularOrder,
-                broker_order_id: child_order_id.to_string(),
-            };
-            if let Err(error) = self.cancel_resolved_broker_order(identity).await {
-                tracing::error!(
-                    %error,
-                    %client_order_id,
-                    %child_order_id,
-                    "failed to drain pending T-Bank cancel after activated-stop child resolution"
-                );
-            }
-        }
     }
 
-    async fn record_broker_order_mapping_and_drain_cancel(
+    fn record_broker_order_mapping_and_notify_cancel(
         &mut self,
         route: TbankBrokerOrderRoute,
         client_order_id: &str,
         venue_order_id: &str,
     ) {
-        let should_cancel =
-            self.record_broker_order_mapping(route, client_order_id, venue_order_id);
+        self.record_broker_order_mapping(route, client_order_id, venue_order_id);
         self.record_pending_submit_venue_order_id(client_order_id, venue_order_id);
-        if should_cancel {
-            let identity = TbankBrokerOrderIdentity {
-                route,
-                broker_order_id: venue_order_id.to_string(),
-            };
-            if let Err(error) = self.cancel_resolved_broker_order(identity).await {
-                tracing::error!(
-                    %error,
-                    %client_order_id,
-                    route = ?route,
-                    "failed to drain pending T-Bank cancel after broker order mapping"
-                );
-            }
-        }
     }
 
-    async fn record_regular_order_alias_and_drain_cancel(
+    fn record_regular_order_alias_and_notify_cancel(
         &mut self,
         client_order_id: &str,
         canonical_order_id: &str,
@@ -1369,18 +1639,13 @@ impl TbankExecutionRuntime {
         };
         self.record_pending_submit_venue_order_id(client_order_id, current_order_id);
         if should_cancel {
-            let identity = TbankBrokerOrderIdentity {
-                route: TbankBrokerOrderRoute::RegularOrder,
-                broker_order_id: current_order_id.to_string(),
-            };
-            if let Err(error) = self.cancel_resolved_broker_order(identity).await {
-                tracing::error!(
-                    %error,
-                    %client_order_id,
-                    %current_order_id,
-                    "failed to drain pending T-Bank cancel after regular order alias resolution"
-                );
-            }
+            self.notify_pending_cancel(
+                client_order_id,
+                TbankBrokerOrderIdentity {
+                    route: TbankBrokerOrderRoute::RegularOrder,
+                    broker_order_id: current_order_id.to_string(),
+                },
+            );
         }
     }
 
@@ -1410,6 +1675,10 @@ impl TbankExecutionRuntime {
             .lock()
             .expect("broker_order_index lock")
             .remove_unresolved_client_order_route(client_order_id);
+        self.reject_pending_cancel_waiters(
+            client_order_id,
+            "T-Bank order submission was rejected before a broker order identity was available",
+        );
     }
 
     fn record_broker_order_id(&self, route: TbankBrokerOrderRoute, venue_order_id: &str) {
@@ -1579,22 +1848,26 @@ impl TbankExecutionRuntime {
         venue_order_id: Option<&str>,
     ) -> Result<TbankCancelTarget> {
         let venue_order_id = venue_order_id.filter(|venue_order_id| !venue_order_id.is_empty());
-        let known_identity = {
-            self.broker_order_index
+        let (known_identity, pending_route, pending_cancel_owner) = {
+            let mut index = self
+                .broker_order_index
                 .lock()
-                .expect("broker_order_index lock")
-                .identity_for(Some(client_order_id), venue_order_id)
+                .expect("broker_order_index lock");
+            let known_identity = index.identity_for(Some(client_order_id), venue_order_id);
+            let (pending_route, pending_cancel_owner) = if known_identity.is_none() {
+                let route = index.route_for_client_order_id(client_order_id);
+                let owner = route.is_some()
+                    && venue_order_id.is_none()
+                    && index.record_pending_cancel(client_order_id);
+                (route, owner)
+            } else {
+                (None, false)
+            };
+            (known_identity, pending_route, pending_cancel_owner)
         };
         if let Some(identity) = known_identity {
             return Ok(TbankCancelTarget::Ready(identity));
         }
-        let pending_route = {
-            let index = self
-                .broker_order_index
-                .lock()
-                .expect("broker_order_index lock");
-            index.route_for_client_order_id(client_order_id)
-        };
         if let Some(route) = pending_route {
             if let Some(venue_order_id) = venue_order_id {
                 return Ok(TbankCancelTarget::Ready(TbankBrokerOrderIdentity {
@@ -1602,13 +1875,10 @@ impl TbankExecutionRuntime {
                     broker_order_id: venue_order_id.to_string(),
                 }));
             }
-            self.broker_order_index
-                .lock()
-                .expect("broker_order_index lock")
-                .record_pending_cancel(client_order_id);
             return Ok(TbankCancelTarget::Pending {
                 route,
                 client_order_id: client_order_id.to_string(),
+                owner: pending_cancel_owner,
             });
         }
         if venue_order_id.is_some()
@@ -1993,68 +2263,66 @@ impl TbankExecutionRuntime {
         }
     }
 
-    fn spawn_submit_outcome_recovery(
-        &self,
+    async fn recover_submit_outcome(
+        &mut self,
         order: TbankSubmitOrder,
         metadata: TbankInstrumentMetadata,
         ts_init: UnixNanos,
         deadline: tokio::time::Instant,
         emitter: ExecutionEventEmitter,
     ) {
-        let mut client = self.clone();
         let policy = self.config.reconnect_policy.clone();
-        self.spawn_mutating_followup_task(async move {
-            let mut attempts = 0_u32;
-            for attempt in 0..SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
-                let Some(delay) = next_submit_outcome_recovery_delay(
-                    &policy,
-                    attempt,
-                    tokio::time::Instant::now(),
-                    deadline,
-                ) else {
-                    break;
-                };
-                tokio::time::sleep(delay).await;
-                attempts = attempt + 1;
-                let reconciliation_ts = current_unix_nanos();
-                match client
-                    .step_submit_outcome_recovery(&order, &metadata, ts_init, deadline)
-                    .await
-                {
-                    TbankSubmitRecoveryStep::Resolved(reconciled) => {
-                        client.mark_pending_submit_report(&reconciled.order_report);
-                        for report in order_status_execution_reports(
-                            reconciled.order_report,
-                            reconciled.fill_reports,
-                        ) {
+        let mut attempts = 0_u32;
+        for attempt in 0..SUBMIT_OUTCOME_RECOVERY_ATTEMPTS {
+            let Some(delay) = next_submit_outcome_recovery_delay(
+                &policy,
+                attempt,
+                tokio::time::Instant::now(),
+                deadline,
+            ) else {
+                break;
+            };
+            tokio::time::sleep(delay).await;
+            attempts = attempt + 1;
+            let reconciliation_ts = current_unix_nanos();
+            match self
+                .step_submit_outcome_recovery(&order, &metadata, ts_init, deadline)
+                .await
+            {
+                TbankSubmitRecoveryStep::Resolved(reconciled) => {
+                    self.mark_pending_submit_report(&reconciled.order_report);
+                    let reports = order_status_execution_reports(
+                        reconciled.order_report,
+                        reconciled.fill_reports,
+                    );
+                    self.lifecycle_active.run_if_active(|| {
+                        for report in reports {
                             emitter.send_execution_report(report);
                         }
-                        tracing::info!(
-                            client_order_id = %order.client_order_id,
-                            attempt = attempts,
-                            "recovered unresolved T-Bank submit outcome"
-                        );
-                        return;
-                    }
-                    // T-Bank's 50005 only describes this lookup. Without a documented broker
-                    // finality guarantee, keep the request identity unresolved until an order
-                    // report confirms its outcome or the bounded ladder ends.
-                    TbankSubmitRecoveryStep::NotFound | TbankSubmitRecoveryStep::Inconclusive => {
-                        client.touch_pending_submit_reconciliation(
-                            order.client_order_id.as_str(),
-                            attempts,
-                            reconciliation_ts,
-                        );
-                    }
+                    });
+                    tracing::info!(
+                        client_order_id = %order.client_order_id,
+                        attempt = attempts,
+                        "recovered unresolved T-Bank submit outcome"
+                    );
+                    return;
+                }
+                // A single miss is not broker finality; retain request identity for later recovery.
+                TbankSubmitRecoveryStep::NotFound | TbankSubmitRecoveryStep::Inconclusive => {
+                    self.touch_pending_submit_reconciliation(
+                        order.client_order_id.as_str(),
+                        attempts,
+                        reconciliation_ts,
+                    );
                 }
             }
-            client.mark_pending_submit_terminal(
-                order.client_order_id.as_str(),
-                TbankPendingSubmitStage::Unresolved,
-                attempts,
-                current_unix_nanos(),
-            );
-        });
+        }
+        self.mark_pending_submit_terminal(
+            order.client_order_id.as_str(),
+            TbankPendingSubmitStage::Unresolved,
+            attempts,
+            current_unix_nanos(),
+        );
     }
 
     /// Submits an order to T-Bank.
@@ -2133,18 +2401,6 @@ impl TbankExecutionRuntime {
         let route = broker_order_route_for_submit(order, service);
         self.record_broker_order_route(route, order.client_order_id.as_str());
         self.record_submit_order_context(order);
-
-        // Re-check at the mutation boundary in case disconnect invalidated this runtime clone
-        // while the submit pipeline was resolving instrument metadata.
-        if let Err(error) = self.ensure_lifecycle_active() {
-            self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
-            self.mark_pending_submit_stage(
-                order.client_order_id.as_str(),
-                TbankPendingSubmitStage::Rejected,
-                None,
-            );
-            return Err(TbankCommandError::before_rpc(error));
-        }
 
         let result = match service {
             TbankExecutionService::LiveOrders => {
@@ -2277,12 +2533,11 @@ impl TbankExecutionRuntime {
                     pending_stage_after_submit_response(&response),
                     None,
                 );
-                self.record_broker_order_mapping_and_drain_cancel(
+                self.record_broker_order_mapping_and_notify_cancel(
                     route,
                     order.client_order_id.as_str(),
                     broker_order_id,
-                )
-                .await;
+                );
                 Ok(response)
             }
             Err(error) => {
@@ -2379,17 +2634,19 @@ impl TbankExecutionRuntime {
         }
     }
 
-    async fn cancel_resolved_broker_order(
+    async fn cancel_resolved_broker_order_admitted(
         &mut self,
         identity: TbankBrokerOrderIdentity,
     ) -> std::result::Result<(), TbankCommandError> {
-        self.ensure_lifecycle_active()
-            .map_err(TbankCommandError::before_rpc)?;
         let was_unresolved = self
             .unresolved_cancellations
             .lock()
             .expect("unresolved_cancellations lock")
             .contains(&identity);
+        self.unresolved_cancellations
+            .lock()
+            .expect("unresolved_cancellations lock")
+            .insert(identity.clone());
         let result = self
             .cancel_resolved_broker_order_unchecked(identity.clone())
             .await;
@@ -2411,7 +2668,14 @@ impl TbankExecutionRuntime {
                     .expect("unresolved_cancellations lock")
                     .insert(identity.clone());
             }
-            Err(_) => {}
+            Err(_) => {
+                if !was_unresolved {
+                    self.unresolved_cancellations
+                        .lock()
+                        .expect("unresolved_cancellations lock")
+                        .remove(&identity);
+                }
+            }
         }
         if was_unresolved
             && result.as_ref().is_err_and(|error| {
@@ -2449,9 +2713,7 @@ impl TbankExecutionRuntime {
         Ok(())
     }
 
-    /// Cancels all open regular and stop orders for the configured account.
-    pub async fn cancel_all_orders(&mut self) -> Result<usize> {
-        self.ensure_lifecycle_active()?;
+    async fn cancel_all_orders_admitted(&mut self) -> Result<usize> {
         let orders = self.query_open_orders().await?;
         let stops = self.query_stop_orders().await?;
         let identities = orders
@@ -2473,7 +2735,10 @@ impl TbankExecutionRuntime {
         let mut cancelled = 0;
         let mut first_error: Option<TbankAdapterError> = None;
         for identity in identities {
-            match self.cancel_resolved_broker_order(identity.clone()).await {
+            match self
+                .cancel_resolved_broker_order_admitted(identity.clone())
+                .await
+            {
                 Ok(()) => cancelled += 1,
                 Err(error)
                     if matches!(
@@ -3380,6 +3645,7 @@ impl TbankExecutionRuntime {
             account_id: self.account_id,
             config: self.config.clone(),
             clients: self.clients.clone(),
+            connected: self.connected.clone(),
             // Detached clones share the refreshable sender slot. Worker threads do not have
             // Nautilus' thread-local runner state, so snapshotting an Option here would make
             // late sender initialization or replacement invisible to already-running streams.
@@ -3397,15 +3663,16 @@ impl TbankExecutionRuntime {
             recovery_rpc_deadline: None,
             unresolved_trade_fills: self.unresolved_trade_fills.clone(),
             unresolved_cancellations: self.unresolved_cancellations.clone(),
-            stream_tasks: Arc::new(Mutex::new(Vec::new())),
-            reconciliation_tasks: self.reconciliation_tasks.clone(),
-            command_tasks: self.command_tasks.clone(),
+            pending_cancel_waiters: self.pending_cancel_waiters.clone(),
             lifecycle_active: self.lifecycle_active.clone(),
             emitter: self.emitter.clone(),
         }
     }
 
-    fn spawn_execution_streams(&mut self) -> anyhow::Result<()> {
+    fn spawn_execution_streams(
+        &mut self,
+        task_owner: &TbankExecutionTaskOwner,
+    ) -> anyhow::Result<()> {
         self.refresh_data_event_sender();
         if !self.emitter.is_initialized() {
             tracing::debug!("Nautilus execution event sender not initialized; skipping streams");
@@ -3414,6 +3681,11 @@ impl TbankExecutionRuntime {
         let Some(clients) = self.clients.as_ref() else {
             return Ok(());
         };
+        let session_spawner = task_owner
+            .session_tasks
+            .spawner()
+            .map_err(anyhow::Error::new)?;
+        let session_generation = task_owner.session_generation;
         let account_id = self.config.resolve_account_id()?;
         let reconnect_reconciler =
             TbankReconnectReconciler::new(self.detached_query_clone(), self.emitter.clone());
@@ -3435,107 +3707,116 @@ impl TbankExecutionRuntime {
             reconnect_policy: self.config.reconnect_policy.clone(),
             activated_stop_reconciliations: Arc::new(Mutex::new(HashSet::new())),
             regular_order_reconciliations: Arc::new(Mutex::new(HashSet::new())),
-            reconciliation_tasks: self.reconciliation_tasks.clone(),
+            session_spawner: session_spawner.clone(),
+            session_generation,
         };
         let trades_order_context = order_context.clone();
         let order_reconciler = reconnect_reconciler.clone();
         let order_last_observed_unix_nanos =
             Arc::new(AtomicU64::new(current_unix_nanos().as_u64()));
-        self.stream_tasks
-            .lock()
-            .expect("stream_tasks lock")
-            .push(get_runtime().spawn(async move {
-                let request = OrderStateStreamRequest {
-                    accounts: vec![order_account],
-                    ping_delay_millis: None,
-                };
-                let mut attempt = 0;
-                let mut stream_generation = 0_u64;
-                let mut recovery_from = None;
-                loop {
-                    match order_stream.order_state_stream(request.clone()).await {
-                        Ok(response) => {
-                            stream_generation = stream_generation.saturating_add(1);
-                            if recovery_from.is_none() {
+        let order_task = async move {
+            let request = OrderStateStreamRequest {
+                accounts: vec![order_account],
+                ping_delay_millis: None,
+            };
+            let mut attempt = 0;
+            let mut stream_generation = 0_u64;
+            let mut recovery_from = None;
+            loop {
+                match order_stream.order_state_stream(request.clone()).await {
+                    Ok(response) => {
+                        stream_generation = stream_generation.saturating_add(1);
+                        if recovery_from.is_none() {
+                            attempt = 0;
+                        }
+                        let stream = response.into_inner();
+                        let recovery_pending = Arc::new(AtomicBool::new(false));
+                        if let Some(from_unix_nanos) = recovery_from {
+                            let outcome = reconcile_after_stream_reopen(
+                                &order_reconciler,
+                                "order_state_stream",
+                                from_unix_nanos,
+                                &order_reconnect_policy,
+                            )
+                            .await;
+                            if apply_reconnect_reconciliation_outcome(
+                                &mut recovery_from,
+                                from_unix_nanos,
+                                outcome,
+                            ) {
                                 attempt = 0;
+                                order_last_observed_unix_nanos
+                                    .store(current_unix_nanos().as_u64(), Ordering::Release);
+                            } else {
+                                recovery_pending.store(true, Ordering::Release);
                             }
-                            let stream = response.into_inner();
-                            let recovery_pending = Arc::new(AtomicBool::new(false));
-                            if let Some(from_unix_nanos) = recovery_from {
-                                let outcome = reconcile_after_stream_reopen(
-                                    &order_reconciler,
-                                    "order_state_stream",
-                                    from_unix_nanos,
-                                    &order_reconnect_policy,
-                                )
-                                .await;
-                                if apply_reconnect_reconciliation_outcome(
-                                    &mut recovery_from,
-                                    from_unix_nanos,
-                                    outcome,
-                                ) {
+                        }
+                        let publish = publish_order_state_stream(
+                            stream,
+                            order_context.clone(),
+                            stream_generation,
+                            recovery_pending.clone(),
+                            order_last_observed_unix_nanos.clone(),
+                        );
+                        tokio::pin!(publish);
+                        let stream_result = if let Some(from_unix_nanos) = recovery_from {
+                            let reconciliation = reconcile_degraded_stream_until_complete(
+                                &order_reconciler,
+                                "order_state_stream_background",
+                                from_unix_nanos,
+                                &order_reconnect_policy,
+                            );
+                            tokio::pin!(reconciliation);
+                            tokio::select! {
+                                result = &mut publish => result,
+                                () = &mut reconciliation => {
+                                    recovery_from = None;
                                     attempt = 0;
                                     order_last_observed_unix_nanos
                                         .store(current_unix_nanos().as_u64(), Ordering::Release);
-                                } else {
-                                    recovery_pending.store(true, Ordering::Release);
+                                    recovery_pending.store(false, Ordering::Release);
+                                    publish.await
                                 }
                             }
-                            let publish = publish_order_state_stream(
-                                stream,
-                                order_context.clone(),
-                                stream_generation,
-                                recovery_pending.clone(),
-                                order_last_observed_unix_nanos.clone(),
-                            );
-                            tokio::pin!(publish);
-                            let stream_result = if let Some(from_unix_nanos) = recovery_from {
-                                let reconciliation = reconcile_degraded_stream_until_complete(
-                                    &order_reconciler,
-                                    "order_state_stream_background",
-                                    from_unix_nanos,
-                                    &order_reconnect_policy,
-                                );
-                                tokio::pin!(reconciliation);
-                                tokio::select! {
-                                    result = &mut publish => result,
-                                    () = &mut reconciliation => {
-                                        recovery_from = None;
-                                        attempt = 0;
-                                        order_last_observed_unix_nanos
-                                            .store(current_unix_nanos().as_u64(), Ordering::Release);
-                                        recovery_pending.store(false, Ordering::Release);
-                                        publish.await
-                                    }
-                                }
-                            } else {
-                                publish.await
-                            };
-                            match stream_result {
-                                Ok(()) => {
-                                    tracing::warn!("T-Bank order-state stream closed by server");
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%error, "T-Bank order-state stream closed with error");
-                                }
+                        } else {
+                            publish.await
+                        };
+                        match stream_result {
+                            Ok(()) => {
+                                tracing::warn!("T-Bank order-state stream closed by server");
                             }
-                            recovery_from.get_or_insert_with(|| {
-                                reconnect_reconciliation_from(&order_last_observed_unix_nanos)
-                            });
+                            Err(error) => {
+                                tracing::warn!(%error, "T-Bank order-state stream closed with error");
+                            }
                         }
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to open T-Bank order-state stream");
-                        }
+                        recovery_from.get_or_insert_with(|| {
+                            reconnect_reconciliation_from(&order_last_observed_unix_nanos)
+                        });
                     }
-                    recovery_from.get_or_insert_with(|| {
-                        reconnect_reconciliation_from(&order_last_observed_unix_nanos)
-                    });
-                    let delay = crate::grpc::retry::backoff_duration(&order_reconnect_policy, attempt);
-                    attempt = attempt.saturating_add(1);
-                    tracing::warn!(delay_ms = delay.as_millis(), "reopening T-Bank order-state stream after disconnect");
-                    tokio::time::sleep(delay).await;
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to open T-Bank order-state stream");
+                    }
                 }
-            }));
+                recovery_from.get_or_insert_with(|| {
+                    reconnect_reconciliation_from(&order_last_observed_unix_nanos)
+                });
+                let delay = crate::grpc::retry::backoff_duration(&order_reconnect_policy, attempt);
+                attempt = attempt.saturating_add(1);
+                tracing::warn!(
+                    delay_ms = delay.as_millis(),
+                    "reopening T-Bank order-state stream after disconnect"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        };
+        spawn_session_task(
+            &session_spawner,
+            session_generation,
+            "order_state_stream",
+            false,
+            order_task,
+        )
+        .map_err(anyhow::Error::new)?;
 
         let mut trades_stream = clients.orders_stream.clone();
         let trades_account = account_id.clone();
@@ -3549,7 +3830,7 @@ impl TbankExecutionRuntime {
         let trades_reconciler = reconnect_reconciler.clone();
         let trades_last_observed_unix_nanos =
             Arc::new(AtomicU64::new(current_unix_nanos().as_u64()));
-        let trades_task = get_runtime().spawn(async move {
+        let trades_task = async move {
             let request = TradesStreamRequest {
                 accounts: vec![trades_account],
                 ping_delay_ms: None,
@@ -3638,11 +3919,15 @@ impl TbankExecutionRuntime {
                 );
                 tokio::time::sleep(delay).await;
             }
-        });
-        self.stream_tasks
-            .lock()
-            .expect("stream_tasks lock")
-            .push(trades_task);
+        };
+        spawn_session_task(
+            &session_spawner,
+            session_generation,
+            "trades_stream",
+            false,
+            trades_task,
+        )
+        .map_err(anyhow::Error::new)?;
 
         let mut portfolio_stream = clients.operations_stream.clone();
         let portfolio_account = account_id.clone();
@@ -3652,7 +3937,7 @@ impl TbankExecutionRuntime {
         let portfolio_lifecycle_active = self.lifecycle_active.clone();
         let portfolio_query_client = self.detached_query_clone();
         let portfolio_reconnect_policy = self.config.reconnect_policy.clone();
-        let portfolio_task = get_runtime().spawn(async move {
+        let portfolio_task = async move {
             let request = PortfolioStreamRequest {
                 accounts: vec![portfolio_account],
                 ping_settings: None,
@@ -3692,11 +3977,15 @@ impl TbankExecutionRuntime {
                 );
                 tokio::time::sleep(delay).await;
             }
-        });
-        self.stream_tasks
-            .lock()
-            .expect("stream_tasks lock")
-            .push(portfolio_task);
+        };
+        spawn_session_task(
+            &session_spawner,
+            session_generation,
+            "portfolio_stream",
+            false,
+            portfolio_task,
+        )
+        .map_err(anyhow::Error::new)?;
 
         let mut positions_stream = clients.operations_stream.clone();
         let positions_account = account_id;
@@ -3706,7 +3995,7 @@ impl TbankExecutionRuntime {
         let positions_lifecycle_active = self.lifecycle_active.clone();
         let positions_query_client = self.detached_query_clone();
         let positions_reconnect_policy = self.config.reconnect_policy.clone();
-        let positions_task = get_runtime().spawn(async move {
+        let positions_task = async move {
             let request = PositionsStreamRequest {
                 accounts: vec![positions_account],
                 with_initial_positions: true,
@@ -3747,11 +4036,15 @@ impl TbankExecutionRuntime {
                 );
                 tokio::time::sleep(delay).await;
             }
-        });
-        self.stream_tasks
-            .lock()
-            .expect("stream_tasks lock")
-            .push(positions_task);
+        };
+        spawn_session_task(
+            &session_spawner,
+            session_generation,
+            "positions_stream",
+            false,
+            positions_task,
+        )
+        .map_err(anyhow::Error::new)?;
 
         Ok(())
     }
@@ -4492,19 +4785,17 @@ impl TbankExecutionRuntime {
         };
         if let Some(client_order_id) = client_order_id.as_deref() {
             if known_current_order_id.is_none() {
-                self.record_broker_order_mapping_and_drain_cancel(
+                self.record_broker_order_mapping_and_notify_cancel(
                     TbankBrokerOrderRoute::RegularOrder,
                     client_order_id,
                     state.order_id.as_str(),
-                )
-                .await;
+                );
             } else if let Some(canonical_order_id) = canonical_order_id.as_deref() {
-                self.record_regular_order_alias_and_drain_cancel(
+                self.record_regular_order_alias_and_notify_cancel(
                     client_order_id,
                     canonical_order_id,
                     state.order_id.as_str(),
-                )
-                .await;
+                );
             }
         } else if activated_stop_order_id.is_none() {
             self.record_broker_order_id(
@@ -4607,12 +4898,11 @@ impl TbankExecutionRuntime {
             stop.stop_order_id.as_str(),
         );
         if let Some(client_order_id) = client_order_id.as_deref() {
-            self.record_activated_stop_child_mapping_and_drain_cancel(
+            self.record_activated_stop_child_mapping_and_notify_cancel(
                 client_order_id,
                 stop.stop_order_id.as_str(),
                 exchange_order_id,
-            )
-            .await;
+            );
         } else {
             self.record_activated_stop_child_alias(stop.stop_order_id.as_str(), exchange_order_id);
         }
@@ -4651,12 +4941,11 @@ impl TbankExecutionRuntime {
         ts_init: UnixNanos,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
         if let Some(client_order_id) = client_order_id.as_ref() {
-            self.record_broker_order_mapping_and_drain_cancel(
+            self.record_broker_order_mapping_and_notify_cancel(
                 TbankBrokerOrderRoute::StopOrder,
                 client_order_id.as_str(),
                 stop.stop_order_id.as_str(),
-            )
-            .await;
+            );
         } else {
             self.record_broker_order_id(
                 TbankBrokerOrderRoute::StopOrder,

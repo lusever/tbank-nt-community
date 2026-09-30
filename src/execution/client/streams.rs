@@ -231,45 +231,10 @@ pub(super) async fn publish_order_state_stream(
                             continue;
                         };
                         if let Some(pending_cancel) = resolved_identity.pending_cancel {
-                            let mut cancel_client = context.query_client.detached_query_clone();
-                            if !context.query_client.spawn_mutating_followup_task_if_active(
-                                async move {
-                                    match cancel_client
-                                        .cancel_resolved_broker_order(pending_cancel.clone())
-                                        .await
-                                    {
-                                        Ok(()) => {}
-                                        Err(error)
-                                            if matches!(
-                                                classify_command_failure(&error),
-                                                CommandFailure::Ambiguous(_)
-                                            ) =>
-                                        {
-                                            match cancel_client
-                                                .recover_ambiguous_cancel(pending_cancel)
-                                                .await
-                                            {
-                                                Ok(TbankCancelRecoveryOutcome::Canceled) => {}
-                                                Ok(TbankCancelRecoveryOutcome::Active) => {
-                                                    tracing::warn!(
-                                                        "deferred T-Bank cancel reconciliation confirmed the order remains active"
-                                                    );
-                                                }
-                                                Err(recovery_error) => tracing::warn!(
-                                                    %recovery_error,
-                                                    "deferred T-Bank cancel outcome remained unresolved"
-                                                ),
-                                            }
-                                        }
-                                        Err(error) => tracing::error!(
-                                            %error,
-                                            "failed to drain pending T-Bank cancel after stream identity resolution"
-                                        ),
-                                    }
-                                },
-                            ) {
-                                return Ok(());
-                            }
+                            context.query_client.notify_pending_cancel(
+                                client_order_id.as_deref().unwrap_or_default(),
+                                pending_cancel,
+                            );
                         }
                         let venue_order_id = resolved_identity.venue_order_id;
                         let current_broker_order_id = state.order_id.clone();

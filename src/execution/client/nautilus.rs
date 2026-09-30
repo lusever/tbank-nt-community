@@ -637,6 +637,8 @@ impl ExecutionClient for TbankExecutionClient {
         Ok(())
     }
 
+    // Sync lifecycle hooks request cancellation. Reset/dispose fail until async drain and broker
+    // mutation resolution are complete.
     fn stop(&mut self) -> anyhow::Result<()> {
         if self.core.is_stopped() {
             return Ok(());
@@ -648,11 +650,9 @@ impl ExecutionClient for TbankExecutionClient {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.disconnect();
-        if self.runtime.has_unfinished_mutating_tasks()
-            || self.runtime.has_unresolved_mutation_outcomes()
-        {
+        if !self.task_owner.can_reset() || self.runtime.has_unresolved_mutation_outcomes() {
             anyhow::bail!(
-                "cannot reset T-Bank execution client while broker mutation outcomes are unresolved"
+                "cannot reset T-Bank execution client before task drain and broker mutation resolution"
             );
         }
         self.unsubscribe_instrument_updates();
@@ -663,11 +663,9 @@ impl ExecutionClient for TbankExecutionClient {
 
     fn dispose(&mut self) -> anyhow::Result<()> {
         self.disconnect();
-        if self.runtime.has_unfinished_mutating_tasks()
-            || self.runtime.has_unresolved_mutation_outcomes()
-        {
+        if !self.task_owner.can_reset() || self.runtime.has_unresolved_mutation_outcomes() {
             anyhow::bail!(
-                "cannot dispose T-Bank execution client while broker mutation outcomes are unresolved"
+                "cannot dispose T-Bank execution client before task drain and broker mutation resolution"
             );
         }
         self.unsubscribe_instrument_updates();
@@ -682,9 +680,7 @@ impl ExecutionClient for TbankExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.runtime.disconnect_async().await;
-        self.core.set_disconnected();
-        Ok(())
+        self.disconnect_async().await.map_err(anyhow::Error::from)
     }
 
     fn submit_order(
@@ -714,42 +710,54 @@ impl ExecutionClient for TbankExecutionClient {
         let order_type = cmd.order_init.order_type;
         let emitter = self.runtime.emitter.clone();
         let route_runtime = self.runtime.clone();
+        let panic_runtime = self.runtime.clone();
         let route_client_order_id = client_order_id;
+        let panic_client_order_id = client_order_id;
         let recovery_deadline =
             tokio::time::Instant::now() + submit_outcome_recovery_budget(&self.runtime.config);
-        self.runtime.spawn_mutating_command_task_with(async move {
-            let prepared = match prepare_nautilus_order_before_deadline(
-                &mut client,
-                cmd,
-                recovery_deadline,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    tracing::warn!(%error, %client_order_id, "denying Nautilus order during local preflight");
-                    client.remove_unresolved_broker_order_route(client_order_id.as_str());
-                    emitter.emit_order_denied(&order, &error.to_string());
-                    return;
+        self.task_owner.spawn_mutating_command_task_with(
+            &self.runtime,
+            "submit_order",
+            async move {
+                let prepared = match prepare_nautilus_order_before_deadline(
+                    &mut client,
+                    cmd,
+                    recovery_deadline,
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        tracing::warn!(%error, %client_order_id, "denying Nautilus order during local preflight");
+                        client.remove_unresolved_broker_order_route(client_order_id.as_str());
+                        emitter.emit_order_denied(&order, &error.to_string());
+                        return;
+                    }
+                };
+                emitter.emit_order_submitted(&order);
+                if let Err(error) = submit_prepared_nautilus_order(
+                    &mut client,
+                    prepared,
+                    emitter,
+                    recovery_deadline,
+                )
+                .await
+                {
+                    tracing::error!(%error, "failed to submit Nautilus order to T-Bank");
                 }
-            };
-            emitter.emit_order_submitted(&order);
-            if let Err(error) = submit_prepared_nautilus_order(
-                &mut client,
-                prepared,
-                emitter,
-                recovery_deadline,
-            )
-            .await
-            {
-                tracing::error!(%error, "failed to submit Nautilus order to T-Bank");
-            }
-        }, move || {
-            // The task is registered but has not started its async preflight.
-            // Publish the route at this acceptance boundary so a concurrent
-            // CancelOrder cannot fall back to OrdersService.
-            route_runtime.prepare_submit_route(&route_client_order_id, order_type);
-        })?;
+            },
+            move || {
+                // Register the route before opening the task's polling gate.
+                route_runtime.prepare_submit_route(&route_client_order_id, order_type);
+            },
+            move || {
+                panic_runtime.mark_pending_submit_stage(
+                    panic_client_order_id.as_str(),
+                    TbankPendingSubmitStage::Unknown,
+                    None,
+                );
+            },
+        )?;
         Ok(())
     }
 
@@ -795,7 +803,14 @@ impl ExecutionClient for TbankExecutionClient {
         };
         let submit_routes_for_cleanup = submit_routes.clone();
         let route_runtime = self.runtime.clone();
-        self.runtime.spawn_mutating_command_task_with(
+        let panic_runtime = self.runtime.clone();
+        let panic_client_order_ids = submit_routes
+            .iter()
+            .map(|(client_order_id, _)| client_order_id.to_string())
+            .collect::<Vec<_>>();
+        self.task_owner.spawn_mutating_command_task_with(
+            &self.runtime,
+            "submit_order_list",
             async move {
                 if commands
                     .iter()
@@ -849,6 +864,15 @@ impl ExecutionClient for TbankExecutionClient {
                     route_runtime.prepare_submit_route(&client_order_id, order_type);
                 }
             },
+            move || {
+                for client_order_id in panic_client_order_ids {
+                    panic_runtime.mark_pending_submit_stage(
+                        client_order_id.as_str(),
+                        TbankPendingSubmitStage::Unknown,
+                        None,
+                    );
+                }
+            },
         )?;
         Ok(())
     }
@@ -876,115 +900,157 @@ impl ExecutionClient for TbankExecutionClient {
         let mut client = self.runtime.clone();
         let emitter = self.runtime.emitter.clone();
         let account_id = self.runtime.account_id();
-        self.runtime.spawn_mutating_command_task(async move {
-            let client_order_id = cmd.client_order_id.to_string();
-            let venue_order_id = cmd.venue_order_id.map(|id| id.to_string());
-            let target = match client
-                .resolve_cancel_target(&client_order_id, venue_order_id.as_deref())
-                .await
-            {
-                Ok(target) => target,
-                Err(error) => {
-                    let command_error = TbankCommandError::before_rpc(error);
-                    tracing::error!(
-                        %command_error,
-                        %client_order_id,
-                        "failed to resolve T-Bank cancel target"
-                    );
-                    if matches!(
-                        classify_command_failure(&command_error),
-                        CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
-                    ) {
-                        emitter.emit_order_cancel_rejected_event(
-                            cmd.strategy_id,
-                            cmd.instrument_id,
-                            cmd.client_order_id,
-                            cmd.venue_order_id,
-                            &command_error.to_string(),
-                            current_unix_nanos(),
-                        );
-                    }
-                    return;
-                }
-            };
-            match target {
-                TbankCancelTarget::Ready(identity) => {
-                    if let Err(error) = client.cancel_resolved_broker_order(identity.clone()).await
-                    {
+        self.task_owner
+            .spawn_mutating_command_task(&self.runtime, "cancel_order", async move {
+                let client_order_id = cmd.client_order_id.to_string();
+                let venue_order_id = cmd.venue_order_id.map(|id| id.to_string());
+                let pending_cancel_receiver =
+                    client.register_pending_cancel_waiter(&client_order_id);
+                let target = match client
+                    .resolve_cancel_target(&client_order_id, venue_order_id.as_deref())
+                    .await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        drop(pending_cancel_receiver);
+                        client.remove_closed_pending_cancel_waiters(&client_order_id);
+                        let command_error = TbankCommandError::before_rpc(error);
                         tracing::error!(
-                            %error,
+                            %command_error,
                             %client_order_id,
-                            "failed to cancel T-Bank order"
+                            "failed to resolve T-Bank cancel target"
                         );
                         if matches!(
-                            classify_command_failure(&error),
-                            CommandFailure::VenueRejected(_)
+                            classify_command_failure(&command_error),
+                            CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
                         ) {
                             emitter.emit_order_cancel_rejected_event(
                                 cmd.strategy_id,
                                 cmd.instrument_id,
                                 cmd.client_order_id,
                                 cmd.venue_order_id,
-                                &error.to_string(),
+                                &command_error.to_string(),
                                 current_unix_nanos(),
                             );
-                        } else {
-                            match client.recover_ambiguous_cancel(identity).await {
-                                Ok(TbankCancelRecoveryOutcome::Canceled) => {
-                                    let ts_event = current_unix_nanos();
-                                    client.lifecycle_active.run_if_active(|| {
-                                        emitter.send_order_event(OrderEventAny::Canceled(
-                                            OrderCanceled::new(
-                                                cmd.trader_id,
-                                                cmd.strategy_id,
-                                                cmd.instrument_id,
-                                                cmd.client_order_id,
-                                                UUID4::new(),
-                                                ts_event,
-                                                ts_event,
-                                                true,
-                                                cmd.venue_order_id,
-                                                Some(account_id),
-                                                None,
-                                            ),
-                                        ));
-                                    });
-                                }
-                                Ok(TbankCancelRecoveryOutcome::Active) => {
-                                    client.lifecycle_active.run_if_active(|| {
-                                        emitter.emit_order_cancel_rejected_event(
+                        }
+                        return;
+                    }
+                };
+                let identity = match target {
+                    TbankCancelTarget::Ready(identity) => {
+                        drop(pending_cancel_receiver);
+                        client.remove_closed_pending_cancel_waiters(&client_order_id);
+                        identity
+                    }
+                    TbankCancelTarget::Pending {
+                        route,
+                        client_order_id: pending_client_order_id,
+                        owner,
+                    } => {
+                        if !owner {
+                            drop(pending_cancel_receiver);
+                            client.remove_closed_pending_cancel_waiters(&pending_client_order_id);
+                            tracing::debug!(
+                                client_order_id = %pending_client_order_id,
+                                route = ?route,
+                                "T-Bank cancel is already awaiting order identity"
+                            );
+                            return;
+                        }
+                        tracing::info!(
+                            client_order_id = %pending_client_order_id,
+                            route = ?route,
+                            "retaining admitted T-Bank cancel until broker order id is known"
+                        );
+                        match pending_cancel_receiver.await {
+                            Ok(Ok(identity)) => identity,
+                            Ok(Err(reason)) => {
+                                emitter.emit_order_cancel_rejected_event(
+                                    cmd.strategy_id,
+                                    cmd.instrument_id,
+                                    cmd.client_order_id,
+                                    cmd.venue_order_id,
+                                    &reason,
+                                    current_unix_nanos(),
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    %client_order_id,
+                                    "pending T-Bank cancel lost its identity continuation"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                };
+                if let Err(error) = client
+                    .cancel_resolved_broker_order_admitted(identity.clone())
+                    .await
+                {
+                    tracing::error!(
+                        %error,
+                        %client_order_id,
+                        "failed to cancel T-Bank order"
+                    );
+                    if matches!(
+                        classify_command_failure(&error),
+                        CommandFailure::VenueRejected(_)
+                    ) {
+                        emitter.emit_order_cancel_rejected_event(
+                            cmd.strategy_id,
+                            cmd.instrument_id,
+                            cmd.client_order_id,
+                            cmd.venue_order_id,
+                            &error.to_string(),
+                            current_unix_nanos(),
+                        );
+                    } else {
+                        match client.recover_ambiguous_cancel(identity).await {
+                            Ok(TbankCancelRecoveryOutcome::Canceled) => {
+                                let ts_event = current_unix_nanos();
+                                client.lifecycle_active.run_if_active(|| {
+                                    emitter.send_order_event(OrderEventAny::Canceled(
+                                        OrderCanceled::new(
+                                            cmd.trader_id,
                                             cmd.strategy_id,
                                             cmd.instrument_id,
                                             cmd.client_order_id,
+                                            UUID4::new(),
+                                            ts_event,
+                                            ts_event,
+                                            true,
                                             cmd.venue_order_id,
-                                            "broker reconciliation confirmed the order remains active",
-                                            current_unix_nanos(),
-                                        );
-                                    });
-                                }
-                                Err(recovery_error) => {
-                                    tracing::warn!(
-                                        %recovery_error,
-                                        %client_order_id,
-                                        "T-Bank cancel outcome recovery remained unresolved"
+                                            Some(account_id),
+                                            None,
+                                        ),
+                                    ));
+                                });
+                            }
+                            Ok(TbankCancelRecoveryOutcome::Active) => {
+                                client.lifecycle_active.run_if_active(|| {
+                                    emitter.emit_order_cancel_rejected_event(
+                                        cmd.strategy_id,
+                                        cmd.instrument_id,
+                                        cmd.client_order_id,
+                                        cmd.venue_order_id,
+                                        "broker reconciliation confirmed the order remains active",
+                                        current_unix_nanos(),
                                     );
-                                }
+                                });
+                            }
+                            Err(recovery_error) => {
+                                tracing::warn!(
+                                    %recovery_error,
+                                    %client_order_id,
+                                    "T-Bank cancel outcome recovery remained unresolved"
+                                );
                             }
                         }
                     }
                 }
-                TbankCancelTarget::Pending {
-                    route,
-                    client_order_id,
-                } => {
-                    tracing::info!(
-                        %client_order_id,
-                        route = ?route,
-                        "deferred T-Bank cancel until broker order id is known"
-                    );
-                }
-            }
-        })?;
+            })?;
         Ok(())
     }
 
@@ -995,26 +1061,29 @@ impl ExecutionClient for TbankExecutionClient {
         self.runtime.ensure_lifecycle_active()?;
         let mut client = self.runtime.clone();
         let emitter = self.runtime.emitter.clone();
-        self.runtime.spawn_read_only_command_task(async move {
-            let result = client
-                .query_order_status_report_by_ids(
-                    Some(cmd.client_order_id),
-                    cmd.venue_order_id,
-                    cmd.ts_init,
-                )
-                .await;
-            // Abort is asynchronous: the current poll may finish after reset. The generation
-            // gate prevents stale events; any earlier mapping touched only old reset-isolated Arcs.
-            match result {
-                Ok(Some(report)) => {
-                    client.lifecycle_active.run_if_active(|| {
-                        emitter.send_order_status_report(report);
-                    });
+        self.task_owner
+            .spawn_read_only_command_task(&self.runtime, "query_order", async move {
+                let result = client
+                    .query_order_status_report_by_ids(
+                        Some(cmd.client_order_id),
+                        cmd.venue_order_id,
+                        cmd.ts_init,
+                    )
+                    .await;
+                // Abort is asynchronous: the current poll may finish after reset. The generation
+                // gate prevents stale events; any earlier mapping touched only old reset-isolated Arcs.
+                match result {
+                    Ok(Some(report)) => {
+                        client.lifecycle_active.run_if_active(|| {
+                            emitter.send_order_status_report(report);
+                        });
+                    }
+                    Ok(None) => {
+                        tracing::warn!("T-Bank query order returned no order status report")
+                    }
+                    Err(error) => tracing::warn!(%error, "failed to query T-Bank order status"),
                 }
-                Ok(None) => tracing::warn!("T-Bank query order returned no order status report"),
-                Err(error) => tracing::warn!(%error, "failed to query T-Bank order status"),
-            }
-        })?;
+            })?;
         Ok(())
     }
 
@@ -1024,25 +1093,29 @@ impl ExecutionClient for TbankExecutionClient {
     ) -> anyhow::Result<()> {
         self.runtime.ensure_lifecycle_active()?;
         let mut client = self.runtime.clone();
-        self.runtime.spawn_read_only_command_task(async move {
-            let result = client.query_portfolio().await;
-            // See query_order: a stale generation may finish I/O after abort was requested.
-            match result {
-                Ok(portfolio) => match account_state_from_portfolio(&portfolio) {
-                    Ok(Some(state)) => {
-                        if let Some(Err(error)) = client
-                            .lifecycle_active
-                            .run_if_active(|| client.publish_account_state(state))
-                        {
-                            tracing::warn!(%error, "failed to publish T-Bank account state");
+        self.task_owner.spawn_read_only_command_task(
+            &self.runtime,
+            "query_account",
+            async move {
+                let result = client.query_portfolio().await;
+                // See query_order: a stale generation may finish I/O after abort was requested.
+                match result {
+                    Ok(portfolio) => match account_state_from_portfolio(&portfolio) {
+                        Ok(Some(state)) => {
+                            if let Some(Err(error)) = client
+                                .lifecycle_active
+                                .run_if_active(|| client.publish_account_state(state))
+                            {
+                                tracing::warn!(%error, "failed to publish T-Bank account state");
+                            }
                         }
-                    }
-                    Ok(None) => tracing::warn!("T-Bank portfolio has no total account value"),
-                    Err(error) => tracing::warn!(%error, "failed to map T-Bank account state"),
-                },
-                Err(error) => tracing::warn!(%error, "failed to query T-Bank account state"),
-            }
-        })?;
+                        Ok(None) => tracing::warn!("T-Bank portfolio has no total account value"),
+                        Err(error) => tracing::warn!(%error, "failed to map T-Bank account state"),
+                    },
+                    Err(error) => tracing::warn!(%error, "failed to query T-Bank account state"),
+                }
+            },
+        )?;
         Ok(())
     }
 
@@ -1052,11 +1125,17 @@ impl ExecutionClient for TbankExecutionClient {
     ) -> anyhow::Result<()> {
         self.runtime.ensure_lifecycle_active()?;
         let mut client = self.runtime.clone();
-        self.runtime.spawn_mutating_command_task(async move {
-            if let Err(error) = TbankExecutionRuntime::cancel_all_orders(&mut client).await {
-                tracing::error!(%error, "failed to cancel all T-Bank orders");
-            }
-        })?;
+        self.task_owner.spawn_mutating_command_task(
+            &self.runtime,
+            "cancel_all_orders",
+            async move {
+                if let Err(error) =
+                    TbankExecutionRuntime::cancel_all_orders_admitted(&mut client).await
+                {
+                    tracing::error!(%error, "failed to cancel all T-Bank orders");
+                }
+            },
+        )?;
         Ok(())
     }
 
