@@ -1,9 +1,9 @@
 use std::{env, fmt, time::Duration};
 
 use nautilus_common::factories::ClientConfig;
+use nautilus_core::string::secret::SecretString;
 use nautilus_live::config::LiveExecutionEngineConfig;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
 
 use crate::{
     common::{
@@ -21,8 +21,9 @@ pub struct TbankExecutionClientConfig {
     /// Broker environment.
     pub environment: TbankEnvironment,
     #[serde(skip_serializing)]
-    /// Optional API token; environment lookup is used when absent.
-    pub token: Option<String>,
+    /// Optional API token; use `Some(token.into())` for an existing `String` value. Environment
+    /// lookup is used when absent.
+    pub token: Option<SecretString>,
     #[serde(skip_serializing)]
     /// Optional broker account ID; environment lookup is used when absent.
     pub account_id: Option<String>,
@@ -136,13 +137,8 @@ impl TbankExecutionClientConfig {
     /// Resolves the API token from configuration or the environment.
     ///
     /// The returned allocation is zeroized when dropped.
-    pub fn resolve_token_secret(&self) -> Result<Zeroizing<String>> {
-        self.token
-            .clone()
-            .or_else(|| env::var(self.environment.token_env()).ok())
-            .filter(|token| !token.trim().is_empty())
-            .map(Zeroizing::new)
-            .ok_or(TbankAdapterError::MissingToken)
+    pub fn resolve_token_secret(&self) -> Result<SecretString> {
+        super::credentials::resolve_token_secret(self.token.as_ref(), self.environment)
     }
 
     /// Resolves the broker account ID from configuration or the environment.
@@ -163,7 +159,11 @@ impl TbankExecutionClientConfig {
     /// Validates the configuration.
     pub fn validate(&self) -> Result<()> {
         self.endpoint_uri()?;
-        self.resolve_token_secret()?;
+        super::credentials::validate_token_source(self.token.as_ref(), self.environment)?;
+        self.validate_settings()
+    }
+
+    pub(crate) fn validate_settings(&self) -> Result<()> {
         self.resolve_account_id()?;
         if self.account_registration_timeout.is_zero() {
             return Err(TbankAdapterError::ConfigError(
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn missing_account_id_is_error() {
         let config = TbankExecutionClientConfig {
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             ..TbankExecutionClientConfig::default()
         };
         assert!(matches!(
@@ -235,7 +235,7 @@ mod tests {
     fn live_submit_requires_explicit_allow_live_trading() {
         let config = TbankExecutionClientConfig {
             environment: TbankEnvironment::Live,
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             account_id: Some("account".to_string()),
             enable_trading: true,
             allow_live_trading: false,
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn sandbox_submit_requires_enable_trading() {
         let config = TbankExecutionClientConfig {
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             account_id: Some("account".to_string()),
             enable_trading: false,
             ..TbankExecutionClientConfig::default()
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn serialization_and_debug_omit_credentials() {
         let config = TbankExecutionClientConfig {
-            token: Some("secret-token".to_string()),
+            token: Some("secret-token".into()),
             account_id: Some("secret-account".to_string()),
             endpoint: Some("https://secret-endpoint@invest-public-api.tbank.ru".to_string()),
             ..TbankExecutionClientConfig::default()
@@ -278,6 +278,33 @@ mod tests {
         assert!(!debug.contains("secret-token"));
         assert!(!debug.contains("secret-account"));
         assert!(!debug.contains("secret-endpoint"));
+    }
+
+    #[test]
+    fn deserialize_accepts_token_string_and_debug_redacts_it() {
+        let config: TbankExecutionClientConfig =
+            serde_json::from_str(r#"{"token":"deserialized-secret"}"#).unwrap();
+
+        assert_eq!(
+            config.token.as_ref().unwrap().expose_secret(),
+            "deserialized-secret"
+        );
+        assert!(!format!("{config:?}").contains("deserialized-secret"));
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("deserialized-secret"));
+        assert!(!serialized.contains("token"));
+    }
+
+    #[test]
+    fn public_builder_accepts_secret_string_tokens() {
+        let config = TbankExecutionClientConfig::builder()
+            .token("builder-secret".into())
+            .build();
+
+        assert_eq!(
+            config.token.as_ref().unwrap().expose_secret(),
+            "builder-secret"
+        );
     }
 
     #[test]
@@ -307,7 +334,7 @@ mod tests {
             || {
                 let sandbox = TbankExecutionClientConfig::default();
                 assert_eq!(
-                    sandbox.resolve_token_secret().unwrap().as_str(),
+                    sandbox.resolve_token_secret().unwrap().expose_secret(),
                     "sandbox-env-secret"
                 );
 
@@ -316,10 +343,38 @@ mod tests {
                     ..TbankExecutionClientConfig::default()
                 };
                 assert_eq!(
-                    live.resolve_token_secret().unwrap().as_str(),
+                    live.resolve_token_secret().unwrap().expose_secret(),
                     "live-env-secret"
                 );
             },
         );
+    }
+
+    #[test]
+    fn explicit_token_takes_precedence_over_environment() {
+        with_env_vars(&[(SANDBOX_TOKEN_ENV, Some("sandbox-env-secret"))], || {
+            let config = TbankExecutionClientConfig {
+                token: Some("explicit-secret".into()),
+                ..TbankExecutionClientConfig::default()
+            };
+            assert_eq!(
+                config.resolve_token_secret().unwrap().expose_secret(),
+                "explicit-secret"
+            );
+        });
+    }
+
+    #[test]
+    fn empty_and_invalid_tokens_fail_without_echoing_values() {
+        for token in ["", "   ", "bad-é-token"] {
+            let config = TbankExecutionClientConfig {
+                token: Some(token.into()),
+                ..TbankExecutionClientConfig::default()
+            };
+            let error = config.resolve_token_secret().unwrap_err();
+            assert!(token.is_empty() || !error.to_string().contains(token));
+            assert!(token.is_empty() || !format!("{error:?}").contains(token));
+            assert!(token.is_empty() || !format!("{config:?}").contains(token));
+        }
     }
 }

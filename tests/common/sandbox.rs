@@ -4,7 +4,9 @@
     allow(dead_code, unused_imports)
 )]
 
-use std::{cell::RefCell, env, future::Future, panic::AssertUnwindSafe, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell, env, future::Future, panic::AssertUnwindSafe, rc::Rc, sync::Arc, time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::{FutureExt, StreamExt};
@@ -20,7 +22,7 @@ use nautilus_common::{
         },
     },
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{UUID4, UnixNanos, string::secret::SecretString};
 use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType},
@@ -105,7 +107,7 @@ fn execution_core(account_id: &str, cache: Rc<RefCell<Cache>>) -> ExecutionClien
 
 #[derive(Clone)]
 struct SandboxEnv {
-    token: String,
+    token: Arc<SecretString>,
     account_id: Option<String>,
     pay_in_rub: Option<Decimal>,
     instrument: InstrumentSpec,
@@ -149,14 +151,14 @@ impl SandboxEnv {
     fn from_instrument(instrument: InstrumentSpec) -> Result<Self> {
         assert_sandbox_endpoint()?;
 
-        let token = env::var(SANDBOX_TOKEN_ENV).map_err(|_| {
+        let token = SecretString::from(env::var(SANDBOX_TOKEN_ENV).map_err(|_| {
             anyhow!(
                 "missing required sandbox token env: token_present=false account_id_present={} endpoint_host=sandbox-invest-public-api.tbank.ru",
                 env::var_os(SANDBOX_ACCOUNT_ID_ENV).is_some()
             )
-        })?;
+        })?);
         ensure!(
-            !token.trim().is_empty(),
+            !token.expose_secret().trim().is_empty(),
             "sandbox token env is empty: token_present=false"
         );
 
@@ -164,7 +166,7 @@ impl SandboxEnv {
             .ok()
             .filter(|value| !value.trim().is_empty());
         Ok(Self {
-            token,
+            token: Arc::new(token),
             account_id,
             pay_in_rub: env_decimal(SANDBOX_PAY_IN_RUB_ENV)?,
             instrument,
@@ -263,7 +265,7 @@ fn split_ticker_class(value: &str) -> Result<(String, String)> {
 }
 
 async fn sandbox_clients(env: &SandboxEnv) -> Result<Clients> {
-    let interceptor = TbankAuthInterceptor::new(&env.token)?;
+    let interceptor = TbankAuthInterceptor::new(Arc::clone(&env.token))?;
     let channel = connect_sandbox_channel().await?;
     Ok(TbankGrpcClients::new(channel, interceptor))
 }
@@ -624,7 +626,7 @@ async fn sandbox_execution_client_with_trading(
         execution_core(account_id, cache.clone()),
         TbankExecutionClientConfig {
             environment: TbankEnvironment::Sandbox,
-            token: Some(env.token.clone()),
+            token: Some(env.token.as_ref().clone()),
             account_id: Some(account_id.to_string()),
             endpoint: Some(SANDBOX_ENDPOINT.to_string()),
             enable_trading,
@@ -2969,10 +2971,14 @@ fn ensure_eq_decimal_price(
 #[cfg(feature = "sandbox-tests")]
 #[test]
 fn sandbox_redaction_diagnostics_do_not_leak_token_or_metadata() -> Result<()> {
-    let token = "secret-sandbox-token";
-    let interceptor = TbankAuthInterceptor::new(token)?;
+    let token_value = "secret-sandbox-token";
+    let token = SecretString::from(token_value);
+    let interceptor = TbankAuthInterceptor::new(Arc::new(token.clone()))?;
     let debug = format!("{interceptor:?}");
-    ensure!(!debug.contains(token), "interceptor Debug leaked token");
+    ensure!(
+        !debug.contains(token_value),
+        "interceptor Debug leaked token"
+    );
     ensure!(
         !debug.contains("Bearer"),
         "interceptor Debug leaked bearer prefix"
@@ -2983,14 +2989,17 @@ fn sandbox_redaction_diagnostics_do_not_leak_token_or_metadata() -> Result<()> {
     );
 
     let env = SandboxEnv {
-        token: token.to_string(),
+        token: Arc::new(token),
         account_id: Some("sandbox-account".to_string()),
         pay_in_rub: None,
         instrument: InstrumentSpec::from_env()?,
     };
     let status = Status::unauthenticated("Bearer secret-sandbox-token Authorization metadata");
     let message = sanitize_status(&status, "UnitTest.Request", &env);
-    ensure!(!message.contains(token), "sanitized status leaked token");
+    ensure!(
+        !message.contains(token_value),
+        "sanitized status leaked token"
+    );
     ensure!(
         !message.contains("Bearer"),
         "sanitized status leaked bearer prefix"

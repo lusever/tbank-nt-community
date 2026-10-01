@@ -291,7 +291,7 @@ async fn execution_client_connect_and_disconnect_are_idempotent() {
     });
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -338,7 +338,7 @@ async fn admitted_submit_remains_owned_across_disconnect_and_reconnect() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -490,7 +490,7 @@ async fn query_account_returns_immediately_and_emits_account_state() {
     });
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -552,7 +552,7 @@ async fn connect_rolls_back_after_account_registration_timeout() {
     });
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         account_registration_timeout: std::time::Duration::from_millis(20),
@@ -702,7 +702,7 @@ async fn order_stream_reconnect_reconciles_before_consuming_reopened_events() {
     replace_exec_event_sender(sender);
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         reconnect_policy: crate::config::TbankReconnectPolicy {
@@ -840,7 +840,7 @@ async fn malformed_order_stream_event_is_rejected_without_reconnect() {
     replace_exec_event_sender(sender);
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         reconnect_policy: crate::config::TbankReconnectPolicy {
@@ -978,7 +978,7 @@ async fn explicit_broker_submit_rejection_emits_upstream_rejected_event() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -1097,7 +1097,7 @@ async fn rate_limited_submit_reconciles_instead_of_emitting_rejection() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -1152,7 +1152,7 @@ async fn successful_submit_emits_submitted_then_accepted_report() {
     });
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -1244,7 +1244,7 @@ async fn cancel_event_for_broker_error(code: Code) -> Option<ExecutionEvent> {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -1312,7 +1312,7 @@ async fn admitted_pending_cancel_survives_disconnect_and_reconnect() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -1512,7 +1512,7 @@ async fn exhausted_single_cancel_recovery_blocks_reset_until_known_outcome() {
     });
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         reconnect_policy: TbankReconnectPolicy {
@@ -1586,7 +1586,7 @@ async fn terminal_cancel_retry_reconciles_cancelled_state_and_clears_unknown_out
     });
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         reconnect_policy: TbankReconnectPolicy {
@@ -2010,7 +2010,7 @@ async fn submit_broker_permission_denied_returns_rejection_without_reconciliatio
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -2050,7 +2050,7 @@ async fn submit_response_without_order_id_is_outcome_unknown() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -2155,7 +2155,7 @@ async fn submit_response_partial_fill_returns_fallback_reports_without_polling()
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,

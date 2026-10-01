@@ -1,13 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fmt,
+    fmt,
     time::Duration,
 };
 
 use nautilus_common::factories::ClientConfig;
+use nautilus_core::string::secret::SecretString;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
 
 use crate::{
     common::{
@@ -45,8 +45,9 @@ pub struct TbankDataClientConfig {
     /// Broker environment.
     pub environment: TbankEnvironment,
     #[serde(skip_serializing)]
-    /// Optional API token; environment lookup is used when absent.
-    pub token: Option<String>,
+    /// Optional API token; use `Some(token.into())` for an existing `String` value. Environment
+    /// lookup is used when absent.
+    pub token: Option<SecretString>,
     /// Optional gRPC endpoint override.
     pub endpoint: Option<String>,
     #[builder(default = DEFAULT_REQUEST_TIMEOUT)]
@@ -180,19 +181,18 @@ impl TbankDataClientConfig {
     /// Resolves the API token from configuration or the environment.
     ///
     /// The returned allocation is zeroized when dropped.
-    pub fn resolve_token_secret(&self) -> Result<Zeroizing<String>> {
-        self.token
-            .clone()
-            .or_else(|| env::var(self.environment.token_env()).ok())
-            .filter(|token| !token.trim().is_empty())
-            .map(Zeroizing::new)
-            .ok_or(TbankAdapterError::MissingToken)
+    pub fn resolve_token_secret(&self) -> Result<SecretString> {
+        super::credentials::resolve_token_secret(self.token.as_ref(), self.environment)
     }
 
     /// Validates the configuration.
     pub fn validate(&self) -> Result<()> {
         self.endpoint_uri()?;
-        self.resolve_token_secret()?;
+        super::credentials::validate_token_source(self.token.as_ref(), self.environment)?;
+        self.validate_settings()
+    }
+
+    pub(crate) fn validate_settings(&self) -> Result<()> {
         if self.max_candle_instruments_per_stream == 0 {
             return Err(TbankAdapterError::ConfigError(
                 "max_candle_instruments_per_stream must be positive".to_string(),
@@ -273,6 +273,7 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     use crate::common::consts::{
         LIVE_ENDPOINT, LIVE_TOKEN_ENV, SANDBOX_ENDPOINT, SANDBOX_TOKEN_ENV,
@@ -384,10 +385,13 @@ mod tests {
             ],
             || {
                 let config = TbankDataClientConfig {
-                    token: Some("secret".to_string()),
+                    token: Some("secret".into()),
                     ..TbankDataClientConfig::default()
                 };
-                assert_eq!(config.resolve_token_secret().unwrap().as_str(), "secret");
+                assert_eq!(
+                    config.resolve_token_secret().unwrap().expose_secret(),
+                    "secret"
+                );
                 assert!(!format!("{config:?}").contains("secret"));
             },
         );
@@ -396,7 +400,7 @@ mod tests {
     #[test]
     fn serialization_omits_token() {
         let config = TbankDataClientConfig {
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             ..TbankDataClientConfig::default()
         };
 
@@ -407,9 +411,50 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_accepts_token_string_and_debug_redacts_it() {
+        let config: TbankDataClientConfig =
+            serde_json::from_str(r#"{"token":"deserialized-secret"}"#).unwrap();
+
+        assert_eq!(
+            config.token.as_ref().unwrap().expose_secret(),
+            "deserialized-secret"
+        );
+        assert!(!format!("{config:?}").contains("deserialized-secret"));
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("deserialized-secret"));
+        assert!(!serialized.contains("token"));
+    }
+
+    #[test]
+    fn public_builder_accepts_secret_string_tokens() {
+        let config = TbankDataClientConfig::builder()
+            .token("builder-secret".into())
+            .build();
+
+        assert_eq!(
+            config.token.as_ref().unwrap().expose_secret(),
+            "builder-secret"
+        );
+    }
+
+    #[test]
+    fn empty_and_invalid_tokens_fail_without_echoing_values() {
+        for token in ["", "   ", "bad-é-token"] {
+            let config = TbankDataClientConfig {
+                token: Some(token.into()),
+                ..TbankDataClientConfig::default()
+            };
+            let error = config.resolve_token_secret().unwrap_err();
+            assert!(token.is_empty() || !error.to_string().contains(token));
+            assert!(token.is_empty() || !format!("{error:?}").contains(token));
+            assert!(token.is_empty() || !format!("{config:?}").contains(token));
+        }
+    }
+
+    #[test]
     fn stream_idle_timeout_must_be_positive() {
         let config = TbankDataClientConfig {
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             market_data_stream_idle_timeout: Duration::ZERO,
             ..TbankDataClientConfig::default()
         };
@@ -424,7 +469,7 @@ mod tests {
     #[test]
     fn historical_candle_request_timeout_must_be_positive() {
         let config = TbankDataClientConfig {
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             historical_candle_request_timeout: Duration::ZERO,
             ..TbankDataClientConfig::default()
         };
@@ -439,7 +484,7 @@ mod tests {
     #[test]
     fn periodic_candle_poll_interval_must_be_positive_when_enabled() {
         let config = TbankDataClientConfig {
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             periodic_candle_poll_instrument_ids: HashSet::from(["index-uid".to_string()]),
             periodic_candle_poll_interval: Duration::ZERO,
             ..TbankDataClientConfig::default()
@@ -463,7 +508,7 @@ mod tests {
     #[test]
     fn indicative_definition_requires_explicit_known_currency() {
         let config = TbankDataClientConfig {
-            token: Some("secret".to_string()),
+            token: Some("secret".into()),
             indicative_instruments: HashMap::from([(
                 "IMOEX2.MOEX".to_string(),
                 TbankIndicativeInstrumentConfig {
@@ -491,7 +536,7 @@ mod tests {
             || {
                 let config = TbankDataClientConfig::default();
                 assert_eq!(
-                    config.resolve_token_secret().unwrap().as_str(),
+                    config.resolve_token_secret().unwrap().expose_secret(),
                     "sandbox-env-secret"
                 );
             },
@@ -511,7 +556,7 @@ mod tests {
                     ..TbankDataClientConfig::default()
                 };
                 assert_eq!(
-                    config.resolve_token_secret().unwrap().as_str(),
+                    config.resolve_token_secret().unwrap().expose_secret(),
                     "live-env-secret"
                 );
             },

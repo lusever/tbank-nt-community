@@ -3025,7 +3025,7 @@ async fn unary_order_report_keeps_canonical_stop_identity_for_child_alias() {
     metadata.instrument_uid = "sber-uid".to_string();
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3362,7 +3362,7 @@ async fn submit_market_live_calls_orders_service() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -3424,7 +3424,7 @@ async fn repeated_nautilus_submit_reuses_deterministic_broker_request_id() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -3511,7 +3511,7 @@ async fn generate_order_status_report_routes_known_stop_venue_order_id_to_stop_o
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3568,7 +3568,7 @@ async fn generate_order_status_report_recovers_stop_route_when_local_index_is_em
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3637,7 +3637,7 @@ async fn generate_order_status_report_resolves_executed_stop_child_after_restart
     let client_order_id = "524b1a03-efdd-4cd9-8c1d-a464e2c835a7";
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3726,7 +3726,7 @@ async fn generate_order_status_reports_recovers_old_stop_parent_before_window_fi
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3791,7 +3791,7 @@ async fn generate_order_status_report_routes_known_stop_request_id_to_stop_order
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3850,7 +3850,7 @@ async fn query_order_routes_known_stop_order_to_stop_orders_service() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3927,7 +3927,7 @@ async fn reconcile_order_by_request_id_maps_remote_open_order_to_accepted_report
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -4020,7 +4020,7 @@ async fn reconcile_order_by_request_id_maps_remote_fill_to_fill_report_once() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -4163,7 +4163,7 @@ async fn reconcile_order_by_request_id_emits_only_partial_fill_delta() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -4258,7 +4258,7 @@ async fn cancel_stop_order_live_calls_stop_orders_service() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         enable_trading: true,
@@ -4582,7 +4582,7 @@ async fn stop_order_cancel_route_recovers_from_broker_after_restart() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -4628,7 +4628,7 @@ async fn activated_stop_recovery_uses_order_request_id_without_exchange_order_id
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -4694,7 +4694,7 @@ async fn query_fills_pages_until_cursor_exhausted() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -4855,7 +4855,7 @@ async fn generate_fill_reports_returns_operation_history_trades() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -5115,7 +5115,7 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -5274,7 +5274,7 @@ async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()

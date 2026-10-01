@@ -109,7 +109,7 @@ mod tests {
     #[test]
     fn creates_client_with_requested_identity() {
         let config = TbankExecutionClientConfig {
-            token: Some("test-token".to_string()),
+            token: Some("test-token".into()),
             account_id: Some("account".to_string()),
             ..TbankExecutionClientConfig::default()
         };
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn rejects_invalid_config_before_creating_client() {
         let config = TbankExecutionClientConfig {
-            token: Some("test-token".to_string()),
+            token: Some("test-token".into()),
             account_id: Some("account".to_string()),
             endpoint: Some("http://example.com".to_string()),
             ..TbankExecutionClientConfig::default()

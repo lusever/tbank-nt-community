@@ -15,7 +15,7 @@ fn live_node_builds_with_tbank_factories_and_configs() {
     let endpoint = "http://127.0.0.1:1".to_string();
     let data_config = TbankDataClientConfig {
         environment: TbankEnvironment::Sandbox,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         endpoint: Some(endpoint.clone()),
         ..TbankDataClientConfig::default()
     };
@@ -27,7 +27,7 @@ fn live_node_builds_with_tbank_factories_and_configs() {
     };
     let execution_config = TbankExecutionClientConfig {
         environment: TbankEnvironment::Sandbox,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("test-account".to_string()),
         endpoint: Some(endpoint),
         ..TbankExecutionClientConfig::default()

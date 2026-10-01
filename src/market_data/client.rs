@@ -1,3 +1,4 @@
+use nautilus_core::string::secret::SecretString;
 use std::{
     any::Any,
     collections::{HashMap, HashSet, VecDeque},
@@ -21,7 +22,7 @@ use crate::{
         ids::{TbankInstrumentIdParts, instrument_id_from_ticker_class_for_venue},
         time::unix_nanos_to_timestamp,
     },
-    config::{TbankDataClientConfig, TbankIndicativeInstrumentConfig},
+    config::{TbankCredentialSource, TbankDataClientConfig, TbankIndicativeInstrumentConfig},
     grpc::{
         TbankAuthInterceptor, TbankGrpcClients, connect_channel,
         generated::{
@@ -974,16 +975,32 @@ fn commit_refreshed_instrument_catalogue(
     })
 }
 
-async fn refresh_published_instrument_catalogue(
-    config: &TbankDataClientConfig,
-    configured_stream_ids: &HashMap<String, String>,
-    resolved_stream_ids: &SharedInstrumentStreamIds,
-    instrument_metadata: &SharedInstrumentMetadata,
-    sender: &DataEventSender,
-    lifecycle: &SessionPublicationFence,
+struct InstrumentCatalogueRefreshContext<'a> {
+    config: &'a TbankDataClientConfig,
+    configured_stream_ids: &'a HashMap<String, String>,
+    credentials: Arc<SecretString>,
+    resolved_stream_ids: &'a SharedInstrumentStreamIds,
+    instrument_metadata: &'a SharedInstrumentMetadata,
+    sender: &'a DataEventSender,
+    lifecycle: &'a SessionPublicationFence,
     generation: u64,
+}
+
+async fn refresh_published_instrument_catalogue(
+    context: InstrumentCatalogueRefreshContext<'_>,
 ) -> Result<bool> {
-    let catalogue = load_resolved_instrument_catalogue(config, configured_stream_ids).await?;
+    let InstrumentCatalogueRefreshContext {
+        config,
+        configured_stream_ids,
+        credentials,
+        resolved_stream_ids,
+        instrument_metadata,
+        sender,
+        lifecycle,
+        generation,
+    } = context;
+    let catalogue =
+        load_resolved_instrument_catalogue(config, configured_stream_ids, credentials).await?;
 
     // Successful refreshes merge so a transient miss cannot remove an active route.
     commit_refreshed_instrument_catalogue(
@@ -999,12 +1016,13 @@ async fn refresh_published_instrument_catalogue(
 async fn load_resolved_instrument_catalogue(
     config: &TbankDataClientConfig,
     configured_stream_ids: &HashMap<String, String>,
+    credentials: Arc<SecretString>,
 ) -> Result<ResolvedInstrumentCatalogue> {
     // Keep provider selection tied to the immutable user configuration. Runtime stream routing
     // may contain auto-discovered shares after connect, but must never widen futures enrichment.
     let mut provider_config = config.clone();
     provider_config.instrument_stream_ids = configured_stream_ids.clone();
-    let mut provider = TbankInstrumentProvider::new(provider_config);
+    let mut provider = TbankInstrumentProvider::new_with_credentials(provider_config, credentials);
     provider
         .load_all_current(None)
         .await
@@ -1062,6 +1080,8 @@ fn resolve_instrument_metadata<'a>(
 pub struct TbankDataClient {
     client_id: ClientId,
     config: TbankDataClientConfig,
+    credential_source: TbankCredentialSource,
+    active_credentials: Option<Arc<SecretString>>,
     /// Captured from the Nautilus runner so session tasks can publish off-thread.
     data_event_sender: Option<DataEventSender>,
     /// The runtime map includes canonical broker UIDs discovered by the catalogue refresh.
@@ -1113,8 +1133,9 @@ pub struct TbankDataClient {
 
 impl TbankDataClient {
     /// Creates a new instance.
-    pub fn new(config: TbankDataClientConfig) -> Self {
+    pub fn new(mut config: TbankDataClientConfig) -> Self {
         register_tbank_market_data_custom_data();
+        let credential_source = TbankCredentialSource::take_from_config(&mut config.token);
         let resolved_instrument_stream_ids =
             Arc::new(RwLock::new(config.instrument_stream_ids.clone()));
         let historical_request_limiter =
@@ -1122,6 +1143,8 @@ impl TbankDataClient {
         Self {
             client_id: *TBANK_CLIENT_ID,
             config,
+            credential_source,
+            active_credentials: None,
             data_event_sender: try_get_data_event_sender(),
             resolved_instrument_stream_ids,
             subscriptions: TbankSubscriptionRegistry::default(),
@@ -1426,20 +1449,23 @@ impl TbankDataClient {
         if self.is_connected() {
             return Ok(());
         }
-        self.config.validate()?;
+        let endpoint = self.config.endpoint_uri()?;
+        let credentials = self.credential_source.resolve(self.config.environment)?;
+        self.config.validate_settings()?;
         let data_event_sender = required_data_event_sender(self.data_event_sender.clone())?;
         self.data_event_sender = Some(data_event_sender.clone());
         let replacing_clients = self.clients.is_some();
         self.prepare_session_generation()
             .await
             .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
-        let catalogue =
-            load_resolved_instrument_catalogue(&self.config, &self.config.instrument_stream_ids)
-                .await?;
-        let token = self.config.resolve_token_secret()?;
-        let endpoint = self.config.endpoint_uri()?;
+        let catalogue = load_resolved_instrument_catalogue(
+            &self.config,
+            &self.config.instrument_stream_ids,
+            Arc::clone(&credentials),
+        )
+        .await?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
-        let interceptor = TbankAuthInterceptor::new(&token)?;
+        let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
 
         let catalogue_generation = self.session_publication.advance();
         let session_publication = Arc::clone(&self.session_publication);
@@ -1478,6 +1504,7 @@ impl TbankDataClient {
             },
         );
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.active_credentials = Some(credentials);
         let setup_result = (|| -> anyhow::Result<()> {
             self.subscribe_instrument_updates();
             let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
@@ -1515,6 +1542,7 @@ impl TbankDataClient {
                         "{error}; setup rollback drain failed: {shutdown_error}"
                     ))
                 })?;
+            self.active_credentials = None;
             return Err(TbankAdapterError::ConfigError(error.to_string()));
         }
         setup_guard.disarm();
@@ -1537,6 +1565,7 @@ impl TbankDataClient {
     pub async fn disconnect_async(&mut self) -> anyhow::Result<()> {
         self.begin_background_shutdown("market data client disconnected", false);
         self.finish_session_tasks().await?;
+        self.active_credentials = None;
         tracing::info!("disconnected T-Bank data client");
         Ok(())
     }
@@ -1638,6 +1667,11 @@ impl TbankDataClient {
             return Ok(());
         }
         let config = self.config.clone();
+        let credentials = self
+            .active_credentials
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("data client credentials are not connected"))?;
         let configured_stream_ids = config.instrument_stream_ids.clone();
         let resolved_stream_ids = Arc::clone(&self.resolved_instrument_stream_ids);
         let instrument_metadata = Arc::clone(&self.instrument_metadata);
@@ -1652,16 +1686,18 @@ impl TbankDataClient {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if let Err(error) = refresh_published_instrument_catalogue(
-                    &config,
-                    &configured_stream_ids,
-                    &resolved_stream_ids,
-                    &instrument_metadata,
-                    &sender,
-                    &session_publication,
-                    generation,
-                )
-                .await
+                if let Err(error) =
+                    refresh_published_instrument_catalogue(InstrumentCatalogueRefreshContext {
+                        config: &config,
+                        configured_stream_ids: &configured_stream_ids,
+                        credentials: Arc::clone(&credentials),
+                        resolved_stream_ids: &resolved_stream_ids,
+                        instrument_metadata: &instrument_metadata,
+                        sender: &sender,
+                        lifecycle: &session_publication,
+                        generation,
+                    })
+                    .await
                 {
                     tracing::warn!(
                         %error,
@@ -2216,6 +2252,11 @@ impl TbankDataClient {
             self.bar_snapshot_active = true;
             let stream_market_data_client = market_data_client.clone();
             let stream_config = config.clone();
+            let stream_credentials = self
+                .active_credentials
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("data client credentials are not connected"))?;
             let stream_sender = sender.clone();
             let stream_instrument_metadata = instrument_metadata.clone();
             let stream_historical_request_limiter = historical_request_limiter.clone();
@@ -2239,6 +2280,7 @@ impl TbankDataClient {
                     request,
                     kind,
                     config: stream_config.clone(),
+                    credentials: Arc::clone(&stream_credentials),
                     historical_request_limiter: stream_historical_request_limiter.clone(),
                     instrument_metadata: stream_instrument_metadata.clone(),
                     task_key,
@@ -2355,6 +2397,11 @@ impl TbankDataClient {
         let sender = get_data_event_sender();
         self.stream_health.bind_event_sender(sender.clone());
         let config = self.config.clone();
+        let credentials = self
+            .active_credentials
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("data client credentials are not connected"))?;
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
         let message_sequence = self.message_sequence.clone();
@@ -2388,6 +2435,7 @@ impl TbankDataClient {
                 request,
                 kind: TbankStreamKind::Quotes { instrument_ids },
                 config: config.clone(),
+                credentials: Arc::clone(&credentials),
                 historical_request_limiter: historical_request_limiter.clone(),
                 instrument_metadata: instrument_metadata.clone(),
                 task_key: format!("quotes:generation:{generation}:group:{group_index}:depth1"),
@@ -2506,6 +2554,11 @@ impl TbankDataClient {
         let sender = get_data_event_sender();
         self.stream_health.bind_event_sender(sender.clone());
         let config = self.config.clone();
+        let credentials = self
+            .active_credentials
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("data client credentials are not connected"))?;
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
         let message_sequence = self.message_sequence.clone();
@@ -2517,6 +2570,7 @@ impl TbankDataClient {
             request,
             kind,
             config,
+            credentials,
             historical_request_limiter,
             instrument_metadata,
             task_key: task_key.clone(),
@@ -2833,6 +2887,7 @@ struct MarketDataStreamContext {
     request: MarketDataServerSideStreamRequest,
     kind: TbankStreamKind,
     config: TbankDataClientConfig,
+    credentials: Arc<SecretString>,
     historical_request_limiter: HistoricalRequestLimiter,
     instrument_metadata: SharedInstrumentMetadata,
     task_key: String,
@@ -2974,6 +3029,7 @@ fn run_market_data_stream_worker(
             mut request,
             mut kind,
             config,
+            credentials,
             historical_request_limiter,
             instrument_metadata,
             task_key,
@@ -3003,7 +3059,7 @@ fn run_market_data_stream_worker(
             {
                 return Err(StreamWorkerExit::RetryBudgetExhausted);
             }
-            match reconnect_market_data_clients(&config).await {
+            match reconnect_market_data_clients(&config, Arc::clone(&credentials)).await {
                 Ok((next_stream, next_data)) => {
                     market_data_stream = next_stream;
                     market_data_client = next_data;
@@ -3221,6 +3277,7 @@ fn run_market_data_stream_worker(
                                                             request: isolated_request,
                                                             kind: isolated_kind,
                                                             config: config.clone(),
+                                                            credentials: Arc::clone(&credentials),
                                                             historical_request_limiter:
                                                                 historical_request_limiter.clone(),
                                                             instrument_metadata:
@@ -3517,7 +3574,12 @@ fn run_market_data_stream_worker(
                                 if let Some(exit) = permanent_stream_status(&error) {
                                     return Err(exit);
                                 }
-                                match reconnect_market_data_clients(&config).await {
+                                match reconnect_market_data_clients(
+                                    &config,
+                                    Arc::clone(&credentials),
+                                )
+                                .await
+                                {
                                     Ok((next_stream, next_data)) => {
                                         market_data_stream = next_stream;
                                         market_data_client = next_data;
@@ -3553,7 +3615,12 @@ fn run_market_data_stream_worker(
                                         attempt,
                                     },
                                 );
-                                let trigger = match reconnect_market_data_clients(&config).await {
+                                let trigger = match reconnect_market_data_clients(
+                                    &config,
+                                    Arc::clone(&credentials),
+                                )
+                                .await
+                                {
                                     Ok((next_stream, next_data)) => {
                                         market_data_stream = next_stream;
                                         market_data_client = next_data;
@@ -3596,7 +3663,7 @@ fn run_market_data_stream_worker(
                     if let Some(exit) = permanent_stream_status(&error) {
                         return Err(exit);
                     }
-                    match reconnect_market_data_clients(&config).await {
+                    match reconnect_market_data_clients(&config, Arc::clone(&credentials)).await {
                         Ok((next_stream, next_data)) => {
                             market_data_stream = next_stream;
                             market_data_client = next_data;
@@ -3662,7 +3729,9 @@ fn run_market_data_stream_worker(
                     config.max_market_data_reconnect_attempts,
                 ))
                 .await;
-                if let Ok((next_stream, next_data)) = reconnect_market_data_clients(&config).await {
+                if let Ok((next_stream, next_data)) =
+                    reconnect_market_data_clients(&config, Arc::clone(&credentials)).await
+                {
                     market_data_stream = next_stream;
                     market_data_client = next_data;
                 }
@@ -4632,11 +4701,11 @@ fn filter_market_data_response_for_continuity(
 
 async fn reconnect_market_data_clients(
     config: &TbankDataClientConfig,
+    credentials: Arc<SecretString>,
 ) -> Result<(MarketDataStreamClient, MarketDataClient)> {
-    let token = config.resolve_token_secret()?;
     let endpoint = config.endpoint_uri()?;
     let channel = connect_channel(&endpoint, config.request_timeout).await?;
-    let interceptor = TbankAuthInterceptor::new(&token)?;
+    let interceptor = TbankAuthInterceptor::new(credentials)?;
     let clients = TbankGrpcClients::new(channel, interceptor);
     Ok((clients.market_data_stream, clients.market_data))
 }
@@ -5313,7 +5382,8 @@ mod tests {
         use nautilus_common::clients::DataClient;
 
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let interceptor =
+            TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
         client.clients = Some(TbankGrpcClients::new(channel, interceptor));
         client.bar_subscriptions.insert(sber_id(), sber_bar_type());
@@ -5354,7 +5424,8 @@ mod tests {
     #[tokio::test]
     async fn terminal_stream_health_is_not_reported_as_connected() {
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let interceptor =
+            TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
         client.clients = Some(TbankGrpcClients::new(channel, interceptor));
 
@@ -5850,9 +5921,11 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         nautilus_common::live::runner::replace_data_event_sender(sender);
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let interceptor =
+            TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
         client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        client.active_credentials = Some(Arc::new(SecretString::from("test-token")));
         client.start_snapshot_task_reaper().unwrap();
 
         client.quote_subscriptions.insert(sber_id());
@@ -5965,9 +6038,11 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         nautilus_common::live::runner::replace_data_event_sender(sender);
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let interceptor =
+            TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
         client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        client.active_credentials = Some(Arc::new(SecretString::from("test-token")));
         client.start_snapshot_task_reaper().unwrap();
         client.bar_subscriptions.insert(sber_id(), sber_bar_type());
 
@@ -6426,7 +6501,8 @@ mod tests {
     #[tokio::test]
     async fn reconnect_without_bar_watermark_does_not_fail_recovery() {
         let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let interceptor = TbankAuthInterceptor::new("test-token").unwrap();
+        let interceptor =
+            TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut market_data_client = TbankGrpcClients::new(channel, interceptor).market_data;
         let kind = TbankStreamKind::Bars {
             bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
@@ -6653,6 +6729,7 @@ mod tests {
             instrument_refresh_interval: Duration::from_secs(60 * 60),
             ..TbankDataClientConfig::default()
         });
+        enabled.active_credentials = Some(Arc::new(SecretString::from("test-token")));
         let spawner = enabled.session_tasks.spawner().unwrap();
         let (enabled_sender, _enabled_receiver) = tokio::sync::mpsc::unbounded_channel();
         enabled

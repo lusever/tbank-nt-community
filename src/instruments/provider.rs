@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use nautilus_common::providers::{InstrumentProvider, InstrumentStore};
+use nautilus_core::string::secret::SecretString;
 use nautilus_model::identifiers::InstrumentId;
 
 use crate::{
@@ -14,7 +16,7 @@ use crate::{
         consts::{SPBFUT_CLASS_CODE, TQBR_CLASS_CODE},
         venue::TbankVenue,
     },
-    config::{TbankDataClientConfig, TbankReconnectPolicy},
+    config::{TbankCredentialSource, TbankDataClientConfig, TbankReconnectPolicy},
     grpc::{
         TbankAuthInterceptor, TbankGrpcClients, connect_channel,
         generated::{
@@ -35,6 +37,7 @@ const FUTURES_MARGIN_MAX_RETRIES: u32 = 2;
 #[derive(Debug)]
 pub struct TbankInstrumentProvider {
     config: TbankDataClientConfig,
+    credential_source: TbankCredentialSource,
     store: InstrumentStore,
     mapper: TbankInstrumentMapper,
     market_data_metadata: HashMap<String, TbankMarketDataInstrumentMetadata>,
@@ -44,9 +47,26 @@ pub struct TbankInstrumentProvider {
 impl TbankInstrumentProvider {
     /// Creates a new instance.
     #[must_use]
-    pub fn new(config: TbankDataClientConfig) -> Self {
+    pub fn new(mut config: TbankDataClientConfig) -> Self {
+        let credential_source = TbankCredentialSource::take_from_config(&mut config.token);
+        Self::new_with_credential_source(config, credential_source)
+    }
+
+    pub(crate) fn new_with_credentials(
+        mut config: TbankDataClientConfig,
+        credentials: Arc<SecretString>,
+    ) -> Self {
+        config.token = None;
+        Self::new_with_credential_source(config, TbankCredentialSource::from_resolved(credentials))
+    }
+
+    fn new_with_credential_source(
+        config: TbankDataClientConfig,
+        credential_source: TbankCredentialSource,
+    ) -> Self {
         Self {
             config,
+            credential_source,
             store: InstrumentStore::new(),
             mapper: TbankInstrumentMapper::new(),
             market_data_metadata: HashMap::new(),
@@ -97,11 +117,11 @@ impl TbankInstrumentProvider {
     }
 
     async fn clients(&self) -> anyhow::Result<TbankGrpcClients<TbankAuthInterceptor>> {
-        self.config.validate()?;
         let endpoint = self.config.endpoint_uri()?;
-        let token = self.config.resolve_token_secret()?;
+        let credentials = self.credential_source.resolve(self.config.environment)?;
+        self.config.validate_settings()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
-        let interceptor = TbankAuthInterceptor::new(&token)?;
+        let interceptor = TbankAuthInterceptor::new(credentials)?;
         Ok(TbankGrpcClients::new(channel, interceptor))
     }
 
@@ -425,7 +445,8 @@ impl TbankInstrumentProvider {
             Self::configured_futures_for_catalogue(&self.config.instrument_stream_ids);
         // Build the replacement off to the side. The currently published catalog remains
         // usable if any later RPC, conversion, or instrument insertion fails.
-        let mut staged = Self::new(self.config.clone());
+        let mut staged =
+            Self::new_with_credential_source(self.config.clone(), self.credential_source.clone());
         {
             let response = clients
                 .instruments

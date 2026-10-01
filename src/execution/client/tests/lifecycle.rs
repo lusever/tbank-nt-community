@@ -150,6 +150,31 @@ fn test_client(config: TbankExecutionClientConfig) -> TbankExecutionClient {
     TbankExecutionClient::new(core, config)
 }
 
+#[test]
+fn admitted_recovery_runtime_keeps_shared_credentials_alive_after_disconnect_owner_drops() {
+    let token = "admitted-recovery-secret";
+    let mut client = test_client(TbankExecutionClientConfig {
+        token: Some(token.into()),
+        account_id: Some("account-1".to_string()),
+        ..TbankExecutionClientConfig::default()
+    });
+    assert!(client.runtime.config.token.is_none());
+
+    let credentials = client
+        .runtime
+        .credential_source
+        .resolve(client.runtime.config.environment)
+        .unwrap();
+    client.runtime.active_credentials = Some(Arc::clone(&credentials));
+    let admitted_recovery = client.runtime.detached_query_clone();
+    client.runtime.active_credentials = None;
+    drop(credentials);
+    drop(client);
+
+    let retained = admitted_recovery.active_credentials.as_ref().unwrap();
+    assert_eq!(retained.expose_secret(), token);
+}
+
 fn futures_margin_response() -> crate::grpc::generated::GetFuturesMarginResponse {
     crate::grpc::generated::GetFuturesMarginResponse {
         initial_margin_on_buy: Some(MoneyValue {
@@ -202,7 +227,7 @@ fn current_si_future() -> crate::grpc::generated::Future {
 fn live_query_client(endpoint: String) -> TbankExecutionClient {
     test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(endpoint),
         ..TbankExecutionClientConfig::default()
@@ -403,7 +428,7 @@ async fn dropping_execution_owner_preserves_admitted_operations_until_completion
 #[tokio::test]
 async fn old_session_spawner_cannot_spawn_after_reconnect() {
     let mut client = test_client(TbankExecutionClientConfig {
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         ..TbankExecutionClientConfig::default()
     });
@@ -2103,7 +2128,7 @@ async fn uncached_share_by_resolution_classifies_out_of_scope() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -2157,7 +2182,7 @@ async fn malformed_share_metadata_classifies_out_of_scope_without_retry() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -2696,7 +2721,7 @@ async fn reconnect_stop_query_keeps_active_orders_and_bounds_terminal_history() 
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -2756,7 +2781,7 @@ async fn unbounded_stop_query_recovers_from_response_limit_in_bounded_windows() 
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -2814,7 +2839,7 @@ async fn executed_stop_reconciliation_queries_missing_exchange_child() {
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()
@@ -3115,7 +3140,7 @@ async fn run_order_status_report_query_test(
 
     let mut client = test_client(TbankExecutionClientConfig {
         environment: TbankEnvironment::Live,
-        token: Some("test-token".to_string()),
+        token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
         endpoint: Some(format!("http://{addr}")),
         ..TbankExecutionClientConfig::default()

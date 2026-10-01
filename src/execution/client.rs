@@ -18,7 +18,7 @@ use crate::{
         time::unix_nanos_to_timestamp,
         venue::{TbankInstrumentType, TbankVenue},
     },
-    config::TbankExecutionClientConfig,
+    config::{TbankCredentialSource, TbankExecutionClientConfig},
     execution::{
         TbankExecutionService, TbankSubmitOrder, build_post_order_request,
         build_post_stop_order_request,
@@ -61,7 +61,9 @@ use nautilus_common::{
     messages::{DataEvent, execution::ExecutionReport},
     msgbus::{self, TypedHandler, switchboard},
 };
-use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{
+    Params, UUID4, UnixNanos, string::secret::SecretString, time::get_atomic_clock_realtime,
+};
 use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_live::{
     ExecutionEventEmitter,
@@ -179,6 +181,8 @@ struct TbankExecutionRuntime {
     client_id: ClientId,
     account_id: AccountId,
     pub config: TbankExecutionClientConfig,
+    credential_source: TbankCredentialSource,
+    active_credentials: Option<Arc<SecretString>>,
     clients: Option<TbankGrpcClients<TbankAuthInterceptor>>,
     connected: Arc<AtomicBool>,
     data_event_sender: Arc<Mutex<Option<TbankDataEventSender>>>,
@@ -1170,15 +1174,18 @@ impl Drop for TbankFuturesMarginFlightGuard {
 
 impl TbankExecutionRuntime {
     fn new(
-        config: TbankExecutionClientConfig,
+        mut config: TbankExecutionClientConfig,
         client_id: ClientId,
         account_id: AccountId,
         emitter: ExecutionEventEmitter,
     ) -> Self {
+        let credential_source = TbankCredentialSource::take_from_config(&mut config.token);
         Self {
             client_id,
             account_id,
             config,
+            credential_source,
+            active_credentials: None,
             clients: None,
             connected: Arc::new(AtomicBool::new(false)),
             data_event_sender: Arc::new(Mutex::new(try_get_data_event_sender())),
@@ -1423,6 +1430,8 @@ impl TbankExecutionRuntime {
         self.unresolved_trade_fills = Arc::new(Mutex::new(HashMap::new()));
         self.unresolved_cancellations = Arc::new(Mutex::new(HashSet::new()));
         self.pending_cancel_waiters = Arc::new(Mutex::new(HashMap::new()));
+        // TaskOwner calls reset only after session and admitted operation tasks have drained.
+        self.active_credentials = None;
         self.connected.store(false, Ordering::Release);
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(false));
     }
@@ -1477,12 +1486,13 @@ impl TbankExecutionRuntime {
         task_owner.prepare_operation_generation().await?;
         task_owner.prepare_session_generation(self).await?;
         self.clients = None;
-        self.config.validate()?;
-        let token = self.config.resolve_token_secret()?;
         let endpoint = self.config.endpoint_uri()?;
+        let credentials = self.credential_source.resolve(self.config.environment)?;
+        self.config.validate_settings()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
-        let interceptor = TbankAuthInterceptor::new(&token)?;
+        let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.active_credentials = Some(credentials);
         self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
         task_owner.connected_generation = true;
@@ -1530,12 +1540,13 @@ impl TbankExecutionRuntime {
         task_owner.prepare_operation_generation().await?;
         task_owner.prepare_session_generation(self).await?;
         self.clients = None;
-        self.config.validate()?;
-        let token = self.config.resolve_token_secret()?;
         let endpoint = self.config.endpoint_uri()?;
+        let credentials = self.credential_source.resolve(self.config.environment)?;
+        self.config.validate_settings()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
-        let interceptor = TbankAuthInterceptor::new(&token)?;
+        let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.active_credentials = Some(credentials);
         self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
         task_owner.connected_generation = true;
@@ -3720,6 +3731,8 @@ impl TbankExecutionRuntime {
             client_id: self.client_id,
             account_id: self.account_id,
             config: self.config.clone(),
+            credential_source: self.credential_source.clone(),
+            active_credentials: self.active_credentials.clone(),
             clients: self.clients.clone(),
             connected: self.connected.clone(),
             // Detached clones share the refreshable sender slot. Worker threads do not have

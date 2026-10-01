@@ -1,5 +1,8 @@
-use anyhow::{Context, bail};
+use std::sync::Arc;
+
+use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use nautilus_core::string::secret::SecretString;
 use tbank_nt_community::{
     common::consts::{
         ACCOUNT_ID_ENV, DEFAULT_REQUEST_TIMEOUT, LIVE_ENDPOINT, LIVE_TOKEN_ENV,
@@ -13,7 +16,6 @@ use tbank_nt_community::{
         with_timeout,
     },
 };
-use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
 #[command(about = "List T-Bank accounts available to the configured token")]
@@ -55,15 +57,12 @@ impl Environment {
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
-    let token = Zeroizing::new(
+    let token = SecretString::from(
         std::env::var(cli.environment.token_env())
             .with_context(|| format!("missing {}", cli.environment.token_env()))?,
     );
-    if token.trim().is_empty() {
-        bail!("{} is empty", cli.environment.token_env());
-    }
     let configured_account = std::env::var(cli.environment.configured_account_env()).ok();
-    let mut clients = clients(cli.environment.endpoint(), &token).await?;
+    let mut clients = clients(cli.environment.endpoint(), Arc::new(token)).await?;
     let request = GetAccountsRequest {
         status: Some(AccountStatus::Open as i32),
     };
@@ -102,12 +101,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn clients(
     endpoint: &str,
-    token: &str,
+    credentials: Arc<SecretString>,
 ) -> anyhow::Result<TbankGrpcClients<TbankAuthInterceptor>> {
     let channel = connect_channel(endpoint, DEFAULT_REQUEST_TIMEOUT)
         .await
         .with_context(|| format!("connect to T-Bank endpoint {endpoint}"))?;
-    let interceptor = TbankAuthInterceptor::new(token)?;
+    let interceptor = TbankAuthInterceptor::new(credentials)?;
     Ok(TbankGrpcClients::new(channel, interceptor))
 }
 

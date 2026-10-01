@@ -86,7 +86,7 @@ mod tests {
     fn creates_client_with_requested_identity() {
         let (cache, clock) = dependencies();
         let config = TbankDataClientConfig {
-            token: Some("test-token".to_string()),
+            token: Some("test-token".into()),
             ..TbankDataClientConfig::default()
         };
         let client = TbankDataClientFactory::new()
@@ -112,7 +112,7 @@ mod tests {
     fn rejects_invalid_config_before_creating_client() {
         let (cache, clock) = dependencies();
         let config = TbankDataClientConfig {
-            token: Some("test-token".to_string()),
+            token: Some("test-token".into()),
             endpoint: Some("http://example.com".to_string()),
             ..TbankDataClientConfig::default()
         };

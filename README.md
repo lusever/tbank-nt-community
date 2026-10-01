@@ -172,7 +172,12 @@ TBANK_SANDBOX_ACCOUNT_ID=...
 
 `TBANK_INVEST_TOKEN` — переменная окружения для токена рабочей среды.
 
-Секретные значения маскируются при сериализации конфигурации и в отладочном выводе.
+Поле `token` в `TbankDataClientConfig` и `TbankExecutionClientConfig` теперь имеет тип
+`Option<nautilus_core::string::secret::SecretString>`. При миграции struct literal замените
+`token: Some(token)` для обычного `String` на `token: Some(token.into())` (для строкового литерала
+также используйте `Some("...".into())`). Deserialize по-прежнему принимает JSON-строку. Конфигурации
+исключают токен из сериализации через `skip_serializing`, а `Debug` показывает только наличие токена;
+сам `SecretString` сериализуется открытым значением и не должен сериализоваться отдельно.
 
 ## Офлайн-валидация
 

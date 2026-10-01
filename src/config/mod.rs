@@ -1,9 +1,11 @@
 //! Configuration shared by data and execution clients.
 
+mod credentials;
 mod data;
 mod environment;
 mod execution;
 
+pub(crate) use credentials::TbankCredentialSource;
 pub use data::{TbankCandleTimestampMode, TbankDataClientConfig, TbankIndicativeInstrumentConfig};
 pub use environment::TbankEnvironment;
 pub use execution::TbankExecutionClientConfig;
