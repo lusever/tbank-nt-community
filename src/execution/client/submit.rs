@@ -672,7 +672,8 @@ pub(super) fn classify_command_failure(error: &TbankCommandError) -> CommandFail
         | TbankAdapterError::StopOrdersResponseLimitExceeded(_) => {
             CommandFailure::venue_rejected(error.to_string())
         }
-        TbankAdapterError::InstrumentNotFound(_)
+        TbankAdapterError::DataEventPublicationFailed(_)
+        | TbankAdapterError::InstrumentNotFound(_)
         | TbankAdapterError::InstrumentMetadataUnresolved(_)
         | TbankAdapterError::FuturesMarginUnresolved(_)
         | TbankAdapterError::SubmitOutcomeUnknown(_)

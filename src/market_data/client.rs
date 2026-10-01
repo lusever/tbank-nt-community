@@ -87,11 +87,18 @@ type MarketDataStreamClient =
     crate::grpc::generated::market_data_stream_service_client::MarketDataStreamServiceClient<
         tonic::codegen::InterceptedService<tonic::transport::Channel, TbankAuthInterceptor>,
     >;
+type DataEventSender = tokio::sync::mpsc::UnboundedSender<DataEvent>;
 
 const MAX_QUOTES_PER_STREAM: usize = 300;
 const MAX_PRE_ACK_MESSAGES: usize = 2_048;
 type SharedInstrumentMetadata = Arc<RwLock<HashMap<String, MarketDataInstrumentMetadata>>>;
 type SharedInstrumentStreamIds = Arc<RwLock<HashMap<String, String>>>;
+
+struct ResolvedInstrumentCatalogue {
+    definitions: Vec<InstrumentAny>,
+    stream_ids: HashMap<String, String>,
+    metadata: HashMap<String, MarketDataInstrumentMetadata>,
+}
 
 #[derive(Debug, Default)]
 struct SessionPublicationFence {
@@ -435,6 +442,22 @@ impl SessionPublicationFence {
         }
         publish();
         true
+    }
+
+    fn try_if_current(
+        &self,
+        generation: u64,
+        publish: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        let _gate = self
+            .publication_gate
+            .lock()
+            .expect("market-data session publication lock");
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Ok(false);
+        }
+        publish()?;
+        Ok(true)
     }
 }
 
@@ -909,15 +932,46 @@ fn quote_subscription_groups(
         .collect()
 }
 
-fn publish_instrument_definitions(instrument_provider: &TbankInstrumentProvider) {
-    let Some(sender) = try_get_data_event_sender() else {
-        return;
-    };
-    for instrument in instrument_provider.store().list_all() {
-        if let Err(error) = sender.send(DataEvent::Instrument(instrument.clone())) {
-            tracing::warn!(%error, "failed to publish T-Bank instrument definition");
-        }
+fn required_data_event_sender(cached_sender: Option<DataEventSender>) -> Result<DataEventSender> {
+    try_get_data_event_sender()
+        .or(cached_sender)
+        .ok_or_else(|| {
+            TbankAdapterError::DataEventPublicationFailed(
+                "Nautilus data-event sender is not initialized".to_string(),
+            )
+        })
+}
+
+fn publish_instrument_definitions(
+    instruments: impl IntoIterator<Item = InstrumentAny>,
+    sender: &DataEventSender,
+) -> Result<()> {
+    for instrument in instruments {
+        sender
+            .send(DataEvent::Instrument(instrument))
+            .map_err(|error| TbankAdapterError::DataEventPublicationFailed(error.to_string()))?;
     }
+    Ok(())
+}
+
+fn commit_refreshed_instrument_catalogue(
+    lifecycle: &SessionPublicationFence,
+    generation: u64,
+    sender: &DataEventSender,
+    catalogue: ResolvedInstrumentCatalogue,
+    resolved_stream_ids: &SharedInstrumentStreamIds,
+    instrument_metadata: &SharedInstrumentMetadata,
+) -> Result<bool> {
+    lifecycle.try_if_current(generation, || {
+        // The node must receive definitions before routes or decoder metadata expose them.
+        publish_instrument_definitions(catalogue.definitions, sender)?;
+        merge_resolved_instrument_stream_ids(resolved_stream_ids, catalogue.stream_ids);
+        instrument_metadata
+            .write()
+            .expect("market-data metadata lock")
+            .extend(catalogue.metadata);
+        Ok(())
+    })
 }
 
 async fn refresh_published_instrument_catalogue(
@@ -925,31 +979,27 @@ async fn refresh_published_instrument_catalogue(
     configured_stream_ids: &HashMap<String, String>,
     resolved_stream_ids: &SharedInstrumentStreamIds,
     instrument_metadata: &SharedInstrumentMetadata,
+    sender: &DataEventSender,
     lifecycle: &SessionPublicationFence,
     generation: u64,
 ) -> Result<bool> {
-    let (provider, refreshed_stream_ids, resolved_metadata) =
-        load_resolved_instrument_catalogue(config, configured_stream_ids).await?;
+    let catalogue = load_resolved_instrument_catalogue(config, configured_stream_ids).await?;
 
-    Ok(lifecycle.if_current(generation, || {
-        // Successful refreshes merge so a transient miss cannot remove an active route.
-        merge_resolved_instrument_stream_ids(resolved_stream_ids, refreshed_stream_ids);
-        instrument_metadata
-            .write()
-            .expect("market-data metadata lock")
-            .extend(resolved_metadata);
-        publish_instrument_definitions(&provider);
-    }))
+    // Successful refreshes merge so a transient miss cannot remove an active route.
+    commit_refreshed_instrument_catalogue(
+        lifecycle,
+        generation,
+        sender,
+        catalogue,
+        resolved_stream_ids,
+        instrument_metadata,
+    )
 }
 
 async fn load_resolved_instrument_catalogue(
     config: &TbankDataClientConfig,
     configured_stream_ids: &HashMap<String, String>,
-) -> Result<(
-    TbankInstrumentProvider,
-    HashMap<String, String>,
-    HashMap<String, MarketDataInstrumentMetadata>,
-)> {
+) -> Result<ResolvedInstrumentCatalogue> {
     // Keep provider selection tied to the immutable user configuration. Runtime stream routing
     // may contain auto-discovered shares after connect, but must never widen futures enrichment.
     let mut provider_config = config.clone();
@@ -965,7 +1015,11 @@ async fn load_resolved_instrument_catalogue(
         &config.indicative_instruments,
         provider.market_data_metadata(),
     )?;
-    Ok((provider, resolved_stream_ids, resolved_metadata))
+    Ok(ResolvedInstrumentCatalogue {
+        definitions: provider.store().list_all().into_iter().cloned().collect(),
+        stream_ids: resolved_stream_ids,
+        metadata: resolved_metadata,
+    })
 }
 
 fn resolve_instrument_metadata<'a>(
@@ -1008,6 +1062,8 @@ fn resolve_instrument_metadata<'a>(
 pub struct TbankDataClient {
     client_id: ClientId,
     config: TbankDataClientConfig,
+    /// Captured from the Nautilus runner so session tasks can publish off-thread.
+    data_event_sender: Option<DataEventSender>,
     /// The runtime map includes canonical broker UIDs discovered by the catalogue refresh.
     resolved_instrument_stream_ids: SharedInstrumentStreamIds,
     subscriptions: TbankSubscriptionRegistry,
@@ -1066,6 +1122,7 @@ impl TbankDataClient {
         Self {
             client_id: *TBANK_CLIENT_ID,
             config,
+            data_event_sender: try_get_data_event_sender(),
             resolved_instrument_stream_ids,
             subscriptions: TbankSubscriptionRegistry::default(),
             cache: None,
@@ -1369,21 +1426,43 @@ impl TbankDataClient {
         if self.is_connected() {
             return Ok(());
         }
+        self.config.validate()?;
+        let data_event_sender = required_data_event_sender(self.data_event_sender.clone())?;
+        self.data_event_sender = Some(data_event_sender.clone());
         let replacing_clients = self.clients.is_some();
         self.prepare_session_generation()
             .await
             .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
-        self.config.validate()?;
-        let (instrument_provider, instrument_stream_ids, instrument_metadata) =
+        let catalogue =
             load_resolved_instrument_catalogue(&self.config, &self.config.instrument_stream_ids)
                 .await?;
         let token = self.config.resolve_token_secret()?;
         let endpoint = self.config.endpoint_uri()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(&token)?;
+
+        let catalogue_generation = self.session_publication.advance();
+        let session_publication = Arc::clone(&self.session_publication);
+        let published = session_publication.try_if_current(catalogue_generation, || {
+            publish_instrument_definitions(catalogue.definitions, &data_event_sender)?;
+            *self
+                .resolved_instrument_stream_ids
+                .write()
+                .expect("market-data stream IDs lock") = catalogue.stream_ids;
+            *self
+                .instrument_metadata
+                .write()
+                .expect("market-data metadata lock") = catalogue.metadata;
+            Ok(())
+        })?;
+        if !published {
+            return Err(TbankAdapterError::DataEventPublicationFailed(
+                "connection generation changed before initial instrument publication".to_string(),
+            ));
+        }
+
         self.start_snapshot_task_reaper()
             .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
-
         let stream_health = Arc::clone(&self.stream_health);
         let setup_guard = TaskGroupGuard::new(
             &[
@@ -1398,25 +1477,15 @@ impl TbankDataClient {
                 );
             },
         );
-
-        let catalogue_generation = self.session_publication.advance();
-        let session_publication = Arc::clone(&self.session_publication);
-        session_publication.if_current(catalogue_generation, || {
-            *self
-                .resolved_instrument_stream_ids
-                .write()
-                .expect("market-data stream IDs lock") = instrument_stream_ids;
-            *self
-                .instrument_metadata
-                .write()
-                .expect("market-data metadata lock") = instrument_metadata;
-            publish_instrument_definitions(&instrument_provider);
-        });
         self.clients = Some(TbankGrpcClients::new(channel, interceptor));
         let setup_result = (|| -> anyhow::Result<()> {
             self.subscribe_instrument_updates();
             let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
-            self.schedule_instrument_refresh(&spawner, catalogue_generation)?;
+            self.schedule_instrument_refresh(
+                &spawner,
+                catalogue_generation,
+                data_event_sender.clone(),
+            )?;
             if should_restore_market_data_streams(
                 replacing_clients,
                 self.config.subscriptions_on_reconnect,
@@ -1559,6 +1628,7 @@ impl TbankDataClient {
         &mut self,
         spawner: &TaskSpawner,
         generation: u64,
+        data_event_sender: DataEventSender,
     ) -> anyhow::Result<()> {
         if let Some(task) = self.instrument_refresh_task.take() {
             task.cancel();
@@ -1572,6 +1642,7 @@ impl TbankDataClient {
         let resolved_stream_ids = Arc::clone(&self.resolved_instrument_stream_ids);
         let instrument_metadata = Arc::clone(&self.instrument_metadata);
         let session_publication = Arc::clone(&self.session_publication);
+        let sender = data_event_sender;
         let cancellation = TaskCancellation::new();
         let task_cancellation = cancellation.clone();
         let future = async move {
@@ -1586,6 +1657,7 @@ impl TbankDataClient {
                     &configured_stream_ids,
                     &resolved_stream_ids,
                     &instrument_metadata,
+                    &sender,
                     &session_publication,
                     generation,
                 )
@@ -5207,6 +5279,19 @@ mod tests {
         }
     }
 
+    fn test_resolved_catalogue(
+        stream_ids: HashMap<String, String>,
+        metadata: HashMap<String, MarketDataInstrumentMetadata>,
+    ) -> ResolvedInstrumentCatalogue {
+        ResolvedInstrumentCatalogue {
+            definitions: vec![InstrumentAny::CurrencyPair(
+                nautilus_model::instruments::stubs::audusd_sim(),
+            )],
+            stream_ids,
+            metadata,
+        }
+    }
+
     fn sber_bar_type() -> BarType {
         BarType::new(
             sber_id(),
@@ -5511,17 +5596,143 @@ mod tests {
     }
 
     #[test]
-    fn stale_catalogue_refresh_cannot_commit_or_publish_after_generation_advance() {
+    fn delayed_catalogue_refresh_cannot_publish_across_reconnect() {
         let lifecycle = SessionPublicationFence::default();
         let old_generation = lifecycle.advance();
-        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let old_commit = Arc::clone(&committed);
+        let (old_sender, old_receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(old_receiver);
+        let current_generation = lifecycle.advance();
+        let (current_sender, mut current_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let resolved_stream_ids = Arc::new(RwLock::new(HashMap::from([(
+            "SBER_TQBR.MOEX".to_string(),
+            "old-uid".to_string(),
+        )])));
+        let instrument_metadata = Arc::new(RwLock::new(HashMap::from([(
+            "SBER_TQBR.MOEX".to_string(),
+            MarketDataInstrumentMetadata {
+                lot_size: 1,
+                price_precision: 1,
+                preserve_instrument_id: false,
+            },
+        )])));
 
-        lifecycle.advance();
-        assert!(!lifecycle.if_current(old_generation, || {
-            old_commit.store(true, Ordering::Release);
-        }));
-        assert!(!committed.load(Ordering::Acquire));
+        assert!(
+            !commit_refreshed_instrument_catalogue(
+                &lifecycle,
+                old_generation,
+                &old_sender,
+                test_resolved_catalogue(
+                    HashMap::from([("SBER_TQBR.MOEX".to_string(), "stale-uid".to_string())]),
+                    HashMap::from([(
+                        "stale-uid".to_string(),
+                        MarketDataInstrumentMetadata {
+                            lot_size: 5,
+                            price_precision: 3,
+                            preserve_instrument_id: true,
+                        },
+                    )]),
+                ),
+                &resolved_stream_ids,
+                &instrument_metadata,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            resolved_stream_ids.read().unwrap()["SBER_TQBR.MOEX"],
+            "old-uid"
+        );
+        assert_eq!(
+            instrument_metadata.read().unwrap()["SBER_TQBR.MOEX"],
+            MarketDataInstrumentMetadata {
+                lot_size: 1,
+                price_precision: 1,
+                preserve_instrument_id: false,
+            }
+        );
+
+        assert!(
+            commit_refreshed_instrument_catalogue(
+                &lifecycle,
+                current_generation,
+                &current_sender,
+                test_resolved_catalogue(
+                    HashMap::from([("SBER_TQBR.MOEX".to_string(), "new-uid".to_string())]),
+                    HashMap::from([(
+                        "new-uid".to_string(),
+                        MarketDataInstrumentMetadata {
+                            lot_size: 10,
+                            price_precision: 2,
+                            preserve_instrument_id: true,
+                        },
+                    )]),
+                ),
+                &resolved_stream_ids,
+                &instrument_metadata,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            resolved_stream_ids.read().unwrap()["SBER_TQBR.MOEX"],
+            "new-uid"
+        );
+        assert!(instrument_metadata.read().unwrap()["new-uid"].preserve_instrument_id);
+        assert!(matches!(
+            current_receiver.try_recv(),
+            Ok(DataEvent::Instrument(_))
+        ));
+    }
+
+    #[test]
+    fn closed_catalogue_receiver_fails_without_committing_routes_or_metadata() {
+        let lifecycle = SessionPublicationFence::default();
+        let generation = lifecycle.advance();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        let resolved_stream_ids = Arc::new(RwLock::new(HashMap::from([(
+            "SBER_TQBR.MOEX".to_string(),
+            "old-uid".to_string(),
+        )])));
+        let initial_metadata = MarketDataInstrumentMetadata {
+            lot_size: 1,
+            price_precision: 1,
+            preserve_instrument_id: false,
+        };
+        let instrument_metadata = Arc::new(RwLock::new(HashMap::from([(
+            "SBER_TQBR.MOEX".to_string(),
+            initial_metadata,
+        )])));
+
+        let result = commit_refreshed_instrument_catalogue(
+            &lifecycle,
+            generation,
+            &sender,
+            test_resolved_catalogue(
+                HashMap::from([("SBER_TQBR.MOEX".to_string(), "new-uid".to_string())]),
+                HashMap::from([(
+                    "SBER_TQBR.MOEX".to_string(),
+                    MarketDataInstrumentMetadata {
+                        lot_size: 10,
+                        price_precision: 2,
+                        preserve_instrument_id: true,
+                    },
+                )]),
+            ),
+            &resolved_stream_ids,
+            &instrument_metadata,
+        );
+
+        assert!(matches!(
+            result,
+            Err(TbankAdapterError::DataEventPublicationFailed(_))
+        ));
+        assert_eq!(
+            resolved_stream_ids.read().unwrap()["SBER_TQBR.MOEX"],
+            "old-uid"
+        );
+        assert_eq!(
+            instrument_metadata.read().unwrap()["SBER_TQBR.MOEX"],
+            initial_metadata
+        );
     }
 
     #[tokio::test]
@@ -6432,7 +6643,10 @@ mod tests {
             ..TbankDataClientConfig::default()
         });
         let spawner = disabled.session_tasks.spawner().unwrap();
-        disabled.schedule_instrument_refresh(&spawner, 1).unwrap();
+        let (disabled_sender, _disabled_receiver) = tokio::sync::mpsc::unbounded_channel();
+        disabled
+            .schedule_instrument_refresh(&spawner, 1, disabled_sender)
+            .unwrap();
         assert!(disabled.instrument_refresh_task.is_none());
 
         let mut enabled = TbankDataClient::new(TbankDataClientConfig {
@@ -6440,7 +6654,10 @@ mod tests {
             ..TbankDataClientConfig::default()
         });
         let spawner = enabled.session_tasks.spawner().unwrap();
-        enabled.schedule_instrument_refresh(&spawner, 1).unwrap();
+        let (enabled_sender, _enabled_receiver) = tokio::sync::mpsc::unbounded_channel();
+        enabled
+            .schedule_instrument_refresh(&spawner, 1, enabled_sender)
+            .unwrap();
         let cancellation = enabled.instrument_refresh_task.clone().unwrap();
         enabled.disconnect();
         assert!(cancellation.is_cancelled());
@@ -6596,11 +6813,12 @@ mod tests {
     }
 
     #[test]
-    fn publishing_instruments_without_live_runner_is_a_noop() {
+    fn instrument_publication_requires_a_live_runner_sender() {
         assert!(try_get_data_event_sender().is_none());
-        let provider = TbankInstrumentProvider::new(TbankDataClientConfig::default());
-
-        publish_instrument_definitions(&provider);
+        assert!(matches!(
+            required_data_event_sender(None),
+            Err(TbankAdapterError::DataEventPublicationFailed(_))
+        ));
     }
 
     #[tokio::test]

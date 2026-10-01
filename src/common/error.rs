@@ -93,6 +93,9 @@ pub enum TbankAdapterError {
     /// A value could not be converted between broker and Nautilus representations.
     #[error("conversion error: {0}")]
     ConversionError(String),
+    /// A Nautilus data event could not be delivered to the live data engine.
+    #[error("data event publication failed: {0}")]
+    DataEventPublicationFailed(String),
     /// A mutating broker request may have been accepted, but its identity is unavailable.
     #[error("submit outcome unknown: {0}")]
     SubmitOutcomeUnknown(String),
