@@ -604,13 +604,6 @@ fn adapter_instrument(instrument: &InstrumentMeta) -> Result<TbankInstrumentMeta
     })
 }
 
-async fn sandbox_execution_client(
-    env: &SandboxEnv,
-    account_id: &str,
-) -> Result<SandboxExecutionHarness> {
-    sandbox_execution_client_with_trading(env, account_id, true).await
-}
-
 async fn sandbox_execution_client_with_trading(
     env: &SandboxEnv,
     account_id: &str,
@@ -633,28 +626,46 @@ async fn sandbox_execution_client_with_trading(
             ..TbankExecutionClientConfig::default()
         },
     );
-    ExecutionClient::start(&mut client)?;
-    let mut receiver = receiver;
-    let initial_account_state = {
-        // The production ExecutionEngine applies this event to the shared cache while connect
-        // waits for readiness. This direct-client harness must perform the same boundary step.
-        let connect = ExecutionClient::connect(&mut client);
-        tokio::pin!(connect);
-        loop {
-            tokio::select! {
-                result = &mut connect => {
-                    result?;
-                    bail!("execution client connected before publishing initial AccountState");
-                }
-                event = receiver.recv() => {
-                    let event = event.context("execution event channel closed during connect")?;
-                    if let ExecutionEvent::Account(state) = event {
-                        cache.borrow_mut().update_account_state(&state)?;
-                        connect.await?;
-                        break state;
+    let setup = AssertUnwindSafe(async {
+        ExecutionClient::start(&mut client)?;
+        let mut receiver = receiver;
+        let initial_account_state = {
+            // The production ExecutionEngine applies this event to the shared cache while connect
+            // waits for readiness. This direct-client harness must perform the same boundary step.
+            let connect = ExecutionClient::connect(&mut client);
+            tokio::pin!(connect);
+            loop {
+                tokio::select! {
+                    result = &mut connect => {
+                        result?;
+                        bail!("execution client connected before publishing initial AccountState");
+                    }
+                    event = receiver.recv() => {
+                        let event = event.context("execution event channel closed during connect")?;
+                        if let ExecutionEvent::Account(state) = event {
+                            cache.borrow_mut().update_account_state(&state)?;
+                            connect.await?;
+                            break state;
+                        }
                     }
                 }
             }
+        };
+        Ok::<_, anyhow::Error>((receiver, initial_account_state))
+    })
+    .catch_unwind()
+    .await;
+    let (receiver, initial_account_state) = match setup {
+        Ok(Ok(setup)) => setup,
+        Ok(Err(setup_error)) => {
+            let cleanup = disconnect_execution_client(&mut client).await;
+            return finish_with_cleanup(Ok(Err(setup_error)), cleanup).await;
+        }
+        Err(panic) => {
+            if let Err(cleanup_error) = disconnect_execution_client(&mut client).await {
+                eprintln!("execution client setup drain after panic failed: {cleanup_error:#}");
+            }
+            std::panic::resume_unwind(panic);
         }
     };
     Ok(SandboxExecutionHarness {
@@ -672,13 +683,69 @@ struct SandboxExecutionHarness {
     initial_account_state: AccountState,
 }
 
+#[derive(Default)]
+struct SandboxExecutionClients {
+    clients: Vec<SandboxExecutionHarness>,
+}
+
+impl SandboxExecutionClients {
+    async fn connect(
+        &mut self,
+        env: &SandboxEnv,
+        account_id: &str,
+        enable_trading: bool,
+    ) -> Result<&mut SandboxExecutionHarness> {
+        self.clients
+            .push(sandbox_execution_client_with_trading(env, account_id, enable_trading).await?);
+        Ok(self
+            .clients
+            .last_mut()
+            .expect("execution client was just added"))
+    }
+
+    async fn disconnect_all(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        for (index, client) in self.clients.iter_mut().enumerate().rev() {
+            if let Err(error) = client.disconnect().await {
+                errors.push(format!("client {index}: {error:#}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "failed to drain sandbox execution clients: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+}
+
+async fn disconnect_execution_client(client: &mut TbankExecutionClient) -> Result<()> {
+    let cleanup = AssertUnwindSafe(async {
+        ExecutionClient::disconnect(client).await?;
+        client.drain_mutating_operations().await.context(
+            "refusing sandbox mutation cleanup before admitted broker operations resolve",
+        )?;
+        ExecutionClient::dispose(client)
+            .context("refusing sandbox mutation cleanup before broker operations are resolved")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+    match cleanup {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("execution client drain or dispose panicked")),
+    }
+}
+
 impl SandboxExecutionHarness {
     async fn submit(&mut self, command: SubmitOrder) -> Result<NautilusSubmitOutcome> {
         submit_through_nautilus(&self.client, &mut self.events, command).await
     }
 
     async fn disconnect(&mut self) -> Result<()> {
-        ExecutionClient::disconnect(&mut self.client).await
+        disconnect_execution_client(&mut self.client).await
     }
 }
 
@@ -1677,6 +1744,18 @@ async fn finish_with_cleanup<T>(
     }
 }
 
+async fn cleanup_after_execution_drain<F>(execution_cleanup: Result<()>, cleanup: F) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    match execution_cleanup {
+        Ok(()) => cleanup.await,
+        Err(error) => Err(error.context(
+            "skipped follow-up sandbox mutations because execution-client mutations did not drain",
+        )),
+    }
+}
+
 fn subscription_status_name(status: i32) -> &'static str {
     match SubscriptionStatus::try_from(status) {
         Ok(value) => value.as_str_name(),
@@ -1862,10 +1941,18 @@ async fn post_market_order(
     lots: i64,
 ) -> Result<OrderStatusReport> {
     let metadata = adapter_instrument(instrument)?;
-    let mut execution = sandbox_execution_client(env, account_id)
-        .await
-        .context("connect execution client for sandbox market order")?;
-    submit_market_order_with_client(&mut execution, &metadata, direction, lots).await
+    let mut execution_clients = SandboxExecutionClients::default();
+    let body = AssertUnwindSafe(async {
+        let execution = execution_clients
+            .connect(env, account_id, true)
+            .await
+            .context("connect execution client for sandbox market order")?;
+        submit_market_order_with_client(execution, &metadata, direction, lots).await
+    })
+    .catch_unwind()
+    .await;
+    let cleanup = execution_clients.disconnect_all().await;
+    finish_with_cleanup(body, cleanup).await
 }
 
 async fn submit_market_order_with_client(
@@ -2141,13 +2228,22 @@ async fn sandbox_readonly() -> Result<()> {
             stop_orders.stop_orders.len()
         );
 
-        let execution = sandbox_execution_client_with_trading(&env, account_id, false)
-            .await
-            .context("connect read-only execution client")?;
-        ensure!(
-            execution.initial_account_state.account_id
-                == ExecutionClient::account_id(&execution.client)
-        );
+        let mut execution_clients = SandboxExecutionClients::default();
+        let body = AssertUnwindSafe(async {
+            let execution = execution_clients
+                .connect(&env, account_id, false)
+                .await
+                .context("connect read-only execution client")?;
+            ensure!(
+                execution.initial_account_state.account_id
+                    == ExecutionClient::account_id(&execution.client)
+            );
+            Ok(())
+        })
+        .catch_unwind()
+        .await;
+        let cleanup = execution_clients.disconnect_all().await;
+        finish_with_cleanup(body, cleanup).await?;
     }
 
     Ok(())
@@ -2165,6 +2261,7 @@ async fn sandbox_order_lifecycle() -> Result<()> {
         .context("account id required for sandbox order-lifecycle test")?;
     require_existing_sandbox_account(&env, &mut clients, &account_id).await?;
     let mut cleanup = CleanupGuard::new(env.clone(), clients.clone(), account_id.clone());
+    let mut execution_clients = SandboxExecutionClients::default();
 
     let body = AssertUnwindSafe(async {
         let instrument = load_instrument(&env, &mut clients).await?;
@@ -2180,7 +2277,8 @@ async fn sandbox_order_lifecycle() -> Result<()> {
             return Ok(());
         }
         let adapter_instrument = adapter_instrument(&instrument)?;
-        let mut execution = sandbox_execution_client(&env, &account_id)
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("connect initial execution client for limit order")?;
         let last_price = last_price(&env, &mut clients, &instrument.instrument_uid).await?;
@@ -2229,7 +2327,8 @@ async fn sandbox_order_lifecycle() -> Result<()> {
         );
 
         execution.disconnect().await?;
-        let execution = sandbox_execution_client(&env, &account_id)
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("reconnect execution client for limit-order recovery")?;
         let recovered = ExecutionClient::generate_order_status_report(
@@ -2257,8 +2356,10 @@ async fn sandbox_order_lifecycle() -> Result<()> {
             "cancelled limit order has unexpected state: {}",
             state.order_status
         );
+        execution.disconnect().await?;
 
-        let mut execution = sandbox_execution_client(&env, &account_id)
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("connect execution client for stop order")?;
 
@@ -2305,7 +2406,10 @@ async fn sandbox_order_lifecycle() -> Result<()> {
             },
         )
         .await?;
-        let mass_execution = sandbox_execution_client(&env, &account_id)
+        execution.disconnect().await?;
+
+        let mass_execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("connect execution client for mass-status recovery")?;
         wait_for_mass_order_report(&mass_execution.client, |reports| {
@@ -2316,12 +2420,14 @@ async fn sandbox_order_lifecycle() -> Result<()> {
             })
         })
         .await?;
+        mass_execution.disconnect().await?;
 
         Ok(())
     })
     .catch_unwind()
     .await;
-    let cleanup_result = cleanup.cleanup().await;
+    let execution_cleanup = execution_clients.disconnect_all().await;
+    let cleanup_result = cleanup_after_execution_drain(execution_cleanup, cleanup.cleanup()).await;
     finish_with_cleanup(body, cleanup_result).await
 }
 
@@ -2356,16 +2462,18 @@ async fn sandbox_market_fill() -> Result<()> {
     let before = sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
     let mut cleanup = MarketFillCleanupGuard::new(env.clone(), clients.clone(), account_id.clone());
     cleanup.track_position(instrument.clone(), before);
+    let mut execution_clients = SandboxExecutionClients::default();
 
     let body = AssertUnwindSafe(async {
         let adapter_instrument = adapter_instrument(&instrument)?;
-        let mut execution = sandbox_execution_client(&env, &account_id)
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("connect execution client for market-fill buy")?;
         let history_start = sandbox_fill_history_start();
         cleanup.arm();
         let buy = submit_market_order_with_client(
-            &mut execution,
+            execution,
             &adapter_instrument,
             OrderDirection::Buy,
             1,
@@ -2390,7 +2498,7 @@ async fn sandbox_market_fill() -> Result<()> {
     // adapter resolves that id only for trades the querying client observed itself. A separate
     // reporting client skips every operation it never saw, so the assertion below could not pass.
     let sell = submit_market_order_with_client(
-        &mut execution,
+        execution,
         &adapter_instrument,
         OrderDirection::Sell,
         1,
@@ -2452,7 +2560,8 @@ async fn sandbox_market_fill() -> Result<()> {
     })
     .catch_unwind()
     .await;
-    let cleanup_result = cleanup.cleanup().await;
+    let execution_cleanup = execution_clients.disconnect_all().await;
+    let cleanup_result = cleanup_after_execution_drain(execution_cleanup, cleanup.cleanup()).await;
     finish_with_cleanup(body, cleanup_result).await
 }
 
@@ -2500,41 +2609,49 @@ async fn sandbox_reconcile_residual_position() -> Result<()> {
         instrument.instrument_uid
     );
 
-    let mut execution = sandbox_execution_client(&env, &account_id)
-        .await
-        .context("connect execution client for residual reconciliation")?;
-    let current_residual =
-        sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
-    ensure!(
-        current_residual == expected_residual,
-        "refusing to repair a position that changed during preflight: expected={expected_residual} actual={current_residual} instrument_uid={}",
-        instrument.instrument_uid
-    );
-    let sell = submit_market_order_with_client(
-        &mut execution,
-        &adapter_instrument(&instrument)?,
-        OrderDirection::Sell,
-        residual / lot,
-    )
-    .await?;
-    ensure!(
-        sell.order_status == OrderStatus::Filled,
-        "residual reconciliation sell did not fill: status={} residual={residual} instrument_uid={}",
-        sell.order_status,
-        instrument.instrument_uid
-    );
+    let mut execution_clients = SandboxExecutionClients::default();
+    let body = AssertUnwindSafe(async {
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
+            .await
+            .context("connect execution client for residual reconciliation")?;
+        let current_residual =
+            sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
+        ensure!(
+            current_residual == expected_residual,
+            "refusing to repair a position that changed during preflight: expected={expected_residual} actual={current_residual} instrument_uid={}",
+            instrument.instrument_uid
+        );
+        let sell = submit_market_order_with_client(
+            execution,
+            &adapter_instrument(&instrument)?,
+            OrderDirection::Sell,
+            residual / lot,
+        )
+        .await?;
+        ensure!(
+            sell.order_status == OrderStatus::Filled,
+            "residual reconciliation sell did not fill: status={} residual={residual} instrument_uid={}",
+            sell.order_status,
+            instrument.instrument_uid
+        );
 
-    let after = sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
-    println!(
-        "reconciled {}: residual {residual} -> {after}",
-        instrument.instrument_uid
-    );
-    ensure!(
-        after == 0,
-        "residual reconciliation left a position behind: before={residual} after={after} instrument_uid={}",
-        instrument.instrument_uid
-    );
-    Ok(())
+        let after = sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
+        println!(
+            "reconciled {}: residual {residual} -> {after}",
+            instrument.instrument_uid
+        );
+        ensure!(
+            after == 0,
+            "residual reconciliation left a position behind: before={residual} after={after} instrument_uid={}",
+            instrument.instrument_uid
+        );
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    let cleanup = execution_clients.disconnect_all().await;
+    finish_with_cleanup(body, cleanup).await
 }
 
 #[cfg(all(feature = "sandbox-futures-tests", not(feature = "sandbox-tests")))]
@@ -2604,15 +2721,23 @@ async fn sandbox_futures_readonly() -> Result<()> {
         instrument_stop_count == 0,
         "futures read-only probe found active instrument stop orders: count={instrument_stop_count}"
     );
-    let mut execution = sandbox_execution_client_with_trading(&env, &account_id, false)
-        .await
-        .context("connect read-only futures execution client")?;
-    ensure!(
-        execution.initial_account_state.account_id
-            == ExecutionClient::account_id(&execution.client),
-        "futures read-only execution client account id mismatch"
-    );
-    execution.disconnect().await?;
+    let mut execution_clients = SandboxExecutionClients::default();
+    let body = AssertUnwindSafe(async {
+        let execution = execution_clients
+            .connect(&env, &account_id, false)
+            .await
+            .context("connect read-only futures execution client")?;
+        ensure!(
+            execution.initial_account_state.account_id
+                == ExecutionClient::account_id(&execution.client),
+            "futures read-only execution client account id mismatch"
+        );
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    let cleanup = execution_clients.disconnect_all().await;
+    finish_with_cleanup(body, cleanup).await?;
     Ok(())
 }
 
@@ -2661,16 +2786,18 @@ async fn sandbox_futures_market_fill() -> Result<()> {
     let before = sandbox_position_quantity(&env, &mut clients, &account_id, &instrument).await?;
     let mut cleanup = MarketFillCleanupGuard::new(env.clone(), clients.clone(), account_id.clone());
     cleanup.track_position(instrument.clone(), before);
+    let mut execution_clients = SandboxExecutionClients::default();
 
     let body = AssertUnwindSafe(async {
         let adapter_instrument = adapter_instrument(&instrument)?;
-        let mut execution = sandbox_execution_client(&env, &account_id)
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("connect execution client for futures market-fill buy")?;
         let history_start = sandbox_fill_history_start();
         cleanup.arm();
         let buy = submit_market_order_with_client(
-            &mut execution,
+            execution,
             &adapter_instrument,
             OrderDirection::Buy,
             1,
@@ -2694,7 +2821,7 @@ async fn sandbox_futures_market_fill() -> Result<()> {
         // Keep buy, sell, and history reconciliation on one client: operation trades omit broker
         // order IDs, so fill reports rely on the client's observed trade-to-order index.
         let sell = submit_market_order_with_client(
-            &mut execution,
+            execution,
             &adapter_instrument,
             OrderDirection::Sell,
             1,
@@ -2773,7 +2900,8 @@ async fn sandbox_futures_market_fill() -> Result<()> {
     })
     .catch_unwind()
     .await;
-    let cleanup_result = cleanup.cleanup().await;
+    let execution_cleanup = execution_clients.disconnect_all().await;
+    let cleanup_result = cleanup_after_execution_drain(execution_cleanup, cleanup.cleanup()).await;
     finish_with_cleanup(body, cleanup_result).await
 }
 
@@ -2830,10 +2958,12 @@ async fn sandbox_futures_stop_lifecycle() -> Result<()> {
     )?;
     let history_start = recent_history_start();
     let mut cleanup = CleanupGuard::new(env.clone(), clients.clone(), account_id.clone());
+    let mut execution_clients = SandboxExecutionClients::default();
 
     let body = AssertUnwindSafe(async {
         let adapter_instrument = adapter_instrument(&instrument)?;
-        let mut execution = sandbox_execution_client(&env, &account_id)
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("connect execution client for futures stop order")?;
         let submitted = execution
@@ -2887,7 +3017,8 @@ async fn sandbox_futures_stop_lifecycle() -> Result<()> {
         let venue_order_id = submitted.venue_order_id;
         execution.disconnect().await?;
 
-        let execution = sandbox_execution_client(&env, &account_id)
+        let execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("reconnect execution client for futures stop recovery")?;
         let recovered = ExecutionClient::generate_order_status_report(
@@ -2931,8 +3062,10 @@ async fn sandbox_futures_stop_lifecycle() -> Result<()> {
         )
         .await?;
         ensure!(!reports.is_empty());
+        execution.disconnect().await?;
 
-        let mass_execution = sandbox_execution_client(&env, &account_id)
+        let mass_execution = execution_clients
+            .connect(&env, &account_id, true)
             .await
             .context("connect execution client for futures stop mass-status recovery")?;
         wait_for_mass_order_report(&mass_execution.client, |reports| {
@@ -2946,12 +3079,14 @@ async fn sandbox_futures_stop_lifecycle() -> Result<()> {
             })
         })
         .await?;
+        mass_execution.disconnect().await?;
 
         Ok(())
     })
     .catch_unwind()
     .await;
-    let cleanup_result = cleanup.cleanup().await;
+    let execution_cleanup = execution_clients.disconnect_all().await;
+    let cleanup_result = cleanup_after_execution_drain(execution_cleanup, cleanup.cleanup()).await;
     finish_with_cleanup(body, cleanup_result).await
 }
 

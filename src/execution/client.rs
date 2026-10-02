@@ -717,6 +717,54 @@ impl TbankExecutionClient {
         result
     }
 
+    /// Waits for admitted broker mutations to finish after external command admission closes.
+    ///
+    /// The wait is bounded by the larger of the configured RPC timeout and submit recovery
+    /// budget. An incomplete task or unresolved broker outcome remains owned and is reported to
+    /// the caller; this method never cancels an admitted mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if command admission is open, the drain times out, or a mutation remains
+    /// unresolved after its task finishes.
+    pub async fn drain_mutating_operations(&self) -> anyhow::Result<()> {
+        if self
+            .task_owner
+            .external_admission_open
+            .load(Ordering::Acquire)
+        {
+            anyhow::bail!("cannot drain T-Bank mutations while command admission is open");
+        }
+
+        let drain_timeout = self
+            .runtime
+            .config
+            .request_timeout
+            .max(submit_outcome_recovery_budget(&self.runtime.config));
+        let drain = tokio::time::timeout(drain_timeout, async {
+            while !self.task_owner.operation_tasks.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if drain.is_err() {
+            anyhow::bail!(
+                "timed out after {} ms waiting for {} admitted T-Bank broker mutation task(s)",
+                drain_timeout.as_millis(),
+                self.task_owner.operation_tasks.len()
+            );
+        }
+
+        if self.runtime.has_unresolved_mutation_outcomes() {
+            anyhow::bail!(
+                "T-Bank broker mutation tasks drained with unresolved outcomes (unresolved_submits={})",
+                self.unresolved_submits().len()
+            );
+        }
+
+        Ok(())
+    }
+
     /// Returns whether the client is connected.
     #[must_use]
     pub fn is_connected(&self) -> bool {
