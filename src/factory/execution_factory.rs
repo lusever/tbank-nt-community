@@ -80,7 +80,7 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
 mod tests {
     use super::*;
 
-    use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_common::{cache::Cache, clock::VirtualClock};
     use nautilus_model::identifiers::ClientId;
     use std::{cell::RefCell, rc::Rc};
 
@@ -103,7 +103,7 @@ mod tests {
     }
 
     fn clock() -> Rc<RefCell<dyn Clock>> {
-        Rc::new(RefCell::new(TestClock::new()))
+        Rc::new(RefCell::new(VirtualClock::new()))
     }
 
     #[test]

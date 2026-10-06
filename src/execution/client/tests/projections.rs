@@ -536,6 +536,7 @@ fn activated_stop_child_keeps_stop_identity_and_uses_regular_cancel_route() {
     .unwrap();
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
     let fill = project_managed_trade_fill_report(
         &broker_order_index,
         &fill_projection,
@@ -1356,6 +1357,7 @@ async fn duplicate_reported_commission_updates_provenance_without_replaying_fill
     );
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     let make_fill = |commission: TbankFillCommission, source: TbankFillCommissionSource| {
         let report = FillReport::new(
@@ -1481,6 +1483,7 @@ fn unavailable_trade_provenance_channel_does_not_block_fill_projection() {
 
     let (closed_sender, closed_receiver) = tokio::sync::mpsc::unbounded_channel();
     drop(closed_receiver);
+    let closed_sender = closed_sender.into();
     let separate_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let projected = project_managed_trade_fill_report(
         &broker_order_index,
@@ -1608,6 +1611,7 @@ fn cumulative_commission_stays_unknown_when_an_earlier_fill_has_unknown_provenan
         TbankFillCommissionSource::OrderStateStream,
     );
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
     assert!(
         project_managed_trade_fill_report(
             &broker_order_index,
@@ -2026,6 +2030,7 @@ fn reported_operation_commission_corrects_an_emitted_synthetic_fill() {
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     project_cumulative_order_fill(
         &fill_projection,
@@ -2093,6 +2098,7 @@ fn partially_matched_operation_commission_allocates_the_published_residual() {
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     project_cumulative_order_fill(
         &fill_projection,
@@ -2187,6 +2193,7 @@ fn partially_matched_operation_commission_reserves_known_synthetic_fee() {
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
     let known_synthetic_commission = Money::from("0.01 RUB");
 
     project_cumulative_order_fill(
@@ -2262,6 +2269,7 @@ fn synthetic_commission_correction_allocates_minor_units_without_negative_residu
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     for quantity in 1..=5 {
         project_cumulative_order_fill(
@@ -2401,6 +2409,7 @@ fn allocated_operation_commissions_resolve_later_cumulative_fill() {
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
     let allocated_commissions = super::allocate_operation_commission(
         TbankFillCommission::Reported(Money::from("1 RUB")),
         &[Decimal::ONE, Decimal::ONE],
@@ -2464,6 +2473,7 @@ fn reported_operation_commission_upgrades_exact_allocated_synthetic_fill() {
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     let synthetic = project_cumulative_order_fill(
         &fill_projection,
@@ -2552,6 +2562,7 @@ fn split_operation_commissions_accumulate_on_one_synthetic_fill() {
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     project_cumulative_order_fill(
         &fill_projection,
@@ -2646,6 +2657,7 @@ fn partially_matched_operation_commission_keeps_residual_unknown_for_later_snaps
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     project_cumulative_order_fill(
         &fill_projection,
@@ -2713,6 +2725,7 @@ fn repeated_cumulative_snapshot_resolves_a_partially_matched_operation_commissio
     let broker_order_index = Arc::new(Mutex::new(TbankBrokerOrderIndex::default()));
     let fill_projection = Arc::new(Mutex::new(TbankFillProjection::default()));
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sender = sender.into();
 
     project_cumulative_order_fill(
         &fill_projection,

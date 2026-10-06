@@ -607,6 +607,10 @@ impl ExecutionClient for TbankExecutionClient {
         self.core.oms_type
     }
 
+    fn retain_unresolved_submissions(&self) -> bool {
+        true
+    }
+
     fn get_account(&self) -> Option<AccountAny> {
         self.core.cache().account_owned(&self.core.account_id)
     }
@@ -1157,16 +1161,22 @@ impl ExecutionClient for TbankExecutionClient {
 
     fn cancel_all_orders(
         &self,
-        _cmd: nautilus_common::messages::execution::CancelAllOrders,
+        cmd: nautilus_common::messages::execution::CancelAllOrders,
     ) -> anyhow::Result<()> {
         self.runtime.ensure_lifecycle_active()?;
         let mut client = self.runtime.clone();
+        let instrument_id = cmd.instrument_id;
+        let order_side = cmd.order_side;
         self.task_owner.spawn_mutating_command_task(
             &self.runtime,
             "cancel_all_orders",
             async move {
-                if let Err(error) =
-                    TbankExecutionRuntime::cancel_all_orders_admitted(&mut client).await
+                if let Err(error) = TbankExecutionRuntime::cancel_all_orders_admitted(
+                    &mut client,
+                    instrument_id,
+                    order_side,
+                )
+                .await
                 {
                     tracing::error!(%error, "failed to cancel all T-Bank orders");
                 }

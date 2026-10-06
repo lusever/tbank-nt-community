@@ -1,7 +1,7 @@
 # T-Bank adapter capability matrix
 
-This matrix describes the public behavior of `tbank-nt-community` `0.2.x` with NautilusTrader
-`v1.231.0`.
+This matrix describes the public behavior of `tbank-nt-community` `0.3.1` with NautilusTrader
+`v2.0.0rc6`.
 
 ## Instruments and data
 
@@ -12,7 +12,7 @@ This matrix describes the public behavior of `tbank-nt-community` `0.2.x` with N
 | MOEX futures | Supported | Canonical ID: `{ticker}_{class_code}.MOEX`; Nautilus `FuturesContract`, points pricing, expiry and contract multiplier |
 | Instrument discovery | Supported | Supported shares and futures are loaded during `DataClient::connect`; standard instrument filters can narrow requests |
 | Live quotes and trades | Supported | T-Bank market-data streams; quote subscriptions are chunked to 300 instruments per stream and prices use canonical instrument precision |
-| Order book snapshots | Supported | Snapshot semantics; native venue deltas are unavailable |
+| Order book snapshots | Supported | `SubscribeBookDepth`; supports T-Bank depths 1, 10, 20, 30, 40, and 50 levels; defaults to 10; native venue deltas are unavailable |
 | External bars | Supported | Sparse streamed candles; pre-ACK data is buffered, an acknowledged stream opens before startup/reconnect `GetCandles` recovery, and all recovery shares one request limiter |
 | Historical bars | Supported | `RequestBars` on the main data client; requests are chunked |
 | Historical trades | Limited | `RequestTrades` on the main data client; T-Bank guarantees only the recent `GetLastTrades` window |
@@ -54,7 +54,7 @@ rejected locally. Live order submission requires both `enable_trading = true` an
 | Contingent OCO/OTO/OUO lists | Not supported | The complete list is denied locally; no leg is sent to T-Bank |
 | `ModifyOrder` | Not supported | Emits modify-rejected; cancel and submit a replacement |
 | `CancelOrder` | Supported | Resolves the canonical broker route before cancellation |
-| `CancelAllOrders` / `BatchCancelOrders` | Supported | Cancels the resolved open-order set |
+| `CancelAllOrders` / `BatchCancelOrders` | Supported | `CancelAllOrders` is scoped to its instrument and optional side across regular and stop orders |
 | Order/fill/position reports | Supported | Query-backed reports and reconnect reconciliation |
 
 Futures quantities are contracts in Nautilus and whole broker lots at the transport boundary.

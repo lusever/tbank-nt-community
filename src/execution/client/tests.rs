@@ -7,7 +7,7 @@ fn bind_test_data_event_sender(
     *runtime
         .data_event_sender
         .lock()
-        .expect("data_event_sender lock") = Some(sender);
+        .expect("data_event_sender lock") = Some(sender.into());
     receiver
 }
 
