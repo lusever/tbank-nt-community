@@ -1199,13 +1199,33 @@ impl TbankExecutionRuntime {
         tracing::info!("disconnected T-Bank execution client");
     }
 
-    async fn disconnect_async(&mut self) {
+    async fn disconnect_async(&mut self) -> anyhow::Result<()> {
         let tasks = self.abort_background_tasks();
         self.clients = None;
         for task in tasks {
             let _ = task.await;
         }
+
+        loop {
+            let has_pending_mutations = {
+                let mut tasks = self.command_tasks.lock().expect("command_tasks lock");
+                tasks.retain(|task| !task.handle.is_finished());
+                !tasks.is_empty()
+            };
+            if !has_pending_mutations {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if self.has_unresolved_mutation_outcomes() {
+            anyhow::bail!(
+                "T-Bank execution client disconnected with unresolved broker mutation outcomes"
+            );
+        }
+
         tracing::info!("disconnected T-Bank execution client");
+        Ok(())
     }
 
     /// Returns whether the client is connected.

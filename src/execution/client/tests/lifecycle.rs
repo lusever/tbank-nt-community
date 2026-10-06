@@ -1154,6 +1154,71 @@ fn reset_and_dispose_refuse_while_mutating_command_is_in_flight() {
     assert!(client.runtime.instruments.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn async_disconnect_waits_for_mutations_and_reports_unresolved_outcomes() {
+    let mut client = test_client(TbankExecutionClientConfig::default());
+    activate_test_lifecycle(&client);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    client
+        .runtime
+        .spawn_mutating_command_task(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            let _ = completed_tx.send(());
+        })
+        .unwrap();
+    started_rx.await.expect("mutating command did not start");
+
+    let disconnect = client.runtime.disconnect_async();
+    tokio::pin!(disconnect);
+    let early_result = tokio::select! {
+        result = &mut disconnect => Some(result),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => None,
+    };
+    release_tx.send(()).expect("mutating command was dropped");
+    completed_rx
+        .await
+        .expect("mutating command did not complete after release");
+    assert!(early_result.is_none(), "disconnect returned before mutation finished");
+    disconnect.await.unwrap();
+
+    let mut unresolved = test_client(TbankExecutionClientConfig {
+        account_id: Some("account-1".to_string()),
+        ..TbankExecutionClientConfig::default()
+    });
+    activate_test_lifecycle(&unresolved);
+    let order = TbankSubmitOrder {
+        instrument_id: "SBER_TQBR.MOEX".to_string(),
+        client_order_id: "uncertain-order".to_string(),
+        broker_request_id: "uncertain-request".to_string(),
+        side: TbankOrderSide::Buy,
+        order_type: TbankOrderType::Market,
+        time_in_force: TimeInForce::Day,
+        quantity_units: Decimal::ONE,
+        limit_price: None,
+        trigger_price: None,
+        trailing: None,
+        confirm_margin_trade: false,
+    };
+    unresolved
+        .runtime
+        .record_pending_submit(&order, UnixNanos::from(1_u64));
+    unresolved.runtime.mark_pending_submit_stage(
+        "uncertain-order",
+        TbankPendingSubmitStage::Unknown,
+        None,
+    );
+
+    let error = unresolved
+        .runtime
+        .disconnect_async()
+        .await
+        .expect_err("unresolved broker mutation must make shutdown fail");
+    assert!(error.to_string().contains("unresolved broker mutation outcomes"));
+}
+
 #[test]
 fn broker_report_wins_race_with_inconclusive_submit_lookup() {
     let client = test_client(TbankExecutionClientConfig::default());

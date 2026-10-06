@@ -686,9 +686,9 @@ impl ExecutionClient for TbankExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.runtime.disconnect_async().await;
+        let result = self.runtime.disconnect_async().await;
         self.core.set_disconnected();
-        Ok(())
+        result
     }
 
     fn submit_order(
