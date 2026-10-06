@@ -4375,6 +4375,7 @@ fn closed_cumulative_provenance_channel_does_not_block_fill_projection() {
 
     let (closed_sender, closed_receiver) = tokio::sync::mpsc::unbounded_channel();
     drop(closed_receiver);
+    let closed_sender = closed_sender.into();
     let fill = client
         .runtime
         .project_order_status_fill_report_and_publish(

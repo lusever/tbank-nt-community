@@ -19,7 +19,7 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-pub(crate) type TbankDataEventSender = tokio::sync::mpsc::UnboundedSender<DataEvent>;
+pub(crate) type TbankDataEventSender = nautilus_common::live::sender::EventSender<DataEvent>;
 
 /// The adapter path that produced a fill report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

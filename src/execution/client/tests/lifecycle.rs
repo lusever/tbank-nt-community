@@ -264,6 +264,135 @@ fn seed_sber_metadata(client: &mut TbankExecutionClient) {
         .insert(metadata.instrument_id.clone(), metadata);
 }
 
+#[test]
+fn cancel_all_scope_filters_instrument_and_side_for_regular_and_stop_orders() {
+    let mut sber = sber_metadata();
+    sber.instrument_uid = "sber-uid".to_string();
+    let mut gazp = sber.clone();
+    gazp.instrument_id = "GAZP_TQBR.MOEX".to_string();
+    gazp.ticker = "GAZP".to_string();
+    gazp.figi = "BBG004730RP0".to_string();
+    gazp.instrument_uid = "gazp-uid".to_string();
+    let known_instruments = vec![sber.clone(), gazp.clone()];
+
+    let regular = |metadata: &crate::instruments::TbankInstrumentMetadata, side| OrderState {
+        direction: side as i32,
+        instrument_uid: metadata.instrument_uid.clone(),
+        figi: metadata.figi.clone(),
+        ticker: metadata.ticker.clone(),
+        class_code: metadata.class_code.clone(),
+        ..OrderState::default()
+    };
+    let stop = |metadata: &crate::instruments::TbankInstrumentMetadata, side| StopOrder {
+        direction: side as i32,
+        instrument_uid: metadata.instrument_uid.clone(),
+        figi: metadata.figi.clone(),
+        ticker: metadata.ticker.clone(),
+        class_code: metadata.class_code.clone(),
+        ..StopOrder::default()
+    };
+
+    let sber_buy = regular(&sber, OrderDirection::Buy);
+    let sber_sell = stop(&sber, StopOrderDirection::Sell);
+    let gazp_buy = regular(&gazp, OrderDirection::Buy);
+    let unknown = OrderState {
+        direction: OrderDirection::Buy as i32,
+        ..OrderState::default()
+    };
+    let ticker_class_only = OrderState {
+        direction: OrderDirection::Buy as i32,
+        ticker: sber.ticker.clone(),
+        class_code: sber.class_code.clone(),
+        ..OrderState::default()
+    };
+    let conflicting_identity = OrderState {
+        direction: OrderDirection::Buy as i32,
+        instrument_uid: "other-uid".to_string(),
+        figi: sber.figi.clone(),
+        ticker: sber.ticker.clone(),
+        class_code: sber.class_code.clone(),
+        ..OrderState::default()
+    };
+
+    assert!(super::TbankExecutionRuntime::order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        Some(OrderSide::Buy),
+        &sber_buy
+    )
+    .unwrap());
+    assert!(!super::TbankExecutionRuntime::order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        Some(OrderSide::Sell),
+        &sber_buy
+    )
+    .unwrap());
+    assert!(super::TbankExecutionRuntime::stop_order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        Some(OrderSide::Sell),
+        &sber_sell
+    )
+    .unwrap());
+    assert!(!super::TbankExecutionRuntime::stop_order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        Some(OrderSide::Buy),
+        &sber_sell
+    )
+    .unwrap());
+    assert!(!super::TbankExecutionRuntime::order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        None,
+        &gazp_buy
+    )
+    .unwrap());
+    assert!(!super::TbankExecutionRuntime::order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        None,
+        &unknown
+    )
+    .unwrap());
+    assert!(super::TbankExecutionRuntime::order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        None,
+        &ticker_class_only
+    )
+    .unwrap());
+    assert!(super::TbankExecutionRuntime::order_matches_cancel_scope(
+        &sber,
+        &known_instruments,
+        None,
+        &conflicting_identity
+    )
+    .is_err());
+
+    let ambiguous_instruments = vec![sber.clone(), gazp, {
+        let mut duplicate = sber.clone();
+        duplicate.instrument_id = "SBER_TQBR.SPBE".to_string();
+        duplicate.instrument_uid = "sber-other-venue-uid".to_string();
+        duplicate
+    }];
+    assert!(super::TbankExecutionRuntime::order_matches_cancel_scope(
+        &sber,
+        &ambiguous_instruments,
+        None,
+        &ticker_class_only
+    )
+    .is_err());
+}
+
+#[test]
+fn rc6_execution_client_retains_unresolved_submissions() {
+    let client = test_client(TbankExecutionClientConfig::default());
+
+    assert!(nautilus_common::clients::ExecutionClient::retain_unresolved_submissions(&client));
+}
+
 fn test_emitter(
     sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
 ) -> ExecutionEventEmitter {

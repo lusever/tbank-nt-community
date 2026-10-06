@@ -57,13 +57,14 @@ use nautilus_common::{
     live::{
         runner::{get_data_event_sender, try_get_data_event_sender},
         runtime::get_runtime,
+        sender::EventSender,
     },
     messages::{
         DataEvent,
         data::{
             BarsResponse, DataResponse, RequestBars, RequestTrades, SubscribeBars,
-            SubscribeBookDepth10, SubscribeQuotes, SubscribeTrades, TradesResponse,
-            UnsubscribeBars, UnsubscribeBookDepth10, UnsubscribeQuotes, UnsubscribeTrades,
+            SubscribeBookDepth, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            UnsubscribeBookDepth, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     msgbus::{self, TypedHandler, switchboard},
@@ -71,7 +72,7 @@ use nautilus_common::{
 };
 use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
-    data::{Bar, BarType, BookOrder, DEPTH10_LEN, Data, OrderBookDepth10, QuoteTick, TradeTick},
+    data::{Bar, BarType, BookOrder, DEPTH10_LEN, Data, OrderBookDepth, QuoteTick, TradeTick},
     enums::{AggregationSource, AggressorSide, BarAggregation, BookType, OrderSide},
     identifiers::{ClientId, InstrumentId, TradeId, Venue},
     instruments::InstrumentAny,
@@ -150,11 +151,11 @@ struct MarketDataStreamHealthState {
 #[derive(Debug, Default)]
 struct MarketDataStreamHealth {
     state: std::sync::Mutex<MarketDataStreamHealthState>,
-    event_sender: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<DataEvent>>>,
+    event_sender: std::sync::Mutex<Option<EventSender<DataEvent>>>,
 }
 
 impl MarketDataStreamHealth {
-    fn bind_event_sender(&self, sender: tokio::sync::mpsc::UnboundedSender<DataEvent>) {
+    fn bind_event_sender(&self, sender: EventSender<DataEvent>) {
         *self
             .event_sender
             .lock()
@@ -671,7 +672,7 @@ pub struct TbankDataClient {
     scheduled_bar_continuity_keys: HashMap<String, String>,
     quote_subscriptions: HashSet<InstrumentId>,
     trade_subscriptions: HashSet<InstrumentId>,
-    depth10_subscriptions: HashMap<InstrumentId, i32>,
+    order_book_depth_subscriptions: HashMap<InstrumentId, i32>,
     historical_request_limiter: HistoricalRequestLimiter,
     stream_health: Arc<MarketDataStreamHealth>,
     /// Watermarks belong to the client lifecycle, not to one replaceable stream supervisor.
@@ -710,7 +711,7 @@ impl TbankDataClient {
             scheduled_bar_continuity_keys: HashMap::new(),
             quote_subscriptions: HashSet::new(),
             trade_subscriptions: HashSet::new(),
-            depth10_subscriptions: HashMap::new(),
+            order_book_depth_subscriptions: HashMap::new(),
             historical_request_limiter,
             stream_health: Arc::new(MarketDataStreamHealth::default()),
             bar_watermarks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -940,7 +941,7 @@ impl TbankDataClient {
         self.scheduled_bar_continuity_keys.clear();
         self.quote_subscriptions.clear();
         self.trade_subscriptions.clear();
-        self.depth10_subscriptions.clear();
+        self.order_book_depth_subscriptions.clear();
         self.active_stream_task_keys.clear();
         self.bar_watermarks
             .lock()
@@ -957,13 +958,13 @@ impl TbankDataClient {
             self.schedule_trade_stream(instrument_id)?;
         }
 
-        let depth10_subscriptions = self
-            .depth10_subscriptions
+        let order_book_depth_subscriptions = self
+            .order_book_depth_subscriptions
             .iter()
             .map(|(instrument_id, depth)| (*instrument_id, *depth))
             .collect::<Vec<_>>();
-        for (instrument_id, depth) in depth10_subscriptions {
-            self.schedule_depth10_stream(instrument_id, depth)?;
+        for (instrument_id, depth) in order_book_depth_subscriptions {
+            self.schedule_order_book_depth_stream(instrument_id, depth)?;
         }
 
         Ok(())
@@ -1709,7 +1710,7 @@ impl TbankDataClient {
         )
     }
 
-    fn schedule_depth10_stream(
+    fn schedule_order_book_depth_stream(
         &mut self,
         instrument_id: InstrumentId,
         depth: i32,
@@ -1728,9 +1729,9 @@ impl TbankDataClient {
             ..MarketDataServerSideStreamRequest::default()
         };
         self.spawn_stream(
-            stream_task_key("depth10", &instrument_id.to_string(), "book"),
+            stream_task_key("book_depth", &instrument_id.to_string(), "book"),
             request,
-            TbankStreamKind::Depth10 {
+            TbankStreamKind::BookDepth {
                 instrument_id,
                 instrument_uid,
             },
@@ -1933,7 +1934,7 @@ fn periodic_candle_poll_from(
 fn publish_recovery_batch_if_current<C>(
     stream_health: &MarketDataStreamHealth,
     task_key: &str,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     bars: &[Bar],
     commit: C,
 ) -> anyhow::Result<RecoveryPublication>
@@ -1962,7 +1963,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_periodic_candle_poll(
     mut market_data_client: MarketDataClient,
-    sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: EventSender<DataEvent>,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
     config: TbankDataClientConfig,
     historical_request_limiter: HistoricalRequestLimiter,
@@ -2105,7 +2106,7 @@ async fn run_periodic_candle_poll(
 struct MarketDataStreamContext {
     market_data_stream: MarketDataStreamClient,
     market_data_client: MarketDataClient,
-    sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: EventSender<DataEvent>,
     request: MarketDataServerSideStreamRequest,
     kind: TbankStreamKind,
     config: TbankDataClientConfig,
@@ -3039,7 +3040,7 @@ fn is_usable_market_data_response(response: &MarketDataResponse, kind: &TbankStr
         ) => instrument_ids.contains_key(&orderbook.instrument_uid),
         (
             Some(market_data_response::Payload::Orderbook(orderbook)),
-            TbankStreamKind::Depth10 { instrument_uid, .. },
+            TbankStreamKind::BookDepth { instrument_uid, .. },
         ) => orderbook.instrument_uid == *instrument_uid,
         _ => false,
     }
@@ -3056,7 +3057,7 @@ fn is_market_data_subscription_ack(response: &MarketDataResponse, kind: &TbankSt
             TbankStreamKind::Trades { .. }
         ) | (
             Some(market_data_response::Payload::SubscribeOrderBookResponse(_)),
-            TbankStreamKind::Quotes { .. } | TbankStreamKind::Depth10 { .. }
+            TbankStreamKind::Quotes { .. } | TbankStreamKind::BookDepth { .. }
         )
     )
 }
@@ -3070,7 +3071,7 @@ async fn recover_pending_bars_after_stream_ack(
     bar_watermarks: &SharedBarWatermarks,
     bar_continuity_key_overrides: &HashMap<String, String>,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     continuity: &mut HashMap<String, BarContinuityTracker>,
     instrument_count: usize,
     config: &TbankDataClientConfig,
@@ -3363,7 +3364,7 @@ fn validate_market_data_subscription_ack(
         ),
         (
             Some(market_data_response::Payload::SubscribeOrderBookResponse(response)),
-            TbankStreamKind::Depth10 { instrument_uid, .. },
+            TbankStreamKind::BookDepth { instrument_uid, .. },
         ) => (
             response
                 .order_book_subscriptions
@@ -3491,7 +3492,7 @@ async fn reconnect_catch_up_bars(
     bar_watermarks: &SharedBarWatermarks,
     bar_continuity_key_overrides: &HashMap<String, String>,
     timestamp_mode: crate::config::TbankCandleTimestampMode,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     continuity: &mut HashMap<String, BarContinuityTracker>,
     instrument_count: usize,
     config: &TbankDataClientConfig,
@@ -3918,7 +3919,7 @@ enum TbankStreamKind {
     Quotes {
         instrument_ids: HashMap<String, InstrumentId>,
     },
-    Depth10 {
+    BookDepth {
         instrument_id: InstrumentId,
         instrument_uid: String,
     },
@@ -3930,7 +3931,7 @@ impl TbankStreamKind {
             Self::Bars { .. } => "bars",
             Self::Trades { .. } => "trades",
             Self::Quotes { .. } => "quotes",
-            Self::Depth10 { .. } => "depth10",
+            Self::BookDepth { .. } => "book_depth",
         }
     }
 
@@ -3938,7 +3939,7 @@ impl TbankStreamKind {
         match self {
             Self::Bars { bar_types } => bar_types.len(),
             Self::Quotes { instrument_ids } => instrument_ids.len(),
-            Self::Trades { .. } | Self::Depth10 { .. } => 1,
+            Self::Trades { .. } | Self::BookDepth { .. } => 1,
         }
     }
 }
@@ -3966,7 +3967,7 @@ fn continuity_from_bar_watermarks(
 #[allow(clippy::too_many_arguments)]
 fn drain_pre_ack_messages(
     messages: &mut VecDeque<(MarketDataResponse, UnixNanos, u64)>,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     kind: &TbankStreamKind,
     instrument_metadata: &SharedInstrumentMetadata,
     bar_watermarks: &SharedBarWatermarks,
@@ -4020,7 +4021,7 @@ fn drain_pre_ack_messages(
 
 #[allow(clippy::too_many_arguments)]
 fn publish_ready_market_data_response(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     response: MarketDataResponse,
     kind: &TbankStreamKind,
     instrument_metadata: &SharedInstrumentMetadata,
@@ -4107,7 +4108,7 @@ fn publish_ready_market_data_response(
 }
 
 fn publish_market_data_response(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     response: MarketDataResponse,
     kind: &TbankStreamKind,
     instrument_metadata: &SharedInstrumentMetadata,
@@ -4191,7 +4192,7 @@ fn publish_market_data_response(
         }
         (
             market_data_response::Payload::Orderbook(orderbook),
-            TbankStreamKind::Depth10 {
+            TbankStreamKind::BookDepth {
                 instrument_id,
                 instrument_uid,
             },
@@ -4208,7 +4209,7 @@ fn publish_market_data_response(
                 &orderbook.instrument_uid,
                 Some(*instrument_id),
             )?;
-            Some(Data::from(nautilus_depth10_from_orderbook(
+            Some(Data::from(nautilus_order_book_depth_from_orderbook(
                 &orderbook,
                 *instrument_id,
                 metadata,
@@ -4259,8 +4260,8 @@ fn stream_kind_from_task_key(task_key: &str) -> &'static str {
         "quotes"
     } else if task_key.starts_with("trades:") {
         "trades"
-    } else if task_key.starts_with("depth10:") {
-        "depth10"
+    } else if task_key.starts_with("book_depth:") {
+        "book_depth"
     } else {
         "unknown"
     }
@@ -4426,12 +4427,12 @@ fn nautilus_quote_from_orderbook(
     .map_err(|error| anyhow::anyhow!("invalid T-Bank quote tick: {error}"))
 }
 
-fn nautilus_depth10_from_orderbook(
+fn nautilus_order_book_depth_from_orderbook(
     orderbook: &OrderBook,
     fallback_instrument_id: InstrumentId,
     metadata: MarketDataInstrumentMetadata,
     received_at: UnixNanos,
-) -> anyhow::Result<OrderBookDepth10> {
+) -> anyhow::Result<OrderBookDepth> {
     let snapshot = orderbook_to_snapshot(orderbook, i128::from(received_at.as_u64()))?;
     let instrument_id = instrument_id_from_stream_parts(
         &orderbook.ticker,
@@ -4439,31 +4440,35 @@ fn nautilus_depth10_from_orderbook(
         fallback_instrument_id,
         metadata.preserve_instrument_id,
     )?;
-    let mut bids = [BookOrder::default(); DEPTH10_LEN];
-    let mut asks = [BookOrder::default(); DEPTH10_LEN];
-    let mut bid_counts = [0_u32; DEPTH10_LEN];
-    let mut ask_counts = [0_u32; DEPTH10_LEN];
+    anyhow::ensure!(
+        snapshot.is_consistent,
+        "T-Bank returned an inconsistent order-book snapshot"
+    );
+    let mut bids = Vec::with_capacity(snapshot.bids.len());
+    let mut asks = Vec::with_capacity(snapshot.asks.len());
+    let mut bid_counts = Vec::with_capacity(snapshot.bids.len());
+    let mut ask_counts = Vec::with_capacity(snapshot.asks.len());
 
-    for (idx, level) in snapshot.bids.iter().take(DEPTH10_LEN).enumerate() {
-        bids[idx] = BookOrder::new(
+    for (idx, level) in snapshot.bids.iter().enumerate() {
+        bids.push(BookOrder::new(
             OrderSide::Buy,
             decimal_price(level.price, metadata.price_precision)?,
             lot_quantity(level.quantity_lots, metadata.lot_size)?,
             idx as u64 + 1,
-        );
-        bid_counts[idx] = 1;
+        ));
+        bid_counts.push(1);
     }
-    for (idx, level) in snapshot.asks.iter().take(DEPTH10_LEN).enumerate() {
-        asks[idx] = BookOrder::new(
+    for (idx, level) in snapshot.asks.iter().enumerate() {
+        asks.push(BookOrder::new(
             OrderSide::Sell,
             decimal_price(level.price, metadata.price_precision)?,
             lot_quantity(level.quantity_lots, metadata.lot_size)?,
             idx as u64 + 1,
-        );
-        ask_counts[idx] = 1;
+        ));
+        ask_counts.push(1);
     }
 
-    Ok(OrderBookDepth10::new(
+    OrderBookDepth::new_checked(
         instrument_id,
         bids,
         asks,
@@ -4473,7 +4478,7 @@ fn nautilus_depth10_from_orderbook(
         snapshot.ts_event as u64,
         unix_nanos(snapshot.ts_event)?,
         unix_nanos(snapshot.ts_init)?,
-    ))
+    )
 }
 
 mod nautilus;
@@ -4505,7 +4510,7 @@ mod tests {
         health: &MarketDataStreamHealth,
     ) -> tokio::sync::mpsc::UnboundedReceiver<DataEvent> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        health.bind_event_sender(sender);
+        health.bind_event_sender(sender.into());
         receiver
     }
 
@@ -4571,7 +4576,7 @@ mod tests {
         client.bar_subscriptions.insert(sber_id(), sber_bar_type());
         client.quote_subscriptions.insert(sber_id());
         client.trade_subscriptions.insert(sber_id());
-        client.depth10_subscriptions.insert(sber_id(), 10);
+        client.order_book_depth_subscriptions.insert(sber_id(), 10);
 
         DataClient::reset(&mut client).unwrap();
 
@@ -4579,7 +4584,7 @@ mod tests {
         assert!(client.bar_subscriptions.is_empty());
         assert!(client.quote_subscriptions.is_empty());
         assert!(client.trade_subscriptions.is_empty());
-        assert!(client.depth10_subscriptions.is_empty());
+        assert!(client.order_book_depth_subscriptions.is_empty());
     }
 
     #[test]
@@ -4771,7 +4776,9 @@ mod tests {
         client.quote_subscriptions.insert(sber_id());
         client.schedule_quote_stream().unwrap();
         client.schedule_trade_stream(sber_id()).unwrap();
-        client.schedule_depth10_stream(sber_id(), 10).unwrap();
+        client
+            .schedule_order_book_depth_stream(sber_id(), 10)
+            .unwrap();
 
         let expected = client.stream_health.expected_task_keys();
         assert_eq!(expected.len(), 3);
@@ -4788,7 +4795,7 @@ mod tests {
         assert!(
             expected
                 .iter()
-                .any(|key| key.starts_with("depth10:SBER_TQBR.MOEX:book:generation:"))
+                .any(|key| key.starts_with("book_depth:SBER_TQBR.MOEX:book:generation:"))
         );
         assert!(!client.is_connected());
 
@@ -5062,7 +5069,7 @@ mod tests {
         client.bar_subscriptions.insert(sber_id(), sber_bar_type());
         client.quote_subscriptions.insert(sber_id());
         client.trade_subscriptions.insert(sber_id());
-        client.depth10_subscriptions.insert(sber_id(), 10);
+        client.order_book_depth_subscriptions.insert(sber_id(), 10);
         client.subscriptions.subscribe_trades("sber-uid");
 
         client.clear_market_data_subscription_state();
@@ -5070,7 +5077,7 @@ mod tests {
         assert!(client.bar_subscriptions.is_empty());
         assert!(client.quote_subscriptions.is_empty());
         assert!(client.trade_subscriptions.is_empty());
-        assert!(client.depth10_subscriptions.is_empty());
+        assert!(client.order_book_depth_subscriptions.is_empty());
         assert!(client.restore_subscription_requests().is_empty());
     }
 
@@ -5180,7 +5187,7 @@ mod tests {
 
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
         for depth in [5, 10] {
-            let command = SubscribeBookDepth10::new(
+            let command = SubscribeBookDepth::new(
                 sber_id(),
                 BookType::L2_MBP,
                 Some(*TBANK_CLIENT_ID),
@@ -5192,7 +5199,7 @@ mod tests {
                 None,
                 None,
             );
-            assert!(DataClient::subscribe_book_depth10(&mut client, command).is_err());
+            assert!(DataClient::subscribe_book_depth(&mut client, command).is_err());
         }
 
         let requests = client.restore_subscription_requests();
@@ -5204,7 +5211,7 @@ mod tests {
         };
         assert_eq!(request.instruments[0].depth, 10);
 
-        let command = UnsubscribeBookDepth10::new(
+        let command = UnsubscribeBookDepth::new(
             sber_id(),
             Some(*TBANK_CLIENT_ID),
             None,
@@ -5213,7 +5220,7 @@ mod tests {
             None,
             None,
         );
-        DataClient::unsubscribe_book_depth10(&mut client, &command).unwrap();
+        DataClient::unsubscribe_book_depth(&mut client, &command).unwrap();
 
         assert!(client.restore_subscription_requests().is_empty());
     }
@@ -5226,7 +5233,7 @@ mod tests {
 
         for requested_depth in [1, 10, 20, 30, 40, 50] {
             let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-            let command = SubscribeBookDepth10::new(
+            let command = SubscribeBookDepth::new(
                 sber_id(),
                 BookType::L2_MBP,
                 Some(*TBANK_CLIENT_ID),
@@ -5238,7 +5245,7 @@ mod tests {
                 None,
                 None,
             );
-            assert!(DataClient::subscribe_book_depth10(&mut client, command).is_err());
+            assert!(DataClient::subscribe_book_depth(&mut client, command).is_err());
             let requests = client.restore_subscription_requests();
             assert_eq!(requests.len(), 1, "depth {requested_depth}");
             let Some(market_data_request::Payload::SubscribeOrderBookRequest(request)) =
@@ -5247,15 +5254,14 @@ mod tests {
                 panic!("expected order-book restore request");
             };
             assert_eq!(
-                request.instruments[0].depth,
-                requested_depth.min(10) as i32,
+                request.instruments[0].depth, requested_depth as i32,
                 "depth {requested_depth}"
             );
         }
 
         for requested_depth in [2, 5, 9, 11, 49] {
             let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-            let command = SubscribeBookDepth10::new(
+            let command = SubscribeBookDepth::new(
                 sber_id(),
                 BookType::L2_MBP,
                 Some(*TBANK_CLIENT_ID),
@@ -5267,7 +5273,7 @@ mod tests {
                 None,
                 None,
             );
-            let error = DataClient::subscribe_book_depth10(&mut client, command)
+            let error = DataClient::subscribe_book_depth(&mut client, command)
                 .expect_err("broker-invalid depths must be rejected");
             assert!(error.to_string().contains("supports order book depths"));
             assert!(client.restore_subscription_requests().is_empty());
@@ -5291,7 +5297,7 @@ mod tests {
             None,
         );
         assert!(DataClient::subscribe_quotes(&mut client, quote).is_err());
-        let depth = SubscribeBookDepth10::new(
+        let depth = SubscribeBookDepth::new(
             sber_id(),
             BookType::L2_MBP,
             Some(*TBANK_CLIENT_ID),
@@ -5303,7 +5309,7 @@ mod tests {
             None,
             None,
         );
-        assert!(DataClient::subscribe_book_depth10(&mut client, depth).is_err());
+        assert!(DataClient::subscribe_book_depth(&mut client, depth).is_err());
         assert_eq!(client.restore_subscription_requests().len(), 1);
 
         let quote = UnsubscribeQuotes::new(
@@ -5318,7 +5324,7 @@ mod tests {
         DataClient::unsubscribe_quotes(&mut client, &quote).unwrap();
         assert_eq!(client.restore_subscription_requests().len(), 1);
 
-        let depth = UnsubscribeBookDepth10::new(
+        let depth = UnsubscribeBookDepth::new(
             sber_id(),
             Some(*TBANK_CLIENT_ID),
             None,
@@ -5327,7 +5333,7 @@ mod tests {
             None,
             None,
         );
-        DataClient::unsubscribe_book_depth10(&mut client, &depth).unwrap();
+        DataClient::unsubscribe_book_depth(&mut client, &depth).unwrap();
         assert!(client.restore_subscription_requests().is_empty());
     }
 
@@ -5340,6 +5346,7 @@ mod tests {
             bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
         };
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
         let stream_health = MarketDataStreamHealth::default();
         let outcome = reconnect_catch_up_bars(
             RecoveryCause::Reconnect,
@@ -5389,6 +5396,7 @@ mod tests {
         .unwrap();
         let stream_health = MarketDataStreamHealth::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
 
         assert_eq!(
             publish_recovery_batch_if_current(
@@ -5439,6 +5447,7 @@ mod tests {
     #[test]
     fn pre_ack_quote_buffer_drains_after_readiness_with_canonical_precision() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
         let kind = TbankStreamKind::Quotes {
             instrument_ids: HashMap::from([("sber-uid".to_string(), sber_id())]),
         };
@@ -6213,8 +6222,8 @@ mod tests {
             "bars:SBER_TQBR:1m"
         );
         assert_eq!(
-            stream_task_key("depth10", "SBER_TQBR", "book"),
-            "depth10:SBER_TQBR:book"
+            stream_task_key("book_depth", "SBER_TQBR", "book"),
+            "book_depth:SBER_TQBR:book"
         );
     }
 
@@ -6253,6 +6262,7 @@ mod tests {
     #[test]
     fn batched_stream_candle_routes_by_instrument_uid() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
         let candle = Candle {
             interval: SubscriptionInterval::OneMinute as i32,
             open: q(250, 0),
@@ -6296,6 +6306,7 @@ mod tests {
     #[test]
     fn batched_stream_rejects_unknown_candle_uid() {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
         let candle = Candle {
             interval: SubscriptionInterval::OneMinute as i32,
             close: q(251, 0),
@@ -6417,6 +6428,7 @@ mod tests {
         };
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(receiver);
+        let sender = sender.into();
         let metadata = Arc::new(RwLock::new(HashMap::from([(
             "sber-uid".to_string(),
             sber_market_data_metadata(),
@@ -6470,6 +6482,7 @@ mod tests {
             bar_types: HashMap::from([("sber-uid".to_string(), sber_bar_type())]),
         };
         let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sender: EventSender<DataEvent> = sender.into();
         let metadata = Arc::new(RwLock::new(HashMap::from([(
             "sber-uid".to_string(),
             sber_market_data_metadata(),
@@ -6616,6 +6629,7 @@ mod tests {
         assert!(!is_usable_market_data_response(&response, &kind));
 
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
         let error = publish_market_data_response(
             &sender,
             response,
@@ -6634,7 +6648,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_orderbook_maps_quote_and_depth10() {
+    fn stream_orderbook_maps_quote_and_book_depth() {
         let orderbook = OrderBook {
             depth: 2,
             is_consistent: true,
@@ -6680,7 +6694,7 @@ mod tests {
         assert_eq!(quote.ask_price.precision, 2);
         assert_eq!(quote.ts_init, received_at);
 
-        let depth = nautilus_depth10_from_orderbook(
+        let depth = nautilus_order_book_depth_from_orderbook(
             &orderbook,
             sber_id(),
             sber_market_data_metadata(),
@@ -6696,8 +6710,116 @@ mod tests {
     }
 
     #[test]
-    fn single_instrument_depth10_stream_rejects_mismatched_uid() {
-        let kind = TbankStreamKind::Depth10 {
+    fn stream_orderbook_preserves_supported_depths_without_padding() {
+        let received_at = UnixNanos::from(2_000_000_000_u64);
+        for depth in [1, 10, 20, 30, 40, 50] {
+            let orderbook = OrderBook {
+                depth,
+                is_consistent: true,
+                bids: (0..depth)
+                    .map(|level| Order {
+                        price: q(250 - i64::from(level), 0),
+                        quantity: 1,
+                    })
+                    .collect(),
+                asks: (0..depth)
+                    .map(|level| Order {
+                        price: q(251 + i64::from(level), 0),
+                        quantity: 1,
+                    })
+                    .collect(),
+                time: Some(ts(1_000)),
+                instrument_uid: "uid".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                ..OrderBook::default()
+            };
+            let mapped = nautilus_order_book_depth_from_orderbook(
+                &orderbook,
+                sber_id(),
+                sber_market_data_metadata(),
+                received_at,
+            )
+            .unwrap();
+
+            assert_eq!(mapped.bids.len(), depth as usize, "bid depth {depth}");
+            assert_eq!(mapped.asks.len(), depth as usize, "ask depth {depth}");
+            assert_eq!(
+                mapped.bid_counts.len(),
+                depth as usize,
+                "bid counts {depth}"
+            );
+            assert_eq!(
+                mapped.ask_counts.len(),
+                depth as usize,
+                "ask counts {depth}"
+            );
+            assert_eq!(
+                mapped.bids.last().unwrap().price.as_f64(),
+                (251 - depth) as f64
+            );
+            assert_eq!(
+                mapped.asks.last().unwrap().price.as_f64(),
+                (250 + depth) as f64
+            );
+        }
+    }
+
+    #[test]
+    fn stream_orderbook_depth_preserves_empty_sides_and_rejects_inconsistent_snapshots() {
+        let mut orderbook = OrderBook {
+            depth: 50,
+            is_consistent: true,
+            time: Some(ts(1_000)),
+            instrument_uid: "uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            ..OrderBook::default()
+        };
+        let received_at = UnixNanos::from(2_000_000_000_u64);
+        let empty = nautilus_order_book_depth_from_orderbook(
+            &orderbook,
+            sber_id(),
+            sber_market_data_metadata(),
+            received_at,
+        )
+        .unwrap();
+        assert!(empty.bids.is_empty());
+        assert!(empty.asks.is_empty());
+        assert!(empty.bid_counts.is_empty());
+        assert!(empty.ask_counts.is_empty());
+
+        orderbook.asks.push(Order {
+            price: q(251, 0),
+            quantity: 1,
+        });
+        let one_sided = nautilus_order_book_depth_from_orderbook(
+            &orderbook,
+            sber_id(),
+            sber_market_data_metadata(),
+            received_at,
+        )
+        .unwrap();
+        assert!(one_sided.bids.is_empty());
+        assert!(one_sided.bid_counts.is_empty());
+        assert_eq!(one_sided.asks.len(), 1);
+        assert_eq!(one_sided.ask_counts.len(), 1);
+
+        orderbook.is_consistent = false;
+        assert!(
+            nautilus_order_book_depth_from_orderbook(
+                &orderbook,
+                sber_id(),
+                sber_market_data_metadata(),
+                received_at,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn single_instrument_book_depth_stream_rejects_mismatched_uid() {
+        let kind = TbankStreamKind::BookDepth {
             instrument_id: sber_id(),
             instrument_uid: "expected-uid".to_string(),
         };
@@ -6711,6 +6833,7 @@ mod tests {
         assert!(!is_usable_market_data_response(&response, &kind));
 
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
         let error = publish_market_data_response(
             &sender,
             response,
@@ -6747,6 +6870,7 @@ mod tests {
             ..Trade::default()
         };
         let orderbook = OrderBook {
+            is_consistent: true,
             bids: vec![Order {
                 price: q(2_999, 0),
                 quantity: 1,
@@ -6768,9 +6892,13 @@ mod tests {
         let quote = nautilus_quote_from_orderbook(&orderbook, instrument_id, metadata, received_at)
             .unwrap()
             .unwrap();
-        let depth =
-            nautilus_depth10_from_orderbook(&orderbook, instrument_id, metadata, received_at)
-                .unwrap();
+        let depth = nautilus_order_book_depth_from_orderbook(
+            &orderbook,
+            instrument_id,
+            metadata,
+            received_at,
+        )
+        .unwrap();
 
         assert_eq!(tick.instrument_id, instrument_id);
         assert_eq!(quote.instrument_id, instrument_id);

@@ -16,7 +16,7 @@ impl TbankDataClient {
         if self.quote_subscriptions.contains(&instrument_id) {
             depths.insert(1);
         }
-        if let Some(depth) = self.depth10_subscriptions.get(&instrument_id) {
+        if let Some(depth) = self.order_book_depth_subscriptions.get(&instrument_id) {
             depths.insert(*depth);
         }
         self.subscriptions
@@ -105,7 +105,7 @@ impl DataClient for TbankDataClient {
         self.schedule_bar_streams()
     }
 
-    fn subscribe_book_depth10(&mut self, cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
+    fn subscribe_book_depth(&mut self, cmd: SubscribeBookDepth) -> anyhow::Result<()> {
         if cmd.book_type != BookType::L2_MBP {
             anyhow::bail!("T-Bank data client supports only L2_MBP order book depth");
         }
@@ -113,12 +113,11 @@ impl DataClient for TbankDataClient {
         if !matches!(requested_depth, 1 | 10 | 20 | 30 | 40 | 50) {
             anyhow::bail!("T-Bank supports order book depths 1, 10, 20, 30, 40, and 50");
         }
-        // Nautilus OrderBookDepth10 only carries ten levels, so valid deeper T-Bank requests are
-        // intentionally projected to the first ten levels.
-        let depth = requested_depth.min(DEPTH10_LEN) as i32;
-        self.depth10_subscriptions.insert(cmd.instrument_id, depth);
+        let depth = requested_depth as i32;
+        self.order_book_depth_subscriptions
+            .insert(cmd.instrument_id, depth);
         self.sync_nautilus_order_book_registry(cmd.instrument_id);
-        self.schedule_depth10_stream(cmd.instrument_id, depth)
+        self.schedule_order_book_depth_stream(cmd.instrument_id, depth)
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
@@ -149,14 +148,15 @@ impl DataClient for TbankDataClient {
         self.schedule_bar_streams()
     }
 
-    fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
-        self.depth10_subscriptions.remove(&cmd.instrument_id);
+    fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
+        self.order_book_depth_subscriptions
+            .remove(&cmd.instrument_id);
         let stream_id = self.stream_id(cmd.instrument_id);
         self.subscriptions
             .unsubscribe_depth_books_for_instrument(cmd.instrument_id, stream_id);
         self.sync_nautilus_order_book_registry(cmd.instrument_id);
         self.abort_stream(&stream_task_key(
-            "depth10",
+            "book_depth",
             &cmd.instrument_id.to_string(),
             "book",
         ));

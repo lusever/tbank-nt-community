@@ -59,7 +59,7 @@ impl NautilusDataClientFactory for TbankDataClientFactory {
 mod tests {
     use super::*;
 
-    use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_common::{cache::Cache, clock::VirtualClock};
     use nautilus_model::identifiers::ClientId;
 
     struct WrongConfig;
@@ -78,7 +78,7 @@ mod tests {
 
     fn dependencies() -> (CacheView, Rc<RefCell<dyn Clock>>) {
         let cache = Rc::new(RefCell::new(Cache::default())).into();
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         (cache, clock)
     }
 

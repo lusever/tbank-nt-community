@@ -2449,27 +2449,46 @@ impl TbankExecutionRuntime {
         Ok(())
     }
 
-    /// Cancels all open regular and stop orders for the configured account.
-    pub async fn cancel_all_orders(&mut self) -> Result<usize> {
+    /// Cancels open regular and stop orders for the requested instrument and optional side.
+    pub async fn cancel_all_orders(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_side: Option<OrderSide>,
+    ) -> Result<usize> {
         self.ensure_lifecycle_active()?;
+        let instrument_id = instrument_id.to_string();
+        let (scope, known_instruments) = {
+            let instruments = self.instruments.lock().expect("instruments lock");
+            let scope = instruments
+                .get(&instrument_id)
+                .cloned()
+                .filter(|metadata| metadata.instrument_id == instrument_id)
+                .ok_or_else(|| TbankAdapterError::InstrumentNotFound(instrument_id.clone()))?;
+            (scope, instruments.values().cloned().collect::<Vec<_>>())
+        };
+        if !Self::has_broker_instrument_identity(&scope) {
+            return Err(TbankAdapterError::InstrumentNotFound(instrument_id));
+        }
         let orders = self.query_open_orders().await?;
         let stops = self.query_stop_orders().await?;
-        let identities = orders
-            .orders
-            .into_iter()
-            .map(|order| TbankBrokerOrderIdentity {
-                route: TbankBrokerOrderRoute::RegularOrder,
-                broker_order_id: order.order_id,
-            })
-            .chain(
-                stops
-                    .stop_orders
-                    .into_iter()
-                    .map(|stop| TbankBrokerOrderIdentity {
-                        route: TbankBrokerOrderRoute::StopOrder,
-                        broker_order_id: stop.stop_order_id,
-                    }),
-            );
+        let mut identities = Vec::new();
+        for order in orders.orders {
+            if Self::order_matches_cancel_scope(&scope, &known_instruments, order_side, &order)? {
+                identities.push(TbankBrokerOrderIdentity {
+                    route: TbankBrokerOrderRoute::RegularOrder,
+                    broker_order_id: order.order_id,
+                });
+            }
+        }
+        for stop in stops.stop_orders {
+            if Self::stop_order_matches_cancel_scope(&scope, &known_instruments, order_side, &stop)?
+            {
+                identities.push(TbankBrokerOrderIdentity {
+                    route: TbankBrokerOrderRoute::StopOrder,
+                    broker_order_id: stop.stop_order_id,
+                });
+            }
+        }
         let mut cancelled = 0;
         let mut first_error: Option<TbankAdapterError> = None;
         for identity in identities {
@@ -2505,6 +2524,109 @@ impl TbankExecutionRuntime {
             }
         }
         first_error.map_or(Ok(cancelled), Err)
+    }
+
+    fn has_broker_instrument_identity(metadata: &TbankInstrumentMetadata) -> bool {
+        !metadata.instrument_uid.is_empty()
+            || !metadata.figi.is_empty()
+            || (!metadata.ticker.is_empty() && !metadata.class_code.is_empty())
+    }
+
+    fn broker_instrument_matches_scope(
+        scope: &TbankInstrumentMetadata,
+        known_instruments: &[TbankInstrumentMetadata],
+        instrument_uid: &str,
+        figi: &str,
+        ticker: &str,
+        class_code: &str,
+    ) -> Result<bool> {
+        if instrument_uid.is_empty() && figi.is_empty() {
+            if ticker.is_empty() || class_code.is_empty() {
+                return Ok(false);
+            }
+            if !scope.ticker.eq_ignore_ascii_case(ticker)
+                || !scope.class_code.eq_ignore_ascii_case(class_code)
+            {
+                return Ok(false);
+            }
+            let mut matches = known_instruments.iter().filter(|metadata| {
+                metadata.ticker.eq_ignore_ascii_case(ticker)
+                    && metadata.class_code.eq_ignore_ascii_case(class_code)
+            });
+            let Some(metadata) = matches.next() else {
+                return Err(invalid_instrument_identity_error(
+                    "",
+                    "",
+                    ticker,
+                    class_code,
+                    "cancel-all could not resolve ticker/class to a known instrument",
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(invalid_instrument_identity_error(
+                    "",
+                    "",
+                    ticker,
+                    class_code,
+                    "cancel-all ticker/class identity is ambiguous",
+                ));
+            }
+            return Ok(metadata.instrument_id == scope.instrument_id);
+        }
+        let strong_identity_matches = (!scope.instrument_uid.is_empty()
+            && scope.instrument_uid == instrument_uid)
+            || (!scope.figi.is_empty() && scope.figi == figi);
+        if !strong_identity_matches {
+            return Ok(false);
+        }
+        if !metadata_matches_event_identity(scope, instrument_uid, figi, ticker, class_code) {
+            return Err(invalid_instrument_identity_error(
+                instrument_uid,
+                figi,
+                ticker,
+                class_code,
+                "cancel-all broker identity components contradict the requested instrument",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn order_matches_cancel_scope(
+        scope: &TbankInstrumentMetadata,
+        known_instruments: &[TbankInstrumentMetadata],
+        order_side: Option<OrderSide>,
+        order: &OrderState,
+    ) -> Result<bool> {
+        if order_side.is_some_and(|side| nautilus_order_side(order.direction) != Some(side)) {
+            return Ok(false);
+        }
+        Self::broker_instrument_matches_scope(
+            scope,
+            known_instruments,
+            &order.instrument_uid,
+            &order.figi,
+            &order.ticker,
+            &order.class_code,
+        )
+    }
+
+    fn stop_order_matches_cancel_scope(
+        scope: &TbankInstrumentMetadata,
+        known_instruments: &[TbankInstrumentMetadata],
+        order_side: Option<OrderSide>,
+        stop: &StopOrder,
+    ) -> Result<bool> {
+        if order_side.is_some_and(|side| nautilus_stop_order_side(stop.direction) != Some(side)) {
+            return Ok(false);
+        }
+        Self::broker_instrument_matches_scope(
+            scope,
+            known_instruments,
+            &stop.instrument_uid,
+            &stop.figi,
+            &stop.ticker,
+            &stop.class_code,
+        )
     }
 
     async fn query_order_with_id_type(
