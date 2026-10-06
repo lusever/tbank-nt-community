@@ -61,7 +61,6 @@ use nautilus_common::{
     clients::DataClient,
     live::{
         runner::{get_data_event_sender, try_get_data_event_sender},
-        runtime::get_runtime,
         sender::EventSender,
     },
     messages::{
@@ -92,7 +91,7 @@ type MarketDataStreamClient =
     crate::grpc::generated::market_data_stream_service_client::MarketDataStreamServiceClient<
         tonic::codegen::InterceptedService<tonic::transport::Channel, TbankAuthInterceptor>,
     >;
-type DataEventSender = tokio::sync::mpsc::UnboundedSender<DataEvent>;
+type DataEventSender = EventSender<DataEvent>;
 
 const MAX_QUOTES_PER_STREAM: usize = 300;
 const MAX_PRE_ACK_MESSAGES: usize = 2_048;
@@ -5680,8 +5679,10 @@ mod tests {
         let old_generation = lifecycle.advance();
         let (old_sender, old_receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(old_receiver);
+        let old_sender: DataEventSender = old_sender.into();
         let current_generation = lifecycle.advance();
         let (current_sender, mut current_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let current_sender: DataEventSender = current_sender.into();
         let resolved_stream_ids = Arc::new(RwLock::new(HashMap::from([(
             "SBER_TQBR.MOEX".to_string(),
             "old-uid".to_string(),
@@ -5767,6 +5768,7 @@ mod tests {
         let generation = lifecycle.advance();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(receiver);
+        let sender: DataEventSender = sender.into();
         let resolved_stream_ids = Arc::new(RwLock::new(HashMap::from([(
             "SBER_TQBR.MOEX".to_string(),
             "old-uid".to_string(),
@@ -6733,7 +6735,7 @@ mod tests {
         let spawner = disabled.session_tasks.spawner().unwrap();
         let (disabled_sender, _disabled_receiver) = tokio::sync::mpsc::unbounded_channel();
         disabled
-            .schedule_instrument_refresh(&spawner, 1, disabled_sender)
+            .schedule_instrument_refresh(&spawner, 1, disabled_sender.into())
             .unwrap();
         assert!(disabled.instrument_refresh_task.is_none());
 
@@ -6745,7 +6747,7 @@ mod tests {
         let spawner = enabled.session_tasks.spawner().unwrap();
         let (enabled_sender, _enabled_receiver) = tokio::sync::mpsc::unbounded_channel();
         enabled
-            .schedule_instrument_refresh(&spawner, 1, enabled_sender)
+            .schedule_instrument_refresh(&spawner, 1, enabled_sender.into())
             .unwrap();
         let cancellation = enabled.instrument_refresh_task.clone().unwrap();
         enabled.disconnect();

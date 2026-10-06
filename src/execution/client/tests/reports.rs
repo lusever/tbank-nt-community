@@ -3132,6 +3132,11 @@ impl OrdersService for MockOrdersService {
         request: Request<CancelOrderRequest>,
     ) -> std::result::Result<Response<CancelOrderResponse>, Status> {
         self.cancel_calls.lock().unwrap().push(request.into_inner());
+        let gate = self.cancel_gate.lock().unwrap().clone();
+        if let Some((started, release)) = gate {
+            started.notify_one();
+            release.notified().await;
+        }
         if let Some((code, message)) = self.cancel_error.lock().unwrap().clone() {
             return Err(Status::new(code, message));
         }
@@ -3144,6 +3149,11 @@ impl OrdersService for MockOrdersService {
     ) -> std::result::Result<Response<OrderState>, Status> {
         let request = request.into_inner();
         self.state_calls.lock().unwrap().push(request.clone());
+        let gate = self.state_gate.lock().unwrap().clone();
+        if let Some((started, release)) = gate {
+            started.notify_one();
+            release.notified().await;
+        }
         let state_delay = *self.state_delay.lock().unwrap();
         if !state_delay.is_zero() {
             tokio::time::sleep(state_delay).await;
@@ -5064,6 +5074,317 @@ async fn order_identity_recovery_rejects_history_before_current_day() {
 }
 
 #[tokio::test]
+async fn fill_report_identity_queries_only_unresolved_current_operations() {
+    let operations_service = MockOperationsService::default();
+    operations_service
+        .pages
+        .lock()
+        .unwrap()
+        .push_back(GetOperationsByCursorResponse {
+            items: vec![OperationItem {
+                id: "operation-1".to_string(),
+                r#type: TbankOperationType::Buy as i32,
+                state: OperationState::Executed as i32,
+                instrument_uid: "sber-uid".to_string(),
+                figi: "BBG004730N88".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                trades_info: Some(OperationItemTrades {
+                    trades: vec![OperationItemTrade {
+                        num: "trade-from-known-order".to_string(),
+                        quantity: 1,
+                        price: Some(MoneyValue {
+                            currency: "rub".to_string(),
+                            units: 275,
+                            ..MoneyValue::default()
+                        }),
+                        ..OperationItemTrade::default()
+                    }],
+                }),
+                ..OperationItem::default()
+            }],
+            ..GetOperationsByCursorResponse::default()
+        });
+
+    let orders_service = MockOrdersService::default();
+    *orders_service.get_orders_response.lock().unwrap() = Some(GetOrdersResponse::default());
+    let state_calls = Arc::clone(&orders_service.state_calls);
+    *orders_service.state_response.lock().unwrap() = Some(OrderState {
+        order_id: "regular-broker-order-1".to_string(),
+        stages: vec![crate::grpc::generated::OrderStage {
+            trade_id: "trade-from-known-order".to_string(),
+            quantity: 1,
+            ..crate::grpc::generated::OrderStage::default()
+        }],
+        ..OrderState::default()
+    });
+    let stop_orders_service = MockStopOrdersService::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(orders_service))
+            .add_service(StopOrdersServiceServer::new(stop_orders_service))
+            .add_service(OperationsServiceServer::new(operations_service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".into()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    seed_sber_metadata(&mut client);
+    client.runtime.record_broker_order_mapping(
+        TbankBrokerOrderRoute::RegularOrder,
+        "client-order-1",
+        "regular-broker-order-1",
+    );
+    client.connect_for_queries().await.unwrap();
+
+    let (today, _) = super::current_utc_day_bounds();
+    let requested_start = UnixNanos::from(u64::try_from(today.seconds).unwrap() * 1_000_000_000);
+    let reports = <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_fill_reports(
+        &client,
+        GenerateFillReports::new(
+            UUID4::new(),
+            current_unix_nanos(),
+            None,
+            None,
+            Some(requested_start),
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].venue_order_id.to_string(), "regular-broker-order-1");
+    assert_eq!(reports[0].trade_id.to_string(), "trade-from-known-order");
+    let state_calls = state_calls.lock().unwrap();
+    assert_eq!(state_calls.len(), 1);
+    assert_eq!(state_calls[0].account_id, "account-1");
+    assert_eq!(state_calls[0].order_id, "operation-1");
+}
+
+#[tokio::test]
+async fn mass_status_skips_identity_recovery_for_out_of_scope_operations() {
+    let operations_service = MockOperationsService::default();
+    operations_service
+        .pages
+        .lock()
+        .unwrap()
+        .push_back(GetOperationsByCursorResponse {
+            items: vec![OperationItem {
+                id: "unsupported-operation".to_string(),
+                r#type: TbankOperationType::Buy as i32,
+                state: OperationState::Executed as i32,
+                instrument_uid: "unsupported-uid".to_string(),
+                figi: "BBG-UNSUPPORTED".to_string(),
+                ticker: "UNSUPPORTED".to_string(),
+                class_code: "TQTF".to_string(),
+                trades_info: Some(OperationItemTrades {
+                    trades: vec![OperationItemTrade {
+                        num: "unsupported-trade".to_string(),
+                        quantity: 1,
+                        price: Some(MoneyValue {
+                            currency: "rub".to_string(),
+                            units: 100,
+                            ..MoneyValue::default()
+                        }),
+                        ..OperationItemTrade::default()
+                    }],
+                }),
+                ..OperationItem::default()
+            }],
+            ..GetOperationsByCursorResponse::default()
+        });
+    *operations_service.positions_response.lock().unwrap() = Some(PositionsResponse::default());
+
+    let orders_service = MockOrdersService::default();
+    let state_calls = Arc::clone(&orders_service.state_calls);
+    *orders_service.state_error.lock().unwrap() = Some((
+        tonic::Code::Unavailable,
+        "unexpected GetOrderState for an out-of-scope operation".to_string(),
+    ));
+    *orders_service.get_orders_response.lock().unwrap() = Some(GetOrdersResponse::default());
+    *orders_service
+        .get_orders_unfiltered_response
+        .lock()
+        .unwrap() = Some(GetOrdersResponse {
+        orders: vec![OrderState {
+            order_id: "independent-working-order".to_string(),
+            instrument_uid: "sber-uid".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            direction: OrderDirection::Buy as i32,
+            order_type: crate::grpc::generated::OrderType::Market as i32,
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusNew as i32,
+            lots_requested: 1,
+            order_date: Some(crate::common::time::unix_nanos_to_timestamp(i128::from(
+                current_unix_nanos().as_u64(),
+            ))
+            .unwrap()),
+            ..OrderState::default()
+        }],
+    });
+    let stop_orders_service = MockStopOrdersService::default();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(orders_service))
+            .add_service(StopOrdersServiceServer::new(stop_orders_service))
+            .add_service(OperationsServiceServer::new(operations_service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".into()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    let mut sber = sber_metadata();
+    sber.instrument_uid = "sber-uid".to_string();
+    client.runtime.cache_instrument_metadata(sber);
+    let mut unsupported = sber_metadata();
+    unsupported.instrument_id = "UNSUPPORTED_TQTF.MOEX".to_string();
+    unsupported.ticker = "UNSUPPORTED".to_string();
+    unsupported.figi = "BBG-UNSUPPORTED".to_string();
+    unsupported.instrument_uid = "unsupported-uid".to_string();
+    unsupported.class_code = "TQTF".to_string();
+    client.runtime.cache_instrument_metadata(unsupported);
+    client.connect_for_queries().await.unwrap();
+
+    let status =
+        <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_mass_status(
+            &client,
+            Some(60),
+        )
+        .await
+        .expect("an unsupported operation must not make mass status fail")
+        .unwrap();
+
+    assert_eq!(status.order_reports().len(), 1);
+    assert_eq!(
+        status.order_reports()[0].venue_order_id.as_str(),
+        "independent-working-order"
+    );
+    assert!(status.fill_reports().is_empty());
+    assert!(state_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fill_report_identity_recovers_from_operation_id_when_order_history_omits_it() {
+    let operations_service = MockOperationsService::default();
+    operations_service
+        .pages
+        .lock()
+        .unwrap()
+        .push_back(GetOperationsByCursorResponse {
+            items: vec![OperationItem {
+                id: "operation-order-lookup-id".to_string(),
+                r#type: TbankOperationType::Buy as i32,
+                state: OperationState::Executed as i32,
+                instrument_uid: "sber-uid".to_string(),
+                figi: "BBG004730N88".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                trades_info: Some(OperationItemTrades {
+                    trades: vec![OperationItemTrade {
+                        // Operations and Orders may expose different trade IDs. The operation
+                        // ID still authoritatively resolves the owning order through GetOrderState.
+                        num: "operation-trade-id".to_string(),
+                        quantity: 1,
+                        price: Some(MoneyValue {
+                            currency: "rub".to_string(),
+                            units: 275,
+                            ..MoneyValue::default()
+                        }),
+                        ..OperationItemTrade::default()
+                    }],
+                }),
+                ..OperationItem::default()
+            }],
+            ..GetOperationsByCursorResponse::default()
+        });
+
+    let orders_service = MockOrdersService::default();
+    *orders_service.get_orders_response.lock().unwrap() = Some(GetOrdersResponse::default());
+    let state_calls = Arc::clone(&orders_service.state_calls);
+    *orders_service.state_response.lock().unwrap() = Some(OrderState {
+        order_id: "regular-broker-order-from-operation".to_string(),
+        stages: vec![crate::grpc::generated::OrderStage {
+            trade_id: "orders-service-trade-id".to_string(),
+            quantity: 1,
+            ..crate::grpc::generated::OrderStage::default()
+        }],
+        ..OrderState::default()
+    });
+    let stop_orders_service = MockStopOrdersService::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(orders_service))
+            .add_service(StopOrdersServiceServer::new(stop_orders_service))
+            .add_service(OperationsServiceServer::new(operations_service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".into()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    seed_sber_metadata(&mut client);
+    client.connect_for_queries().await.unwrap();
+
+    let (today, _) = super::current_utc_day_bounds();
+    let requested_start = UnixNanos::from(u64::try_from(today.seconds).unwrap() * 1_000_000_000);
+    let reports = <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_fill_reports(
+        &client,
+        GenerateFillReports::new(
+            UUID4::new(),
+            current_unix_nanos(),
+            None,
+            None,
+            Some(requested_start),
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].venue_order_id.to_string(), "regular-broker-order-from-operation");
+    assert_eq!(reports[0].trade_id.to_string(), "operation-trade-id");
+    let state_calls = state_calls.lock().unwrap();
+    assert_eq!(state_calls.len(), 1);
+    assert_eq!(state_calls[0].account_id, "account-1");
+    assert_eq!(state_calls[0].order_id, "operation-order-lookup-id");
+}
+
+#[tokio::test]
 async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
     const NANOS_PER_DAY: u64 = 86_400 * 1_000_000_000;
 
@@ -5185,72 +5506,99 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
 }
 
 #[tokio::test]
-async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_partial_fills() {
+async fn generate_mass_status_handles_empty_order_id_as_unresolved_fill_identity() {
     let operations_service = MockOperationsService::default();
     let operation_calls = Arc::clone(&operations_service.calls);
-    {
-        let mut pages = operations_service.pages.lock().unwrap();
-        pages.push_back(GetOperationsByCursorResponse {
-            items: vec![
-                OperationItem {
-                    id: "operation-with-order-identity".to_string(),
-                    r#type: TbankOperationType::Buy as i32,
-                    state: OperationState::Executed as i32,
-                    instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
-                    figi: "BBG004730N88".to_string(),
-                    ticker: "SBER".to_string(),
-                    class_code: "TQBR".to_string(),
-                    commission: Some(MoneyValue {
-                        currency: "rub".to_string(),
-                        units: 1,
-                        nano: 0,
-                    }),
-                    trades_info: Some(OperationItemTrades {
-                        trades: vec![OperationItemTrade {
-                            num: "mapped-trade".to_string(),
-                            quantity: 1,
-                            price: Some(MoneyValue {
-                                currency: "rub".to_string(),
-                                units: 275,
-                                nano: 0,
-                            }),
-                            ..OperationItemTrade::default()
-                        }],
-                    }),
-                    ..OperationItem::default()
-                },
-                OperationItem {
-                    id: "operation-without-order-identity".to_string(),
-                    r#type: TbankOperationType::Buy as i32,
-                    state: OperationState::Executed as i32,
-                    instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
-                    figi: "BBG004730N88".to_string(),
-                    ticker: "SBER".to_string(),
-                    class_code: "TQBR".to_string(),
-                    trades_info: Some(OperationItemTrades {
-                        trades: vec![OperationItemTrade {
-                            num: "unmapped-trade".to_string(),
-                            quantity: 1,
-                            price: Some(MoneyValue {
-                                currency: "rub".to_string(),
-                                units: 275,
-                                nano: 0,
-                            }),
-                            ..OperationItemTrade::default()
-                        }],
-                    }),
-                    ..OperationItem::default()
-                },
-            ],
-            ..GetOperationsByCursorResponse::default()
-        });
-    }
-    *operations_service.positions_response.lock().unwrap() = Some(PositionsResponse::default());
+    let operations_page = GetOperationsByCursorResponse {
+        items: vec![
+            OperationItem {
+                id: "operation-with-order-identity".to_string(),
+                r#type: TbankOperationType::Buy as i32,
+                state: OperationState::Executed as i32,
+                instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
+                figi: "BBG004730N88".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                commission: Some(MoneyValue {
+                    currency: "rub".to_string(),
+                    units: 1,
+                    nano: 0,
+                }),
+                trades_info: Some(OperationItemTrades {
+                    trades: vec![OperationItemTrade {
+                        num: "mapped-trade".to_string(),
+                        quantity: 1,
+                        price: Some(MoneyValue {
+                            currency: "rub".to_string(),
+                            units: 275,
+                            nano: 0,
+                        }),
+                        ..OperationItemTrade::default()
+                    }],
+                }),
+                ..OperationItem::default()
+            },
+            OperationItem {
+                id: "operation-without-order-identity".to_string(),
+                r#type: TbankOperationType::Buy as i32,
+                state: OperationState::Executed as i32,
+                instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
+                figi: "BBG004730N88".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                trades_info: Some(OperationItemTrades {
+                    trades: vec![OperationItemTrade {
+                        num: "unmapped-trade".to_string(),
+                        quantity: 1,
+                        price: Some(MoneyValue {
+                            currency: "rub".to_string(),
+                            units: 275,
+                            nano: 0,
+                        }),
+                        ..OperationItemTrade::default()
+                    }],
+                }),
+                ..OperationItem::default()
+            },
+        ],
+        ..GetOperationsByCursorResponse::default()
+    };
+    let operations_pages = Arc::clone(&operations_service.pages);
+    operations_pages
+        .lock()
+        .unwrap()
+        .push_back(operations_page.clone());
+    *operations_service.positions_response.lock().unwrap() = Some(PositionsResponse {
+        securities: vec![PositionsSecurities {
+            instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
+            figi: "BBG004730N88".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            balance: 10,
+            ..PositionsSecurities::default()
+        }],
+        ..PositionsResponse::default()
+    });
 
     let orders_service = MockOrdersService::default();
     *orders_service.get_orders_response.lock().unwrap() = Some(GetOrdersResponse {
         orders: vec![OrderState {
             order_id: "broker-order-1".to_string(),
+            instrument_uid: "e6123145-9665-43e0-8413-cd61b8aa9b13".to_string(),
+            figi: "BBG004730N88".to_string(),
+            ticker: "SBER".to_string(),
+            class_code: "TQBR".to_string(),
+            direction: OrderDirection::Buy as i32,
+            order_type: crate::grpc::generated::OrderType::Market as i32,
+            execution_report_status: OrderExecutionReportStatus::ExecutionReportStatusFill as i32,
+            lots_requested: 1,
+            lots_executed: 1,
+            order_date: Some(
+                crate::common::time::unix_nanos_to_timestamp(i128::from(
+                    current_unix_nanos().as_u64(),
+                ))
+                .unwrap(),
+            ),
             stages: vec![crate::grpc::generated::OrderStage {
                 trade_id: "mapped-trade".to_string(),
                 quantity: 1,
@@ -5259,6 +5607,8 @@ async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_
             ..OrderState::default()
         }],
     });
+    *orders_service.state_response.lock().unwrap() = Some(OrderState::default());
+    let state_error = Arc::clone(&orders_service.state_error);
     let stop_orders_service = MockStopOrdersService::default();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5297,6 +5647,69 @@ async fn generate_mass_status_marks_unresolved_fill_identity_incomplete_without_
     assert_eq!(operation_calls.lock().unwrap().len(), 1);
     assert!(!status.reports_complete());
     assert!(status.fill_reports().is_empty());
+    assert_eq!(status.order_reports().len(), 1);
+    assert_eq!(
+        status.order_reports()[0].venue_order_id.as_str(),
+        "broker-order-1"
+    );
+    assert_eq!(
+        status
+            .position_reports()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        1
+    );
+
+    operations_pages
+        .lock()
+        .unwrap()
+        .push_back(operations_page.clone());
+    let (today, _) = super::current_utc_day_bounds();
+    let requested_start = UnixNanos::from(u64::try_from(today.seconds).unwrap() * 1_000_000_000);
+    let fill_error =
+        <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_fill_reports(
+            &client,
+            GenerateFillReports::new(
+                UUID4::new(),
+                current_unix_nanos(),
+                None,
+                None,
+                Some(requested_start),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect_err("individual fill reports must reject unresolved identity");
+    assert!(fill_error.to_string().contains("without canonical broker order identity"));
+
+    *state_error.lock().unwrap() = Some((
+        tonic::Code::NotFound,
+        "50005: order not found".to_string(),
+    ));
+    operations_pages.lock().unwrap().push_back(operations_page);
+    let absent_status =
+        <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_mass_status(
+            &client,
+            Some(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!absent_status.reports_complete());
+    assert!(absent_status.fill_reports().is_empty());
+    assert_eq!(absent_status.order_reports().len(), 1);
+    assert_eq!(
+        absent_status
+            .position_reports()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(operation_calls.lock().unwrap().len(), 3);
     assert!(
         receiver.try_recv().is_err(),
         "an incomplete mass-status snapshot must not publish fill provenance"

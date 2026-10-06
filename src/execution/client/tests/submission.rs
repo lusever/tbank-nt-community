@@ -377,11 +377,22 @@ async fn admitted_submit_remains_owned_across_disconnect_and_reconnect() {
         .expect("submit RPC did not reach the controlled server");
     assert_eq!(client.task_owner.operation_tasks.len(), 1);
 
-    <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::disconnect(&mut client)
-        .await
-        .unwrap();
+    {
+        let disconnect = client.disconnect_async();
+        tokio::pin!(disconnect);
+        let early_result = tokio::select! {
+            result = &mut disconnect => Some(result),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => None,
+        };
+        assert!(
+            early_result.is_none(),
+            "disconnect returned before the admitted submit reached an outcome"
+        );
+        post_release.notify_one();
+        disconnect.await.unwrap();
+    }
     assert!(!client.runtime.is_connected());
-    assert_eq!(client.task_owner.operation_tasks.len(), 1);
+    assert!(client.task_owner.operation_tasks.is_empty());
 
     client
         .runtime
@@ -389,14 +400,13 @@ async fn admitted_submit_remains_owned_across_disconnect_and_reconnect() {
         .await
         .unwrap();
     assert!(client.runtime.is_connected());
-    assert_eq!(client.task_owner.operation_tasks.len(), 1);
+    assert!(client.task_owner.operation_tasks.is_empty());
     {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].order_id, expected_request_id);
     }
 
-    post_release.notify_one();
     let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if let Some(ExecutionEvent::Report(ExecutionReport::Order(report))) =
@@ -992,6 +1002,7 @@ async fn explicit_broker_submit_rejection_emits_upstream_rejected_event() {
         .unwrap()
         .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
     client.connect_for_queries().await.unwrap();
+    enable_test_command_admission(&client);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     client.runtime.emitter.set_sender(sender);
     let submit_cmd = submit_order_cmd(None);
@@ -1113,6 +1124,7 @@ async fn rate_limited_submit_reconciles_instead_of_emitting_rejection() {
         .unwrap()
         .insert(metadata.instrument_id.clone(), metadata);
     client.connect_for_queries().await.unwrap();
+    enable_test_command_admission(&client);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     client.runtime.emitter.set_sender(sender);
 
@@ -1166,6 +1178,7 @@ async fn successful_submit_emits_submitted_then_accepted_report() {
         .unwrap()
         .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
     client.connect_for_queries().await.unwrap();
+    enable_test_command_admission(&client);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     client.runtime.emitter.set_sender(sender);
 
@@ -1250,6 +1263,7 @@ async fn cancel_event_for_broker_error(code: Code) -> Option<ExecutionEvent> {
         ..TbankExecutionClientConfig::default()
     });
     client.connect_for_queries().await.unwrap();
+    enable_test_command_admission(&client);
     client.runtime.record_broker_order_mapping(
         super::TbankBrokerOrderRoute::RegularOrder,
         "order-1",
@@ -1322,6 +1336,9 @@ async fn admitted_pending_cancel_survives_disconnect_and_reconnect() {
         .connect_for_queries(&mut client.task_owner)
         .await
         .unwrap();
+    // The query connection supplies the broker channel; the helper models an already-admitted
+    // mutation from an execution generation for this identity-wait regression.
+    activate_test_lifecycle(&client);
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     client.runtime.emitter.set_sender(sender);
     let client_order_id = ClientOrderId::from("pending-cancel-order");
@@ -1358,11 +1375,12 @@ async fn admitted_pending_cancel_survives_disconnect_and_reconnect() {
 
     client.disconnect();
     assert!(!client.task_owner.operation_tasks.is_empty());
-    client
+    let reconnect_error = client
         .runtime
         .connect_for_queries(&mut client.task_owner)
         .await
-        .unwrap();
+        .expect_err("query reconnect must wait for the admitted cancellation");
+    assert!(reconnect_error.to_string().contains("previous generation"));
     assert!(client.runtime.record_broker_order_mapping(
         TbankBrokerOrderRoute::RegularOrder,
         "pending-cancel-order",
@@ -1387,6 +1405,12 @@ async fn admitted_pending_cancel_survives_disconnect_and_reconnect() {
                 broker_order_id: "venue-order-1".to_string(),
             })
     );
+    client.disconnect_async().await.unwrap();
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
     client.disconnect_async().await.unwrap();
 }
 
@@ -1523,6 +1547,18 @@ async fn exhausted_single_cancel_recovery_blocks_reset_until_known_outcome() {
         ..TbankExecutionClientConfig::default()
     });
     client.connect_for_queries().await.unwrap();
+    assert!(client
+        .connect()
+        .await
+        .expect_err("query-only connection must not open an execution session")
+        .to_string()
+        .contains("connected for queries only"));
+    assert!(client
+        .task_owner
+        .spawn_mutating_command_task(&client.runtime, "query_only_mutation", async {})
+        .expect_err("query-only connection must reject new execution commands")
+        .to_string()
+        .contains("connected for queries only"));
     let identity = TbankBrokerOrderIdentity {
         route: TbankBrokerOrderRoute::RegularOrder,
         broker_order_id: "venue-1".to_string(),

@@ -16,6 +16,15 @@ pub(super) struct TbankFillIdentityUnresolved {
     trade_id: String,
 }
 
+impl TbankFillIdentityUnresolved {
+    pub(super) fn new(operation_id: impl Into<String>, trade_id: impl Into<String>) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            trade_id: trade_id.into(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("T-Bank operation {operation_id} contains trade {trade_id} with a non-positive quantity")]
 pub(super) struct TbankFillQuantityInvalid {
@@ -1152,10 +1161,10 @@ pub(super) fn fill_reports_from_cursor_operation_with_instruments(
             trade_index,
             "T-Bank operations fill cannot be reconciled because the operation is missing broker order identity"
         );
-        return vec![Err(anyhow::Error::new(TbankFillIdentityUnresolved {
-            operation_id: item.id.clone(),
-            trade_id: trade.num.clone(),
-        }))];
+        return vec![Err(anyhow::Error::new(TbankFillIdentityUnresolved::new(
+            item.id.clone(),
+            trade.num.clone(),
+        )))];
     }
     let mut reports: Vec<anyhow::Result<TbankFillReport>> = trades
         .iter()

@@ -438,6 +438,11 @@ fn activate_test_lifecycle(client: &TbankExecutionClient) {
         .task_owner
         .external_admission_open
         .store(true, std::sync::atomic::Ordering::Release);
+    client
+        .task_owner
+        .mutation_admission_open
+        .store(true, std::sync::atomic::Ordering::Release);
+    client.runtime.report_requests.open();
 }
 
 fn order_stream_context(
@@ -520,7 +525,13 @@ async fn disconnect_drains_session_tasks_and_invalidates_clones() {
 
 #[tokio::test]
 async fn dropping_execution_owner_preserves_admitted_operations_until_completion() {
-    let mut client = test_client(TbankExecutionClientConfig::default());
+    let mut client = test_client(TbankExecutionClientConfig {
+        request_timeout: std::time::Duration::from_millis(50),
+        live_node_inflight_check_interval_ms: 1,
+        live_node_inflight_check_threshold_ms: 1,
+        live_node_inflight_check_retries: 1,
+        ..TbankExecutionClientConfig::default()
+    });
     activate_test_lifecycle(&client);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -542,7 +553,12 @@ async fn dropping_execution_owner_preserves_admitted_operations_until_completion
         .await
         .expect("admitted operation did not start");
 
-    client.disconnect_async().await.unwrap();
+    let error = client
+        .disconnect_async()
+        .await
+        .expect_err("disconnect must time out while an admitted mutation is still active");
+    assert!(error.to_string().contains("after 50 ms;"));
+    assert!(!client.task_owner.operation_tasks.is_empty());
     drop(client);
 
     release_tx
@@ -556,9 +572,20 @@ async fn dropping_execution_owner_preserves_admitted_operations_until_completion
 
 #[tokio::test]
 async fn old_session_spawner_cannot_spawn_after_reconnect() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(OrdersServiceServer::new(MockOrdersService::default()))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
     let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
         token: Some("test-token".into()),
         account_id: Some("account-1".to_string()),
+        endpoint: Some(endpoint),
         ..TbankExecutionClientConfig::default()
     });
     client
@@ -1265,6 +1292,88 @@ fn reset_and_dispose_refuse_while_mutating_command_is_in_flight() {
     );
     ExecutionClient::reset(&mut client).unwrap();
     assert!(client.runtime.instruments.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn async_disconnect_waits_for_mutations_and_retains_them_after_timeout() {
+    let mut client = test_client(TbankExecutionClientConfig {
+        request_timeout: std::time::Duration::from_millis(50),
+        live_node_inflight_check_interval_ms: 1,
+        live_node_inflight_check_threshold_ms: 1,
+        live_node_inflight_check_retries: 1,
+        ..TbankExecutionClientConfig::default()
+    });
+    activate_test_lifecycle(&client);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    client
+        .task_owner
+        .spawn_mutating_command_task(&client.runtime, "test_mutation", async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+        })
+        .unwrap();
+    started_rx.await.expect("mutating command did not start");
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.disconnect_async(),
+    )
+    .await
+    .expect("disconnect should use the configured execution-work deadline")
+    .expect_err("disconnect must bound its wait for a stuck mutation");
+    assert!(error.to_string().contains("after 50 ms;"));
+    assert!(error.to_string().contains("mutation outcomes remain unresolved"));
+    assert!(!client.task_owner.operation_tasks.is_empty());
+
+    let error = client
+        .connect_for_queries()
+        .await
+        .expect_err("an in-flight mutation must block a new query generation");
+    assert!(error.to_string().contains("previous generation"));
+    assert!(ExecutionClient::reset(&mut client).is_err());
+
+    release_tx.send(()).expect("mutating command was dropped");
+    client
+        .disconnect_async()
+        .await
+        .expect("disconnect should finish after the mutation completes");
+    assert!(client.task_owner.operation_tasks.is_empty());
+}
+
+#[tokio::test]
+async fn disconnect_waits_for_admitted_reports_and_blocks_query_reconnect() {
+    let mut client = test_client(TbankExecutionClientConfig {
+        request_timeout: std::time::Duration::from_millis(50),
+        live_node_inflight_check_interval_ms: 1,
+        live_node_inflight_check_threshold_ms: 1,
+        live_node_inflight_check_retries: 1,
+        ..TbankExecutionClientConfig::default()
+    });
+    activate_test_lifecycle(&client);
+    let report_request = client.runtime.begin_report_request().unwrap();
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.disconnect_async(),
+    )
+    .await
+    .expect("disconnect should finish within the test deadline")
+    .expect_err("disconnect must wait for an admitted report");
+    assert!(error.to_string().contains("report requests or mutation outcomes remain unresolved"));
+    assert!(client.runtime.begin_report_request().is_err());
+
+    let error = client
+        .connect_for_queries()
+        .await
+        .expect_err("query reconnect must wait for the previous report");
+    assert!(error.to_string().contains("previous generation"));
+
+    drop(report_request);
+    client
+        .disconnect_async()
+        .await
+        .expect("disconnect should finish after the report completes");
 }
 
 #[tokio::test]
@@ -2476,8 +2585,10 @@ struct MockOrdersService {
     post_error: Arc<Mutex<Option<(Code, String)>>>,
     post_response: Arc<Mutex<Option<PostOrderResponse>>>,
     cancel_calls: Arc<Mutex<Vec<CancelOrderRequest>>>,
+    cancel_gate: MockServiceGate,
     cancel_error: Arc<Mutex<Option<(Code, String)>>>,
     state_calls: Arc<Mutex<Vec<GetOrderStateRequest>>>,
+    state_gate: MockServiceGate,
     state_delay: Arc<Mutex<std::time::Duration>>,
     state_error: Arc<Mutex<Option<(Code, String)>>>,
     state_error_responses: Arc<Mutex<VecDeque<(Code, String)>>>,
@@ -2487,6 +2598,8 @@ struct MockOrdersService {
     get_orders_response: Arc<Mutex<Option<GetOrdersResponse>>>,
     get_orders_unfiltered_response: Arc<Mutex<Option<GetOrdersResponse>>>,
 }
+
+type MockServiceGate = Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
 
 #[derive(Clone)]
 struct MockPostOrderGate {

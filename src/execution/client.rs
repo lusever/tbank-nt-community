@@ -115,14 +115,25 @@ fn log_tbank_rpc_failure(rpc: &'static str, error: &TbankAdapterError) {
             } else {
                 "<redacted>"
             };
-            tracing::event!(
-                target: "tbank.rpc",
-                tracing::Level::WARN,
-                rpc,
-                grpc_code = ?code,
-                broker_code,
-                "T-Bank RPC failed"
-            );
+            if error.is_order_absent() {
+                tracing::event!(
+                    target: "tbank.rpc",
+                    tracing::Level::DEBUG,
+                    rpc,
+                    grpc_code = ?code,
+                    broker_code,
+                    "T-Bank reported that the order is absent"
+                );
+            } else {
+                tracing::event!(
+                    target: "tbank.rpc",
+                    tracing::Level::WARN,
+                    rpc,
+                    grpc_code = ?code,
+                    broker_code,
+                    "T-Bank RPC failed"
+                );
+            }
         }
         TbankAdapterError::PermissionDenied(_) => {
             tracing::event!(
@@ -200,6 +211,7 @@ struct TbankExecutionRuntime {
     unresolved_trade_fills: Arc<Mutex<HashMap<String, Vec<TbankFillReport>>>>,
     unresolved_cancellations: Arc<Mutex<HashSet<TbankBrokerOrderIdentity>>>,
     pending_cancel_waiters: TbankPendingCancelWaiters,
+    report_requests: Arc<TbankReportRequestGate>,
     lifecycle_active: Arc<TbankLifecycleToken>,
     emitter: ExecutionEventEmitter,
 }
@@ -272,6 +284,7 @@ struct TbankExecutionTaskOwner {
     operation_tasks: Arc<TaskGroup>,
     operation_admission: Mutex<()>,
     external_admission_open: AtomicBool,
+    mutation_admission_open: AtomicBool,
     session_generation: u64,
     // Keeps sync teardown from skipping failure observation after a command task has exited.
     session_task_admitted: AtomicBool,
@@ -287,6 +300,7 @@ impl TbankExecutionTaskOwner {
             operation_tasks: Arc::new(TaskGroup::new()),
             operation_admission: Mutex::new(()),
             external_admission_open: AtomicBool::new(false),
+            mutation_admission_open: AtomicBool::new(false),
             session_generation: 0,
             session_task_admitted: AtomicBool::new(false),
             session_drain_completed: true,
@@ -360,6 +374,11 @@ impl TbankExecutionTaskOwner {
                 "T-Bank execution client is not ready for commands".to_string(),
             ));
         }
+        if !self.mutation_admission_open.load(Ordering::Acquire) {
+            return Err(TbankAdapterError::ConfigError(
+                "T-Bank execution client is connected for queries only; new execution commands are disabled".to_string(),
+            ));
+        }
         runtime.ensure_lifecycle_active()?;
         let spawner = self.operation_tasks.spawner().map_err(task_spawn_error)?;
         let operation_tasks = Arc::clone(&self.operation_tasks);
@@ -411,10 +430,16 @@ impl TbankExecutionTaskOwner {
         Ok(self.session_generation)
     }
 
-    async fn prepare_operation_generation(&self) -> Result<()> {
+    async fn prepare_operation_generation(&self, runtime: &TbankExecutionRuntime) -> Result<()> {
+        runtime.ensure_previous_generation_quiescent()?;
         if !self.operation_tasks.is_open() {
+            if !self.operation_tasks.is_empty() {
+                return Err(TbankAdapterError::ConfigError(
+                    "cannot connect T-Bank execution client while execution work from the previous generation remains active".to_string(),
+                ));
+            }
             self.operation_tasks
-                .finish_shutdown(TASK_SHUTDOWN_GRACE, TASK_SHUTDOWN_ABORT)
+                .finish_shutdown(Duration::ZERO, Duration::ZERO)
                 .await
                 .map_err(task_shutdown_error)?;
             self.operation_tasks
@@ -430,6 +455,7 @@ impl TbankExecutionTaskOwner {
             .lock()
             .expect("operation_admission lock");
         self.external_admission_open.store(true, Ordering::Release);
+        self.mutation_admission_open.store(true, Ordering::Release);
         runtime.connected.store(true, Ordering::Release);
     }
 
@@ -441,9 +467,14 @@ impl TbankExecutionTaskOwner {
         let should_drain = self.connected_generation
             || !self.session_tasks.is_open()
             || !self.session_tasks.is_empty();
+        runtime.report_requests.close();
         runtime.lifecycle_active.store(false, Ordering::Release);
         runtime.connected.store(false, Ordering::Release);
         self.external_admission_open.store(false, Ordering::Release);
+        self.mutation_admission_open.store(false, Ordering::Release);
+        if self.operation_tasks.is_open() {
+            self.operation_tasks.begin_shutdown();
+        }
         if should_drain && (self.session_tasks.is_open() || !self.session_drain_completed) {
             self.session_tasks.begin_shutdown();
             // An empty, never-used generation has nothing to join or report. Preserve an
@@ -459,14 +490,18 @@ impl TbankExecutionTaskOwner {
         should_drain
     }
 
-    fn can_reset(&self) -> bool {
+    fn can_reset(&self, runtime: &TbankExecutionRuntime) -> bool {
         self.session_drain_completed
             && self.operation_tasks.is_empty()
             && self.session_tasks.is_empty()
+            && runtime.report_requests.in_flight() == 0
     }
 
     fn apply_pending_reset(&mut self, runtime: &mut TbankExecutionRuntime) -> bool {
-        if !self.reset_pending || !self.can_reset() || runtime.has_unresolved_mutation_outcomes() {
+        if !self.reset_pending
+            || !self.can_reset(runtime)
+            || runtime.has_unresolved_mutation_outcomes()
+        {
             return false;
         }
 
@@ -877,6 +912,64 @@ impl TbankLifecycleToken {
     }
 }
 
+#[derive(Debug, Default)]
+struct TbankReportRequestGate {
+    state: Mutex<TbankReportRequestState>,
+}
+
+#[derive(Debug, Default)]
+struct TbankReportRequestState {
+    accepting: bool,
+    in_flight: usize,
+}
+
+struct TbankReportRequestGuard {
+    gate: Arc<TbankReportRequestGate>,
+}
+
+impl TbankReportRequestGate {
+    fn open(&self) {
+        self.state.lock().expect("report request gate").accepting = true;
+    }
+
+    fn close(&self) {
+        self.state.lock().expect("report request gate").accepting = false;
+    }
+
+    fn begin(
+        self: &Arc<Self>,
+        lifecycle_active: &TbankLifecycleToken,
+    ) -> Result<TbankReportRequestGuard> {
+        let mut state = self.state.lock().expect("report request gate");
+        if !state.accepting || !lifecycle_active.load(Ordering::Acquire) {
+            return Err(TbankAdapterError::ConfigError(
+                "T-Bank execution client is disconnected".to_string(),
+            ));
+        }
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .expect("report request count overflow");
+        Ok(TbankReportRequestGuard {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn in_flight(&self) -> usize {
+        self.state.lock().expect("report request gate").in_flight
+    }
+}
+
+impl Drop for TbankReportRequestGuard {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().expect("report request gate");
+        state.in_flight = state
+            .in_flight
+            .checked_sub(1)
+            .expect("report request count underflow");
+    }
+}
+
 pub use super::broker_order_index::tbank_broker_request_id_for_client_order_id;
 use super::broker_order_index::{
     TbankBrokerOrderIdentity, TbankBrokerOrderIndex, TbankBrokerOrderRoute, TbankCancelTarget,
@@ -1159,6 +1252,13 @@ fn submit_outcome_recovery_budget(config: &TbankExecutionClientConfig) -> Durati
     Duration::from_millis(recovery_budget_ms).min(SUBMIT_OUTCOME_RECOVERY_MAX_BUDGET)
 }
 
+/// Covers both broker request deadlines and ambiguous-submit recovery before shutdown fails closed.
+fn execution_work_drain_timeout(config: &TbankExecutionClientConfig) -> Duration {
+    config
+        .request_timeout
+        .max(submit_outcome_recovery_budget(config))
+}
+
 fn submit_outcome_submit_budget(
     configured_timeout: Duration,
     recovery_deadline: tokio::time::Instant,
@@ -1251,6 +1351,7 @@ impl TbankExecutionRuntime {
             unresolved_trade_fills: Arc::new(Mutex::new(HashMap::new())),
             unresolved_cancellations: Arc::new(Mutex::new(HashSet::new())),
             pending_cancel_waiters: Arc::new(Mutex::new(HashMap::new())),
+            report_requests: Arc::new(TbankReportRequestGate::default()),
             lifecycle_active: Arc::new(TbankLifecycleToken::new(false)),
             emitter,
         }
@@ -1264,6 +1365,32 @@ impl TbankExecutionRuntime {
                 "T-Bank execution client is disconnected".to_string(),
             ))
         }
+    }
+
+    fn begin_report_request(&self) -> Result<TbankReportRequestGuard> {
+        self.report_requests.begin(&self.lifecycle_active)
+    }
+
+    fn ensure_previous_generation_resolved(&self) -> Result<()> {
+        if self.report_requests.in_flight() != 0 || self.has_unresolved_mutation_outcomes() {
+            return Err(TbankAdapterError::ConfigError(
+                "cannot connect T-Bank execution client while execution work or mutation outcomes from the previous generation remain unresolved".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_previous_generation_quiescent(&self) -> Result<()> {
+        if self.report_requests.in_flight() != 0 {
+            return Err(TbankAdapterError::ConfigError(
+                "cannot connect T-Bank execution client for queries while execution work from the previous generation is still active".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn has_unresolved_execution_work(&self) -> bool {
+        self.report_requests.in_flight() != 0 || self.has_unresolved_mutation_outcomes()
     }
 
     fn register_pending_cancel_waiter(
@@ -1478,6 +1605,7 @@ impl TbankExecutionRuntime {
         self.unresolved_trade_fills = Arc::new(Mutex::new(HashMap::new()));
         self.unresolved_cancellations = Arc::new(Mutex::new(HashSet::new()));
         self.pending_cancel_waiters = Arc::new(Mutex::new(HashMap::new()));
+        self.report_requests = Arc::new(TbankReportRequestGate::default());
         // TaskOwner calls reset only after session and admitted operation tasks have drained.
         self.active_credentials = None;
         self.connected.store(false, Ordering::Release);
@@ -1525,13 +1653,19 @@ impl TbankExecutionRuntime {
 
     async fn connect_for_node(&mut self, task_owner: &mut TbankExecutionTaskOwner) -> Result<()> {
         self.refresh_data_event_sender();
-        if self.is_connected()
-            && self.lifecycle_active.load(Ordering::Acquire)
-            && task_owner.session_tasks.is_open()
-        {
-            return Ok(());
+        if self.is_connected() && self.lifecycle_active.load(Ordering::Acquire) {
+            return if task_owner.mutation_admission_open.load(Ordering::Acquire)
+                && task_owner.session_tasks.is_open()
+            {
+                Ok(())
+            } else {
+                Err(TbankAdapterError::ConfigError(
+                    "T-Bank execution client is already connected for queries only; disconnect before opening an execution session".to_string(),
+                ))
+            };
         }
-        task_owner.prepare_operation_generation().await?;
+        self.ensure_previous_generation_resolved()?;
+        task_owner.prepare_operation_generation(self).await?;
         task_owner.prepare_session_generation(self).await?;
         self.clients = None;
         let endpoint = self.config.endpoint_uri()?;
@@ -1543,6 +1677,7 @@ impl TbankExecutionRuntime {
         self.active_credentials = Some(credentials);
         self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
+        self.report_requests.open();
         task_owner.connected_generation = true;
         task_owner.session_drain_completed = false;
         let rollback_lifecycle = self.lifecycle_active.clone();
@@ -1585,7 +1720,7 @@ impl TbankExecutionRuntime {
         {
             return Ok(());
         }
-        task_owner.prepare_operation_generation().await?;
+        task_owner.prepare_operation_generation(self).await?;
         task_owner.prepare_session_generation(self).await?;
         self.clients = None;
         let endpoint = self.config.endpoint_uri()?;
@@ -1597,6 +1732,7 @@ impl TbankExecutionRuntime {
         self.active_credentials = Some(credentials);
         self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
+        self.report_requests.open();
         task_owner.connected_generation = true;
         // This connection starts without session workers; a read-only command marks the group
         // as needing async drain before its failure state can be observed.
@@ -1609,6 +1745,9 @@ impl TbankExecutionRuntime {
             task_owner
                 .external_admission_open
                 .store(true, Ordering::Release);
+            task_owner
+                .mutation_admission_open
+                .store(false, Ordering::Release);
             self.connected.store(true, Ordering::Release);
         }
         tracing::info!(
@@ -1629,6 +1768,7 @@ impl TbankExecutionRuntime {
 
     async fn disconnect_async(&mut self, task_owner: &mut TbankExecutionTaskOwner) -> Result<()> {
         let should_drain = task_owner.begin_disconnect(self);
+        let mut first_error = None;
         if should_drain {
             let result = task_owner
                 .session_tasks
@@ -1639,22 +1779,42 @@ impl TbankExecutionRuntime {
             {
                 task_owner.session_drain_completed = true;
             }
-            result.map_err(task_shutdown_error)?;
+            if let Err(error) = result {
+                first_error = Some(task_shutdown_error(error));
+            }
         }
-        if task_owner.operation_tasks.is_open() && task_owner.operation_tasks.is_empty() {
+        if task_owner.operation_tasks.is_open() {
             task_owner.operation_tasks.begin_shutdown();
-            task_owner
-                .operation_tasks
-                .finish_shutdown(TASK_SHUTDOWN_GRACE, TASK_SHUTDOWN_ABORT)
-                .await
-                .map_err(task_shutdown_error)?;
         }
-        let pending_operations = task_owner.operation_tasks.len();
-        if pending_operations > 0 {
-            tracing::warn!(
-                pending_operations,
-                "T-Bank transport disconnected while admitted broker operations remain owned"
-            );
+        let drain_timeout = execution_work_drain_timeout(&self.config);
+        let drained = tokio::time::timeout(drain_timeout, async {
+            loop {
+                if task_owner.operation_tasks.is_empty() && self.report_requests.in_flight() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if drained.is_err() {
+            return Err(TbankAdapterError::ConfigError(format!(
+                "T-Bank execution client timed out draining execution work after {} ms; report requests or mutation outcomes remain unresolved",
+                drain_timeout.as_millis()
+            )));
+        }
+        task_owner
+            .operation_tasks
+            .finish_shutdown(Duration::ZERO, Duration::ZERO)
+            .await
+            .map_err(task_shutdown_error)?;
+        if self.has_unresolved_mutation_outcomes() {
+            return Err(TbankAdapterError::ConfigError(
+                "T-Bank execution client disconnected with unresolved broker mutation outcomes"
+                    .to_string(),
+            ));
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         task_owner.apply_pending_reset(self);
         tracing::info!("disconnected T-Bank execution client");
@@ -3924,6 +4084,7 @@ impl TbankExecutionRuntime {
             unresolved_trade_fills: self.unresolved_trade_fills.clone(),
             unresolved_cancellations: self.unresolved_cancellations.clone(),
             pending_cancel_waiters: self.pending_cancel_waiters.clone(),
+            report_requests: Arc::clone(&self.report_requests),
             lifecycle_active: self.lifecycle_active.clone(),
             emitter: self.emitter.clone(),
         }

@@ -225,10 +225,12 @@ mod tests {
             token: Some("secret".into()),
             ..TbankExecutionClientConfig::default()
         };
-        assert!(matches!(
-            config.validate(),
-            Err(TbankAdapterError::MissingAccountId)
-        ));
+        with_env_vars(&[(SANDBOX_ACCOUNT_ID_ENV, None)], || {
+            assert!(matches!(
+                config.validate(),
+                Err(TbankAdapterError::MissingAccountId)
+            ));
+        });
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! NautilusTrader [`ExecutionClient`] boundary for the T-Bank client.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use super::*;
 use crate::common::venue::TbankVenue;
@@ -23,6 +26,156 @@ struct PreparedPositionReports {
     account_id: AccountId,
     reports: Vec<PositionStatusReport>,
     complete: bool,
+}
+
+async fn recover_operation_order_identities(
+    client: &mut TbankExecutionRuntime,
+    supported_trade_operations: &[&OperationItem],
+    stop_id_by_exchange_order_id: &HashMap<String, String>,
+    stop_ids: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    // OperationsByCursor does not include the broker order ID. T-Bank documents that an
+    // operation ID can be passed to GetOrderState to retrieve the order's trade identities.
+    // Use it only as an ephemeral lookup key: operation IDs can change between history reads.
+    let mut order_id_by_operation_id = HashMap::<String, Option<String>>::new();
+    for &item in supported_trade_operations {
+        if !matches!(
+            classify_fill_operation_type(item.r#type),
+            TbankFillOperationKind::Trade(_)
+        ) {
+            continue;
+        }
+        let trades = item
+            .trades_info
+            .as_ref()
+            .map(|info| info.trades.as_slice())
+            .unwrap_or_default();
+        let unresolved_trade_id = {
+            let index = client
+                .broker_order_index
+                .lock()
+                .expect("broker_order_index lock");
+            trades
+                .iter()
+                .find(|trade| {
+                    index
+                        .venue_order_id_for_trade_id(trade.num.as_str())
+                        .is_none()
+                })
+                .map(|trade| trade.num.clone())
+        };
+        let Some(unresolved_trade_id) = unresolved_trade_id else {
+            continue;
+        };
+        if item.id.is_empty() {
+            continue;
+        }
+
+        if !order_id_by_operation_id.contains_key(item.id.as_str()) {
+            let canonical_order_id = match client.query_order(item.id.as_str()).await {
+                Ok(state) => {
+                    if state.order_id.is_empty() {
+                        return Err(anyhow::Error::new(TbankFillIdentityUnresolved::new(
+                            item.id.clone(),
+                            unresolved_trade_id.clone(),
+                        )));
+                    }
+                    let broker_order_id = state.order_id.clone();
+                    let activated_stop_id = stop_ids
+                        .get(state.order_request_id.as_str())
+                        .map(String::as_str)
+                        .or_else(|| {
+                            stop_id_by_exchange_order_id
+                                .get(broker_order_id.as_str())
+                                .map(String::as_str)
+                        });
+                    let canonical_order_id = activated_stop_id
+                        .unwrap_or(broker_order_id.as_str())
+                        .to_string();
+                    ensure_operation_order_mapping_consistent(
+                        client,
+                        item,
+                        Some(&state),
+                        broker_order_id.as_str(),
+                        canonical_order_id.as_str(),
+                    )?;
+
+                    // Commit the recovered identity only after all fallible validation succeeds.
+                    client.record_broker_order_id(
+                        TbankBrokerOrderRoute::RegularOrder,
+                        &broker_order_id,
+                    );
+                    client.record_trade_order_mappings_from_order_state(&state, &broker_order_id);
+                    if let Some(stop_order_id) = activated_stop_id {
+                        client.record_activated_stop_child_alias(stop_order_id, &broker_order_id);
+                    }
+                    Some(canonical_order_id)
+                }
+                Err(error) if error.is_order_absent() => {
+                    tracing::debug!(
+                        %error,
+                        operation_id = %item.id,
+                        "T-Bank operation order identity was absent from GetOrderState"
+                    );
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            };
+            order_id_by_operation_id.insert(item.id.clone(), canonical_order_id);
+        }
+
+        // The operation itself is the lookup key for GetOrderState. Its trade rows therefore
+        // belong to the returned order even on accounts where Operations and Orders expose
+        // different trade IDs; keep the operation trade ID for the report and attach the
+        // authoritative order identity returned by GetOrderState.
+        if let Some(Some(order_id)) = order_id_by_operation_id.get(item.id.as_str()) {
+            ensure_operation_order_mapping_consistent(client, item, None, order_id, order_id)?;
+            let mut index = client
+                .broker_order_index
+                .lock()
+                .expect("broker_order_index lock");
+            for trade in trades {
+                index.record_trade_order_mapping(trade.num.as_str(), order_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_operation_order_mapping_consistent(
+    client: &TbankExecutionRuntime,
+    item: &OperationItem,
+    state: Option<&OrderState>,
+    broker_order_id: &str,
+    canonical_order_id: &str,
+) -> anyhow::Result<()> {
+    let index = client
+        .broker_order_index
+        .lock()
+        .expect("broker_order_index lock");
+    let operation_trade_ids = item
+        .trades_info
+        .as_ref()
+        .into_iter()
+        .flat_map(|trades| trades.trades.iter().map(|trade| trade.num.as_str()));
+    let order_state_trade_ids = state
+        .into_iter()
+        .flat_map(|state| state.stages.iter().map(|stage| stage.trade_id.as_str()));
+    for trade_id in operation_trade_ids.chain(order_state_trade_ids) {
+        let Some(existing_order_id) = index.venue_order_id_for_trade_id(trade_id) else {
+            continue;
+        };
+        if existing_order_id != canonical_order_id && existing_order_id != broker_order_id {
+            anyhow::bail!(
+                "T-Bank operation {} maps trade {} to conflicting broker orders {} and {}",
+                item.id,
+                trade_id,
+                existing_order_id,
+                canonical_order_id
+            );
+        }
+    }
+    Ok(())
 }
 
 impl PreparedFillReports {
@@ -389,9 +542,12 @@ async fn prepare_fill_reports(
             cmd.end.map(|value| i128::from(value.as_u64())),
         )
         .await?;
-    let mut reports = Vec::new();
-    let mut provenance = Vec::new();
+
+    // Resolve instrument support before recovering broker order identities. Unsupported
+    // operations are discarded from this adapter's reports, so a GetOrderState failure for one
+    // must not abort this snapshot or hide independently available mass-status reports.
     let mut complete = true;
+    let mut supported_trade_operations = Vec::new();
     for item in &response.items {
         match classify_fill_operation_type(item.r#type) {
             TbankFillOperationKind::Trade(_) => {}
@@ -414,12 +570,11 @@ async fn prepare_fill_reports(
             )
             .await
         {
-            Ok(_) => {}
+            Ok(_) => supported_trade_operations.push(item),
             Err(TbankAdapterError::InstrumentOutOfScope(_)) => {
                 tracing::debug!(
                     "ignoring T-Bank fill operation outside the supported adapter scope"
                 );
-                continue;
             }
             Err(error) if TbankExecutionRuntime::metadata_error_is_event_rejection(&error) => {
                 complete = false;
@@ -427,10 +582,20 @@ async fn prepare_fill_reports(
                     %error,
                     "skipping malformed T-Bank fill operation with invalid instrument identity"
                 );
-                continue;
             }
             Err(error) => return Err(error.into()),
         }
+    }
+    recover_operation_order_identities(
+        &mut client,
+        &supported_trade_operations,
+        &stop_id_by_exchange_order_id,
+        &stop_ids,
+    )
+    .await?;
+    let mut reports = Vec::new();
+    let mut provenance = Vec::new();
+    for item in supported_trade_operations {
         if item
             .trades_info
             .as_ref()
@@ -664,7 +829,7 @@ impl ExecutionClient for TbankExecutionClient {
             !self.task_owner.session_drain_completed && !self.task_owner.session_tasks.is_empty();
         if !session_drain_pending
             || !self.task_owner.operation_tasks.is_empty()
-            || self.runtime.has_unresolved_mutation_outcomes()
+            || self.runtime.has_unresolved_execution_work()
         {
             anyhow::bail!(
                 "cannot reset T-Bank execution client before task drain and broker mutation resolution"
@@ -676,7 +841,8 @@ impl ExecutionClient for TbankExecutionClient {
 
     fn dispose(&mut self) -> anyhow::Result<()> {
         self.disconnect();
-        if !self.task_owner.can_reset() || self.runtime.has_unresolved_mutation_outcomes() {
+        if !self.task_owner.can_reset(&self.runtime) || self.runtime.has_unresolved_execution_work()
+        {
             anyhow::bail!(
                 "cannot dispose T-Bank execution client before task drain and broker mutation resolution"
             );
@@ -1199,6 +1365,7 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         cmd: &nautilus_common::messages::execution::GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let _report_request = self.runtime.begin_report_request()?;
         let mut client = self.runtime.clone();
         client
             .query_order_status_report_by_ids(cmd.client_order_id, cmd.venue_order_id, cmd.ts_init)
@@ -1209,6 +1376,7 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         cmd: &nautilus_common::messages::execution::GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let _report_request = self.runtime.begin_report_request()?;
         let mut client = self.runtime.clone();
         let mut queried_order_states = if cmd.open_only {
             client.query_open_orders().await?.orders
@@ -1442,6 +1610,7 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         cmd: nautilus_common::messages::execution::GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
+        let _report_request = self.runtime.begin_report_request()?;
         let prepared = prepare_fill_reports(self, cmd).await?;
         anyhow::ensure!(
             prepared.complete,
@@ -1455,6 +1624,7 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         cmd: &nautilus_common::messages::execution::GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let _report_request = self.runtime.begin_report_request()?;
         let mut client = self.runtime.clone();
         let mut prepared = prepare_position_status_reports(&mut client, cmd).await?;
         anyhow::ensure!(
@@ -1479,6 +1649,7 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        let _report_request = self.runtime.begin_report_request()?;
         let ts_init = current_unix_nanos();
         let mut status = ExecutionMassStatus::new(
             self.client_id(),

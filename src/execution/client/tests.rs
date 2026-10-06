@@ -11,6 +11,21 @@ fn bind_test_data_event_sender(
     receiver
 }
 
+fn enable_test_command_admission(client: &super::TbankExecutionClient) {
+    client
+        .runtime
+        .lifecycle_active
+        .store(true, std::sync::atomic::Ordering::Release);
+    client
+        .task_owner
+        .external_admission_open
+        .store(true, std::sync::atomic::Ordering::Release);
+    client
+        .task_owner
+        .mutation_admission_open
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
 include!("tests/lifecycle.rs");
 include!("tests/submission.rs");
 include!("tests/projections.rs");

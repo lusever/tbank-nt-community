@@ -2818,8 +2818,8 @@ async fn sandbox_futures_market_fill() -> Result<()> {
             instrument.lot
         );
 
-        // Keep buy, sell, and history reconciliation on one client: operation trades omit broker
-        // order IDs, so fill reports rely on the client's observed trade-to-order index.
+        // Keep buy, sell, and history reconciliation on one client. If the local index has no
+        // mapping, the adapter tries GetOrderState and keeps the snapshot incomplete if unresolved.
         let sell = submit_market_order_with_client(
             execution,
             &adapter_instrument,

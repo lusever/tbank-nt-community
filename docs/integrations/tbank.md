@@ -57,6 +57,13 @@ rejected locally. Live order submission requires both `enable_trading = true` an
 | `CancelAllOrders` / `BatchCancelOrders` | Supported | `CancelAllOrders` is scoped to its instrument and optional side across regular and stop orders |
 | Order/fill/position reports | Supported | Query-backed reports and reconnect reconciliation |
 
+Fill snapshots use `OperationsByCursor` for operation trade data and the broker order index for
+`venue_order_id`. If an operation trade is missing from that index, the adapter looks up its
+operation ID with `GetOrderState` and uses the returned broker order ID. Operation IDs are only
+transient lookup keys because T-Bank says they can change between history reads. If the lookup
+cannot establish an order identity, including when `GetOrderState` no longer retains that order,
+the snapshot stays incomplete and does not publish partial fill reports.
+
 Futures quantities are contracts in Nautilus and whole broker lots at the transport boundary.
 Regular and stop futures orders use point prices and send `PriceType::Point`; stop-order reports
 and order-trade fields are also consumed as points. `OperationItemTrade` prices from cursor
