@@ -93,6 +93,29 @@ type MarketDataStreamClient =
     >;
 type DataEventSender = EventSender<DataEvent>;
 
+enum TbankDataConnection {
+    HistoricalDownload(TbankGrpcClients<TbankAuthInterceptor>),
+    Live(TbankGrpcClients<TbankAuthInterceptor>),
+}
+
+impl TbankDataConnection {
+    fn clients(&self) -> &TbankGrpcClients<TbankAuthInterceptor> {
+        match self {
+            Self::HistoricalDownload(clients) | Self::Live(clients) => clients,
+        }
+    }
+
+    fn clients_mut(&mut self) -> &mut TbankGrpcClients<TbankAuthInterceptor> {
+        match self {
+            Self::HistoricalDownload(clients) | Self::Live(clients) => clients,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+}
+
 const MAX_QUOTES_PER_STREAM: usize = 300;
 const MAX_PRE_ACK_MESSAGES: usize = 2_048;
 type SharedInstrumentMetadata = Arc<RwLock<HashMap<String, MarketDataInstrumentMetadata>>>;
@@ -1093,7 +1116,7 @@ pub struct TbankDataClient {
     cache: Option<CacheView>,
     instrument_metadata: SharedInstrumentMetadata,
     instrument_subscriptions: Vec<(Venue, TypedHandler<InstrumentAny>)>,
-    clients: Option<TbankGrpcClients<TbankAuthInterceptor>>,
+    connection: Option<TbankDataConnection>,
     /// Owns every data worker in the current connection generation. Drop closes admission and
     /// requests abort; `disconnect_async` is required to observe bounded completion.
     session_tasks: TaskGroup,
@@ -1154,7 +1177,7 @@ impl TbankDataClient {
             cache: None,
             instrument_metadata: Arc::new(RwLock::new(HashMap::new())),
             instrument_subscriptions: Vec::new(),
-            clients: None,
+            connection: None,
             session_tasks: TaskGroup::new(),
             stream_tasks: HashMap::new(),
             bar_snapshot_tasks: TaskGroup::new(),
@@ -1209,8 +1232,12 @@ impl TbankDataClient {
     }
 
     async fn prepare_session_generation(&mut self) -> anyhow::Result<()> {
-        if self.clients.is_some() {
+        if self.has_live_connection() {
             self.begin_background_shutdown("replacing T-Bank market-data session", false);
+        } else if self.connection.is_some() {
+            // Historical downloads own only the unary gRPC channel and have no session tasks
+            // or subscriptions to shut down before the live session is initialized.
+            self.connection = None;
         }
         if !self.session_tasks.is_open() {
             self.finish_session_tasks().await?;
@@ -1373,7 +1400,7 @@ impl TbankDataClient {
         self.quote_snapshot_active = false;
         self.session_tasks.begin_shutdown();
         self.unsubscribe_instrument_updates();
-        self.clients = None;
+        self.connection = None;
         *self
             .resolved_instrument_stream_ids
             .write()
@@ -1455,9 +1482,11 @@ impl TbankDataClient {
         let endpoint = self.config.endpoint_uri()?;
         let credentials = self.credential_source.resolve(self.config.environment)?;
         self.config.validate_settings()?;
-        let data_event_sender = required_data_event_sender(self.data_event_sender.clone())?;
+        let data_event_sender = required_data_event_sender(
+            try_get_data_event_sender().or_else(|| self.data_event_sender.clone()),
+        )?;
         self.data_event_sender = Some(data_event_sender.clone());
-        let replacing_clients = self.clients.is_some();
+        let replacing_clients = self.has_live_connection();
         self.prepare_session_generation()
             .await
             .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
@@ -1506,7 +1535,10 @@ impl TbankDataClient {
                 );
             },
         );
-        self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.connection = Some(TbankDataConnection::Live(TbankGrpcClients::new(
+            channel,
+            interceptor,
+        )));
         self.active_credentials = Some(credentials);
         let setup_result = (|| -> anyhow::Result<()> {
             self.subscribe_instrument_updates();
@@ -1537,7 +1569,7 @@ impl TbankDataClient {
             }
             drop(setup_guard);
             self.unsubscribe_instrument_updates();
-            self.clients = None;
+            self.connection = None;
             self.finish_session_tasks()
                 .await
                 .map_err(|shutdown_error| {
@@ -1554,6 +1586,40 @@ impl TbankDataClient {
             endpoint = endpoint.as_str(),
             token_present = true,
             "connected T-Bank data client"
+        );
+        Ok(())
+    }
+
+    /// Connects the client for standalone historical downloads outside a live node.
+    ///
+    /// Opens only the gRPC channel required by unary historical requests such as
+    /// [`Self::get_1m_bars`]. Unlike [`Self::connect`], this path requires no Nautilus
+    /// data-event sender, publishes no instrument definitions, and starts no session or
+    /// stream tasks. Use it for warmup downloaders that run before a `LiveNode` is built;
+    /// live data clients must always connect through [`Self::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid, credentials cannot be
+    /// resolved, or the gRPC channel cannot be established.
+    pub async fn connect_historical_download(&mut self) -> Result<()> {
+        if self.connection.is_some() {
+            return Ok(());
+        }
+        let endpoint = self.config.endpoint_uri()?;
+        let credentials = self.credential_source.resolve(self.config.environment)?;
+        self.config.validate_settings()?;
+        let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
+        let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
+        self.connection = Some(TbankDataConnection::HistoricalDownload(
+            TbankGrpcClients::new(channel, interceptor),
+        ));
+        self.active_credentials = Some(credentials);
+        tracing::info!(
+            environment = ?self.config.environment,
+            endpoint = endpoint.as_str(),
+            token_present = true,
+            "connected T-Bank data client for historical download"
         );
         Ok(())
     }
@@ -1720,9 +1786,15 @@ impl TbankDataClient {
         Ok(())
     }
 
-    /// Returns whether the client is connected.
+    /// Returns whether the live data session is connected and operational.
     pub fn is_connected(&self) -> bool {
-        self.clients.is_some() && self.stream_health.is_operational()
+        self.has_live_connection() && self.stream_health.is_operational()
+    }
+
+    fn has_live_connection(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(TbankDataConnection::is_live)
     }
 
     /// Loads one-minute bars for an instrument and time range.
@@ -2051,9 +2123,23 @@ impl TbankDataClient {
     }
 
     fn clients_mut(&mut self) -> Result<&mut TbankGrpcClients<TbankAuthInterceptor>> {
-        self.clients.as_mut().ok_or_else(|| {
-            TbankAdapterError::ConfigError("data client is not connected".to_string())
-        })
+        self.connection
+            .as_mut()
+            .map(TbankDataConnection::clients_mut)
+            .ok_or_else(|| {
+                TbankAdapterError::ConfigError("data client is not connected".to_string())
+            })
+    }
+
+    fn grpc_clients_ref(&self) -> Option<&TbankGrpcClients<TbankAuthInterceptor>> {
+        self.connection.as_ref().map(TbankDataConnection::clients)
+    }
+
+    fn live_clients_ref(&self) -> Option<&TbankGrpcClients<TbankAuthInterceptor>> {
+        match self.connection.as_ref() {
+            Some(TbankDataConnection::Live(clients)) => Some(clients),
+            Some(TbankDataConnection::HistoricalDownload(_)) | None => None,
+        }
     }
 
     fn cached_bar_watermarks(&self) -> HashMap<BarType, i128> {
@@ -2123,14 +2209,12 @@ impl TbankDataClient {
         }
 
         let market_data_stream = self
-            .clients
-            .as_ref()
+            .live_clients_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .market_data_stream
             .clone();
         let market_data_client = self
-            .clients
-            .as_ref()
+            .live_clients_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .market_data
             .clone();
@@ -2245,7 +2329,7 @@ impl TbankDataClient {
         }
         self.scheduled_bar_continuity_keys = next_continuity_keys;
         if !groups.is_empty() || !poll_subscriptions.is_empty() {
-            if self.clients.is_some() && self.snapshot_task_reaper.is_none() {
+            if self.has_live_connection() && self.snapshot_task_reaper.is_none() {
                 anyhow::bail!("T-Bank bar snapshot task reaper is not running");
             }
             let spawner = self
@@ -2367,19 +2451,17 @@ impl TbankDataClient {
             return Ok(());
         }
 
-        if self.clients.is_some() && self.snapshot_task_reaper.is_none() {
+        if self.has_live_connection() && self.snapshot_task_reaper.is_none() {
             anyhow::bail!("T-Bank quote snapshot task reaper is not running");
         }
 
         let market_data_stream = self
-            .clients
-            .as_ref()
+            .live_clients_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .market_data_stream
             .clone();
         let market_data_client = self
-            .clients
-            .as_ref()
+            .live_clients_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .market_data
             .clone();
@@ -2524,8 +2606,7 @@ impl TbankDataClient {
     ) -> anyhow::Result<()> {
         let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
         let (market_data_stream, market_data_client) = self
-            .clients
-            .as_ref()
+            .live_clients_ref()
             .map(|clients| {
                 (
                     clients.market_data_stream.clone(),
@@ -5392,7 +5473,10 @@ mod tests {
         let interceptor =
             TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-        client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        client.connection = Some(TbankDataConnection::Live(TbankGrpcClients::new(
+            channel,
+            interceptor,
+        )));
         client.bar_subscriptions.insert(sber_id(), sber_bar_type());
         client.quote_subscriptions.insert(sber_id());
         client.trade_subscriptions.insert(sber_id());
@@ -5434,7 +5518,10 @@ mod tests {
         let interceptor =
             TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-        client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        client.connection = Some(TbankDataConnection::Live(TbankGrpcClients::new(
+            channel,
+            interceptor,
+        )));
 
         assert!(client.is_connected());
         client.stream_health.register("bars:group:0:1m");
@@ -5934,7 +6021,10 @@ mod tests {
         let interceptor =
             TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-        client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        client.connection = Some(TbankDataConnection::Live(TbankGrpcClients::new(
+            channel,
+            interceptor,
+        )));
         client.active_credentials = Some(Arc::new(SecretString::from("test-token")));
         client.start_snapshot_task_reaper().unwrap();
 
@@ -6053,7 +6143,10 @@ mod tests {
         let interceptor =
             TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
         let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-        client.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        client.connection = Some(TbankDataConnection::Live(TbankGrpcClients::new(
+            channel,
+            interceptor,
+        )));
         client.active_credentials = Some(Arc::new(SecretString::from("test-token")));
         client.start_snapshot_task_reaper().unwrap();
         client.bar_subscriptions.insert(sber_id(), sber_bar_type());
@@ -6909,6 +7002,92 @@ mod tests {
         assert!(matches!(
             required_data_event_sender(None),
             Err(TbankAdapterError::DataEventPublicationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_requires_a_live_runner_sender_before_any_network_use() {
+        assert!(try_get_data_event_sender().is_none());
+        let mut client = TbankDataClient::new(TbankDataClientConfig {
+            token: Some(SecretString::from("test-token")),
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..TbankDataClientConfig::default()
+        });
+
+        let error = client.connect().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            TbankAdapterError::DataEventPublicationFailed(_)
+        ));
+        assert!(client.connection.is_none());
+    }
+
+    #[tokio::test]
+    async fn historical_download_connects_without_a_live_runner_sender() {
+        assert!(try_get_data_event_sender().is_none());
+        let mut client = TbankDataClient::new(TbankDataClientConfig {
+            token: Some(SecretString::from("test-token")),
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..TbankDataClientConfig::default()
+        });
+
+        let error = client.connect_historical_download().await.unwrap_err();
+
+        // The historical path fails on transport, never on data-event publication: it
+        // runs before a LiveNode binds its thread-local sender.
+        assert!(!matches!(
+            error,
+            TbankAdapterError::DataEventPublicationFailed(_)
+        ));
+        assert!(client.connection.is_none());
+        assert!(client.data_event_sender.is_none());
+    }
+
+    #[tokio::test]
+    async fn historical_download_is_noop_when_channel_is_already_open() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor =
+            TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client.connection = Some(TbankDataConnection::HistoricalDownload(
+            TbankGrpcClients::new(channel, interceptor),
+        ));
+        client.active_credentials = Some(Arc::new(SecretString::from("test-token")));
+
+        client.connect_historical_download().await.unwrap();
+
+        assert!(!client.is_connected());
+        client.begin_background_shutdown("test cleanup", false);
+        client.finish_session_tasks().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_connect_does_not_treat_historical_channel_as_live_connection() {
+        assert!(try_get_data_event_sender().is_none());
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let interceptor =
+            TbankAuthInterceptor::new(Arc::new(SecretString::from("test-token"))).unwrap();
+        let mut client = TbankDataClient::new(TbankDataClientConfig {
+            token: Some(SecretString::from("test-token")),
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            ..TbankDataClientConfig::default()
+        });
+        client.connection = Some(TbankDataConnection::HistoricalDownload(
+            TbankGrpcClients::new(channel, interceptor),
+        ));
+        client.active_credentials = Some(Arc::new(SecretString::from("test-token")));
+
+        let error = client.connect().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            TbankAdapterError::DataEventPublicationFailed(_)
+        ));
+        assert!(!client.is_connected());
+        assert!(matches!(
+            client.connection,
+            Some(TbankDataConnection::HistoricalDownload(_))
         ));
     }
 

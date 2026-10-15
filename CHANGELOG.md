@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Добавлен `TbankDataClient::connect_historical_download()` — ветка подключения для standalone-загрузчиков исторических данных, работающих до сборки `LiveNode` (например, warmup-загрузчик `tbank-live-node`). Она открывает только gRPC-канал для unary-исторических запросов, не требует Nautilus data-event sender, не публикует определения инструментов и не запускает session/stream-задачи. Обычный `DataClient::connect` остаётся fail-closed: без инициализированного sender он по-прежнему падает с `DataEventPublicationFailed`. Warmup-загрузчик `tbank-live-node` переведён на этот метод.
 - Адаптер переведён на NautilusTrader `v2.0.0rc6` (все прямые crates версии `0.65.0`) и `jiff 0.2.37`. Обновлены конструкторы инструментов, типы/хуки depth и виртуальные часы; снимки книги передают запрошенные уровни до 50 без padding, а inconsistent snapshots отклоняются.
 - `CancelAllOrders` теперь передаёт instrument/side в runtime и отменяет только совпадающие обычные и стоп-заявки. Неизвестная broker identity не расширяет область отмены. Execution client явно сохраняет unresolved submissions после исчерпания upstream recovery.
 

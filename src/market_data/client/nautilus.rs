@@ -166,8 +166,7 @@ impl DataClient for TbankDataClient {
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
         let clients = self
-            .clients
-            .as_ref()
+            .grpc_clients_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .clone();
         let publication = Arc::clone(&self.session_publication);
@@ -251,8 +250,7 @@ impl DataClient for TbankDataClient {
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
         let clients = self
-            .clients
-            .as_ref()
+            .grpc_clients_ref()
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?
             .clone();
         let publication = Arc::clone(&self.session_publication);
