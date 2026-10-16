@@ -1,7 +1,7 @@
 # T-Bank adapter capability matrix
 
 This matrix describes the public behavior of `tbank-nt-community` `0.3.1` with NautilusTrader
-`v2.0.0rc6`.
+`v2.0.0rc7`.
 
 ## Instruments and data
 
