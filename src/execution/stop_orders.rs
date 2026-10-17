@@ -242,6 +242,7 @@ mod tests {
     #[test]
     fn futures_stop_order_uses_point_trigger_and_price_type() {
         let order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "Si-9.26_SPBFUT.MOEX".to_string(),
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),
@@ -268,6 +269,7 @@ mod tests {
     #[test]
     fn futures_trailing_stop_uses_point_activation_and_offsets() {
         let order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "Si-9.26_SPBFUT.MOEX".to_string(),
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),
@@ -308,6 +310,7 @@ mod tests {
     #[test]
     fn market_if_touched_maps_to_regular_take_profit() {
         let order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),
@@ -335,6 +338,7 @@ mod tests {
     #[test]
     fn stop_order_forwards_margin_confirmation() {
         let order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),
@@ -354,6 +358,7 @@ mod tests {
     #[test]
     fn stop_order_rejects_request_id_longer_than_tbank_limit() {
         let order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             client_order_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156-P33-SL".to_string(),
             broker_request_id: "not-a-uuid".to_string(),
@@ -375,6 +380,7 @@ mod tests {
     #[test]
     fn trailing_stop_market_maps_basis_points_to_tbank_percent() {
         let order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),
@@ -418,6 +424,7 @@ mod tests {
     #[test]
     fn trailing_stop_limit_maps_activation_indent_and_spread() {
         let order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             client_order_id: REQUEST_ID.to_string(),
             broker_request_id: REQUEST_ID.to_string(),

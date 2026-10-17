@@ -27,7 +27,7 @@ use crate::{
 
 pub(crate) type MarketDataClient = MarketDataServiceClient<
     tonic::codegen::InterceptedService<
-        tonic::transport::Channel,
+        crate::grpc::limited_channel::TbankLimitedChannel,
         crate::grpc::TbankAuthInterceptor,
     >,
 >;

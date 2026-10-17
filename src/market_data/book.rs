@@ -11,7 +11,7 @@ pub enum TbankBookSide {
     Ask,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// One price level in a T-Bank order book.
 pub struct TbankOrderBookLevel {
     /// Level price.
@@ -22,7 +22,7 @@ pub struct TbankOrderBookLevel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Normalized full order-book snapshot.
-pub struct TbankOrderBookSnapshot {
+pub struct TbankWireOrderBookSnapshot {
     /// Broker instrument UID.
     pub instrument_uid: String,
     /// Requested book depth.
@@ -56,8 +56,8 @@ pub struct SyntheticBookDelta {
 
 /// Computes synthetic order-book deltas between two snapshots.
 pub fn synthetic_deltas(
-    previous: Option<&TbankOrderBookSnapshot>,
-    next: &TbankOrderBookSnapshot,
+    previous: Option<&TbankWireOrderBookSnapshot>,
+    next: &TbankWireOrderBookSnapshot,
 ) -> Vec<SyntheticBookDelta> {
     let Some(previous) = previous else {
         return Vec::new();
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn first_snapshot_after_reconnect_has_no_synthetic_deltas() {
-        let snapshot = TbankOrderBookSnapshot {
+        let snapshot = TbankWireOrderBookSnapshot {
             instrument_uid: "uid".to_string(),
             depth: 10,
             is_consistent: true,
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn snapshot_diff_is_marked_synthetic() {
-        let previous = TbankOrderBookSnapshot {
+        let previous = TbankWireOrderBookSnapshot {
             instrument_uid: "uid".to_string(),
             depth: 10,
             is_consistent: true,
@@ -147,7 +147,7 @@ mod tests {
             ts_event: 1,
             ts_init: 1,
         };
-        let next = TbankOrderBookSnapshot {
+        let next = TbankWireOrderBookSnapshot {
             bids: vec![TbankOrderBookLevel {
                 price: Decimal::new(100, 0),
                 quantity_lots: 2,

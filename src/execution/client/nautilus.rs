@@ -377,33 +377,22 @@ pub(super) async fn submit_prepared_nautilus_order_list(
     emitter: ExecutionEventEmitter,
     recovery_deadline: tokio::time::Instant,
 ) {
-    let mut remaining = prepared.into_iter().zip(orders);
-    while let Some(((prepared, client_order_id), order)) = remaining.next() {
-        if submit_outcome_submit_budget(
-            client.config.request_timeout,
-            recovery_deadline,
-            tokio::time::Instant::now(),
-        )
-        .is_none()
-        {
-            let reason = "order-list submit deadline leaves no dispatch window";
-            client.remove_unresolved_broker_order_route(client_order_id.as_str());
-            emitter.emit_order_denied(&order, reason);
-            for ((_, client_order_id), order) in remaining {
+    let futures = prepared.into_iter().zip(orders).map(|((prepared, client_order_id), order)| {
+        let mut client = client.clone();
+        let emitter = emitter.clone();
+        async move {
+            if submit_outcome_submit_budget(client.config.request_timeout, recovery_deadline, tokio::time::Instant::now()).is_none() {
                 client.remove_unresolved_broker_order_route(client_order_id.as_str());
-                emitter.emit_order_denied(&order, reason);
+                emitter.emit_order_denied(&order, "order-list submit deadline leaves no dispatch window");
+                return;
             }
-            return;
+            emitter.emit_order_submitted(&order);
+            if let Err(error) = submit_prepared_nautilus_order(&mut client, prepared, emitter, recovery_deadline).await {
+                tracing::error!(%error, %client_order_id, "failed to submit order-list leg to T-Bank");
+            }
         }
-
-        emitter.emit_order_submitted(&order);
-        if let Err(error) =
-            submit_prepared_nautilus_order(client, prepared, emitter.clone(), recovery_deadline)
-                .await
-        {
-            tracing::error!(%error, %client_order_id, "failed to submit order-list leg to T-Bank");
-        }
-    }
+    });
+    futures_util::future::join_all(futures).await;
 }
 
 pub(super) fn submit_commands_from_list(
@@ -886,6 +875,13 @@ impl ExecutionClient for TbankExecutionClient {
             return Ok(());
         }
         let client_order_id = cmd.client_order_id;
+        crate::grpc::limiter::diagnostic_with_context(
+            0,
+            "SubmitOrder",
+            "command_received",
+            Some(client_order_id.as_str()),
+            None,
+        );
         let order_type = cmd.order_init.order_type;
         let emitter = self.runtime.emitter.clone();
         let route_runtime = self.runtime.clone();
@@ -1076,6 +1072,35 @@ impl ExecutionClient for TbankExecutionClient {
         cmd: nautilus_common::messages::execution::CancelOrder,
     ) -> anyhow::Result<()> {
         self.runtime.ensure_lifecycle_active()?;
+        if let Ok(order) = self.core.get_order(&cmd.client_order_id) {
+            let order_type = nautilus_model::orders::Order::order_type(&order);
+            if let Some(venue_order_id) = nautilus_model::orders::Order::venue_order_id(&order) {
+                let route = if matches!(order_type, OrderType::Market | OrderType::Limit) {
+                    TbankBrokerOrderRoute::RegularOrder
+                } else {
+                    TbankBrokerOrderRoute::StopOrder
+                };
+                self.runtime.record_broker_order_mapping(
+                    route,
+                    cmd.client_order_id.as_str(),
+                    venue_order_id.as_str(),
+                );
+                self.runtime.record_pending_submit_venue_order_id(
+                    cmd.client_order_id.as_str(),
+                    venue_order_id.as_str(),
+                );
+            } else {
+                self.runtime
+                    .prepare_submit_route(&cmd.client_order_id, order_type);
+            }
+        }
+        crate::grpc::limiter::diagnostic_with_context(
+            0,
+            "CancelOrder",
+            "command_received",
+            Some(cmd.client_order_id.as_str()),
+            None,
+        );
         let mut client = self.runtime.clone();
         let emitter = self.runtime.emitter.clone();
         let account_id = self.runtime.account_id();
@@ -1202,7 +1227,7 @@ impl ExecutionClient for TbankExecutionClient {
                     );
                     if matches!(
                         classify_command_failure(&error),
-                        CommandFailure::VenueRejected(_)
+                        CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
                     ) {
                         emitter.emit_order_cancel_rejected_event(
                             cmd.strategy_id,
@@ -1213,8 +1238,12 @@ impl ExecutionClient for TbankExecutionClient {
                             current_unix_nanos(),
                         );
                     } else {
-                        match client.recover_ambiguous_cancel(identity).await {
+                        match client.recover_ambiguous_cancel(identity.clone()).await {
                             Ok(TbankCancelRecoveryOutcome::Canceled) => {
+                                if identity.route == TbankBrokerOrderRoute::RegularOrder {
+                                    // Reconciliation already published both authoritative state and fills.
+                                    return;
+                                }
                                 let ts_event = current_unix_nanos();
                                 client.lifecycle_active.run_if_active(|| {
                                     emitter.send_order_event(OrderEventAny::Canceled(
@@ -1241,7 +1270,7 @@ impl ExecutionClient for TbankExecutionClient {
                                         cmd.instrument_id,
                                         cmd.client_order_id,
                                         cmd.venue_order_id,
-                                        "broker reconciliation confirmed the order remains active",
+                                        "broker reconciliation confirmed the order was not cancelled",
                                         current_unix_nanos(),
                                     );
                                 });

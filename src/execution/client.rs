@@ -701,6 +701,11 @@ impl TbankExecutionClient {
 
     /// Connects the client to the configured T-Bank endpoint.
     pub async fn connect(&mut self) -> Result<()> {
+        if self.core.is_connected() {
+            return self.runtime.connect_for_node(&mut self.task_owner).await;
+        }
+        self.runtime.ensure_previous_generation_resolved()?;
+        let pending_cancels = self.restore_cached_execution_intents()?;
         self.runtime.connect_for_node(&mut self.task_owner).await?;
         if let Err(error) = self.await_account_registered().await {
             if let Err(cleanup_error) = self.disconnect_async().await {
@@ -710,7 +715,87 @@ impl TbankExecutionClient {
         }
         self.task_owner.mark_ready(&mut self.runtime);
         self.core.set_connected();
+        for cancel in pending_cancels {
+            <Self as ExecutionClient>::cancel_order(self, cancel).map_err(|e| {
+                TbankAdapterError::ConfigError(format!(
+                    "cannot restore persisted cancel intent: {e}"
+                ))
+            })?;
+        }
         Ok(())
+    }
+
+    fn restore_cached_execution_intents(
+        &mut self,
+    ) -> Result<Vec<nautilus_common::messages::execution::CancelOrder>> {
+        use nautilus_model::orders::Order;
+        let cache = self.core.cache();
+        let orders = cache
+            .orders(None, None, None, None, None)
+            .into_iter()
+            .filter(|o| {
+                !o.is_closed()
+                    && cache.client_id(&o.client_order_id()) == Some(&self.core.client_id)
+                    && o.account_id().is_none_or(|id| id == self.core.account_id)
+            })
+            .collect::<Vec<_>>();
+        let mut staged = self
+            .runtime
+            .broker_order_index
+            .lock()
+            .expect("broker_order_index lock")
+            .clone();
+        let mut cancels = Vec::new();
+        for order in orders {
+            let id = order.client_order_id();
+            let regular = matches!(order.order_type(), OrderType::Market | OrderType::Limit);
+            let route = if regular {
+                TbankBrokerOrderRoute::RegularOrder
+            } else {
+                TbankBrokerOrderRoute::StopOrder
+            };
+            staged.record_client_order_route(route, id.as_str());
+            if regular {
+                let request_id = tbank_broker_request_id_for_client_order_id(id.as_str());
+                staged
+                    .get_or_allocate_request_mapping(id.as_str(), Some(&request_id))
+                    .map_err(TbankAdapterError::ConfigError)?;
+            }
+            if let Some(venue_id) = order.venue_order_id() {
+                staged.record_mapping(route, id.as_str(), venue_id.as_str());
+            }
+            staged.record_managed_context(
+                id.as_str(),
+                TbankManagedOrderContext {
+                    side: tbank_side(order.order_side()).ok(),
+                    order_type: tbank_order_type(order.order_type()).ok(),
+                    report_order_type: Some(order.order_type()),
+                    time_in_force: Some(order.time_in_force()),
+                    quantity_units: Some(order.quantity().as_decimal()),
+                    trailing: None,
+                },
+            );
+            if order.is_pending_cancel() {
+                cancels.push(nautilus_common::messages::execution::CancelOrder::new(
+                    order.trader_id(),
+                    Some(self.core.client_id),
+                    order.strategy_id(),
+                    order.instrument_id(),
+                    id,
+                    order.venue_order_id(),
+                    UUID4::new(),
+                    current_unix_nanos(),
+                    None,
+                    None,
+                ));
+            }
+        }
+        *self
+            .runtime
+            .broker_order_index
+            .lock()
+            .expect("broker_order_index lock") = staged;
+        Ok(cancels)
     }
 
     async fn await_account_registered(&self) -> Result<()> {
@@ -1037,8 +1122,20 @@ impl TbankPendingSubmitStage {
 /// the snapshot only when a broker order report or an explicit broker finality guarantee settles it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TbankUnresolvedSubmit {
+    /// Selected broker method.
+    pub submit_method: crate::execution::TbankSubmitMethod,
+    /// Optional broker intent identity; never an exchange order ID.
+    pub trade_intent_id: Option<String>,
+    /// Broker trade-order identifier observed on the stream, separate from the exchange ID.
+    pub broker_trade_order_id: Option<String>,
+    /// Internal receipt identifier from an initial NEW event, never an exchange ID.
+    pub broker_receipt_id: Option<String>,
     /// Nautilus client order id of the pending submit.
     pub client_order_id: String,
+    /// Deterministic broker idempotency UUID.
+    pub broker_request_id: String,
+    /// Confirmed exchange identity, when available.
+    pub venue_order_id: Option<String>,
     /// Instrument id of the pending submit.
     pub instrument_id: String,
     /// Order side sent to T-Bank.
@@ -1188,13 +1285,20 @@ fn stop_order_is_after_submit(stop: &StopOrder, submitted_ts: UnixNanos, query_f
 
 #[derive(Debug, Clone)]
 struct TbankPendingSubmit {
+    submit_method: crate::execution::TbankSubmitMethod,
+    trade_intent_id: Option<String>,
+    broker_trade_order_id: Option<String>,
+    broker_receipt_id: Option<String>,
     instrument_id: String,
     submitted_ts: UnixNanos,
     quantity_units: Decimal,
     side: crate::common::TbankOrderSide,
     order_type: crate::common::TbankOrderType,
     time_in_force: TimeInForce,
+    limit_price: Option<Decimal>,
+    trigger_price: Option<Decimal>,
     trailing: Option<crate::execution::TbankTrailingStopParams>,
+    confirm_margin_trade: bool,
     venue_order_id: Option<String>,
     last_reconciliation_ts: Option<UnixNanos>,
     stage: TbankPendingSubmitStage,
@@ -1204,7 +1308,13 @@ struct TbankPendingSubmit {
 impl TbankPendingSubmit {
     fn snapshot(&self, client_order_id: &str) -> TbankUnresolvedSubmit {
         TbankUnresolvedSubmit {
+            submit_method: self.submit_method,
+            trade_intent_id: self.trade_intent_id.clone(),
+            broker_trade_order_id: self.broker_trade_order_id.clone(),
+            broker_receipt_id: self.broker_receipt_id.clone(),
             client_order_id: client_order_id.to_string(),
+            broker_request_id: tbank_broker_request_id_for_client_order_id(client_order_id),
+            venue_order_id: self.venue_order_id.clone(),
             instrument_id: self.instrument_id.clone(),
             side: self.side,
             order_type: self.order_type,
@@ -1673,7 +1783,11 @@ impl TbankExecutionRuntime {
         self.config.validate_settings()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
-        self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.clients = Some(TbankGrpcClients::new_with_quota_scope(
+            channel,
+            interceptor,
+            self.config.quota_scope.clone(),
+        ));
         self.active_credentials = Some(credentials);
         self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
@@ -1728,7 +1842,11 @@ impl TbankExecutionRuntime {
         self.config.validate_settings()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
-        self.clients = Some(TbankGrpcClients::new(channel, interceptor));
+        self.clients = Some(TbankGrpcClients::new_with_quota_scope(
+            channel,
+            interceptor,
+            self.config.quota_scope.clone(),
+        ));
         self.active_credentials = Some(credentials);
         self.begin_connection_generation();
         self.lifecycle_active = Arc::new(TbankLifecycleToken::new(true));
@@ -1970,6 +2088,26 @@ impl TbankExecutionRuntime {
             .lock()
             .expect("broker_order_index lock")
             .remove_unresolved_client_order_route(client_order_id);
+        let rejected_or_not_sent = self
+            .pending_submits
+            .lock()
+            .expect("pending_submits lock")
+            .get(client_order_id)
+            .is_none_or(|p| {
+                matches!(
+                    p.stage,
+                    TbankPendingSubmitStage::Rejected | TbankPendingSubmitStage::DefinitivelyAbsent
+                )
+            });
+        if rejected_or_not_sent {
+            self.unresolved_cancellations
+                .lock()
+                .expect("unresolved_cancellations lock")
+                .remove(&TbankBrokerOrderIdentity {
+                    route: TbankBrokerOrderRoute::RegularOrder,
+                    broker_order_id: tbank_broker_request_id_for_client_order_id(client_order_id),
+                });
+        }
         self.reject_pending_cancel_waiters(
             client_order_id,
             "T-Bank order submission was rejected before a broker order identity was available",
@@ -2148,7 +2286,17 @@ impl TbankExecutionRuntime {
                 .broker_order_index
                 .lock()
                 .expect("broker_order_index lock");
-            let known_identity = index.identity_for(Some(client_order_id), venue_order_id);
+            let known_identity = index
+                .identity_for(Some(client_order_id), venue_order_id)
+                .or_else(|| {
+                    let request_id = tbank_broker_request_id_for_client_order_id(client_order_id);
+                    (venue_order_id.is_none()
+                        && index.is_known_regular_order_request_id(&request_id))
+                    .then_some(TbankBrokerOrderIdentity {
+                        route: TbankBrokerOrderRoute::RegularOrder,
+                        broker_order_id: request_id,
+                    })
+                });
             let (pending_route, pending_cancel_owner) = if known_identity.is_none() {
                 let route = index.route_for_client_order_id(client_order_id);
                 let owner = route.is_some()
@@ -2212,15 +2360,17 @@ impl TbankExecutionRuntime {
                 .await
             {
                 Ok(()) => {
-                    self.unresolved_cancellations
-                        .lock()
-                        .expect("unresolved_cancellations lock")
-                        .remove(&identity);
-                    tracing::info!(
-                        attempt = attempt + 1,
-                        "recovered ambiguous T-Bank cancel outcome"
+                    // Cancel RPC success does not account for executions racing the cancellation.
+                    return Ok(
+                        if self
+                            .reconcile_cancel_after_terminal_response(&identity)
+                            .await?
+                        {
+                            TbankCancelRecoveryOutcome::Canceled
+                        } else {
+                            TbankCancelRecoveryOutcome::Active
+                        },
                     );
-                    return Ok(TbankCancelRecoveryOutcome::Canceled);
                 }
                 Err(error)
                     if matches!(
@@ -2287,6 +2437,31 @@ impl TbankExecutionRuntime {
         let cancelled = match identity.route {
             TbankBrokerOrderRoute::RegularOrder => {
                 let state = self.query_order(broker_order_id).await?;
+                if self.emitter.is_initialized() {
+                    let now = current_unix_nanos();
+                    let report = self
+                        .order_status_report_from_state_with_lots(
+                            self.account_id(),
+                            state.clone(),
+                            now,
+                        )
+                        .await
+                        .map_err(|e| TbankAdapterError::ConversionError(e.to_string()))?;
+                    let fills = self
+                        .reconciled_fill_reports_from_state(&state, &report, now)
+                        .map_err(|e| TbankAdapterError::ConversionError(e.to_string()))?;
+                    self.lifecycle_active.run_if_active(|| {
+                        if let Some(report) =
+                            project_order_status_report(&self.order_status_projection, report)
+                        {
+                            self.emitter.send_order_with_fills(report, fills);
+                        } else {
+                            for fill in fills {
+                                self.emitter.send_fill_report(fill);
+                            }
+                        }
+                    });
+                }
                 match TbankOrderExecutionReportStatus::try_from(state.execution_report_status).ok()
                 {
                     Some(TbankOrderExecutionReportStatus::ExecutionReportStatusCancelled) => true,
@@ -2389,22 +2564,27 @@ impl TbankExecutionRuntime {
         self.pending_submits
             .lock()
             .expect("pending_submits lock")
-            .insert(
-                order.client_order_id.clone(),
-                TbankPendingSubmit {
-                    instrument_id: order.instrument_id.clone(),
-                    submitted_ts,
-                    quantity_units: order.quantity_units,
-                    side: order.side,
-                    order_type: order.order_type,
-                    time_in_force: order.time_in_force,
-                    trailing: order.trailing,
-                    venue_order_id: None,
-                    last_reconciliation_ts: None,
-                    stage: TbankPendingSubmitStage::Submitted,
-                    recovery_attempts: 0,
-                },
-            );
+            .entry(order.client_order_id.clone())
+            .or_insert_with(|| TbankPendingSubmit {
+                submit_method: order.submit_method,
+                trade_intent_id: None,
+                broker_trade_order_id: None,
+                broker_receipt_id: None,
+                instrument_id: order.instrument_id.clone(),
+                submitted_ts,
+                quantity_units: order.quantity_units,
+                side: order.side,
+                order_type: order.order_type,
+                time_in_force: order.time_in_force,
+                limit_price: order.limit_price,
+                trigger_price: order.trigger_price,
+                trailing: order.trailing,
+                confirm_margin_trade: order.confirm_margin_trade,
+                venue_order_id: None,
+                last_reconciliation_ts: None,
+                stage: TbankPendingSubmitStage::Submitted,
+                recovery_attempts: 0,
+            });
     }
 
     fn prepare_submit_route(&self, client_order_id: &ClientOrderId, order_type: OrderType) {
@@ -2419,10 +2599,17 @@ impl TbankExecutionRuntime {
         } else {
             TbankBrokerOrderRoute::RegularOrder
         };
-        self.broker_order_index
+        let mut index = self
+            .broker_order_index
             .lock()
-            .expect("broker_order_index lock")
-            .record_client_order_route(route, client_order_id.as_str());
+            .expect("broker_order_index lock");
+        if route == TbankBrokerOrderRoute::RegularOrder {
+            let request_id = tbank_broker_request_id_for_client_order_id(client_order_id.as_str());
+            index
+                .get_or_allocate_request_mapping(client_order_id.as_str(), Some(&request_id))
+                .expect("Nautilus client order must retain its deterministic request UUID");
+        }
+        index.record_client_order_route(route, client_order_id.as_str());
     }
 
     fn mark_pending_submit_stage(
@@ -2453,6 +2640,15 @@ impl TbankExecutionRuntime {
                 stage = ?pending.stage,
                 "updated T-Bank pending submit state"
             );
+        }
+        if stage == TbankPendingSubmitStage::Rejected {
+            self.unresolved_cancellations
+                .lock()
+                .expect("unresolved_cancellations lock")
+                .remove(&TbankBrokerOrderIdentity {
+                    route: TbankBrokerOrderRoute::RegularOrder,
+                    broker_order_id: tbank_broker_request_id_for_client_order_id(client_order_id),
+                });
         }
     }
 
@@ -2627,8 +2823,19 @@ impl TbankExecutionRuntime {
         instrument: &TbankInstrumentMetadata,
         recovery_deadline: tokio::time::Instant,
     ) -> std::result::Result<TbankSubmitResponse, TbankCommandError> {
+        let preserve_prior_outcome = self
+            .pending_submits
+            .lock()
+            .expect("pending_submits lock")
+            .get(&order.client_order_id)
+            .is_some_and(|p| {
+                p.stage != TbankPendingSubmitStage::Rejected
+                    && p.stage != TbankPendingSubmitStage::DefinitivelyAbsent
+            });
         if let Err(error) = self.ensure_broker_request_mapping(order) {
-            self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+            if !preserve_prior_outcome {
+                self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+            }
             return Err(TbankCommandError::before_rpc(error));
         }
         let (submit_deadline, request_timeout) = match submit_outcome_submit_budget(
@@ -2638,7 +2845,9 @@ impl TbankExecutionRuntime {
         ) {
             Some(budget) => budget,
             None => {
-                self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+                if !preserve_prior_outcome {
+                    self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+                }
                 return Err(TbankCommandError::before_rpc(
                     TbankAdapterError::GrpcStatus {
                         code: tonic::Code::DeadlineExceeded,
@@ -2647,21 +2856,89 @@ impl TbankExecutionRuntime {
                 ));
             }
         };
+        if self
+            .pending_submits
+            .lock()
+            .expect("pending_submits lock")
+            .get(&order.client_order_id)
+            .is_some_and(|p| {
+                p.submit_method != order.submit_method
+                    || p.instrument_id != order.instrument_id
+                    || p.side != order.side
+                    || p.order_type != order.order_type
+                    || p.quantity_units != order.quantity_units
+                    || p.time_in_force != order.time_in_force
+                    || p.limit_price != order.limit_price
+                    || p.trigger_price != order.trigger_price
+                    || p.trailing != order.trailing
+                    || p.confirm_margin_trade != order.confirm_margin_trade
+            })
+        {
+            return Err(TbankCommandError::before_rpc(
+                TbankAdapterError::ConfigError(
+                    "a logical order cannot change method or normalized terms during retry".into(),
+                ),
+            ));
+        }
         self.record_pending_submit(order, current_unix_nanos());
-        match tokio::time::timeout_at(
+        let dispatch_marker = crate::grpc::limited_channel::TbankDispatchMarker::for_order(
+            order.client_order_id.clone(),
+        );
+        let result = match tokio::time::timeout_at(
             submit_deadline,
-            self.submit_order_request(order, instrument, request_timeout),
+            self.submit_order_request(
+                order,
+                instrument,
+                request_timeout,
+                dispatch_marker.clone(),
+                preserve_prior_outcome,
+            ),
         )
         .await
         {
+            Ok(Err(mut error)) => {
+                if !dispatch_marker.started() {
+                    error.stage = TbankCommandStage::BeforeRpc;
+                }
+                Err(error)
+            }
             Ok(result) => result,
-            Err(_) => Err(TbankCommandError::rpc_started(
-                TbankAdapterError::GrpcStatus {
-                    code: tonic::Code::DeadlineExceeded,
-                    message: "submit RPC exceeded its reserved deadline".into(),
+            Err(_) => Err(TbankCommandError {
+                stage: if dispatch_marker.started() {
+                    TbankCommandStage::RpcStarted
+                } else {
+                    TbankCommandStage::BeforeRpc
                 },
-            )),
+                error: TbankAdapterError::GrpcStatus {
+                    code: tonic::Code::DeadlineExceeded,
+                    message: "submit exceeded its reserved deadline".into(),
+                },
+            }),
+        };
+        if result.is_err() && !dispatch_marker.started() && !preserve_prior_outcome {
+            let confirmed = self
+                .pending_submits
+                .lock()
+                .expect("pending_submits lock")
+                .get(&order.client_order_id)
+                .is_some_and(|p| p.stage.is_broker_confirmed());
+            if !confirmed {
+                self.remove_unresolved_broker_order_route(&order.client_order_id);
+                self.mark_pending_submit_stage(
+                    &order.client_order_id,
+                    TbankPendingSubmitStage::Rejected,
+                    None,
+                );
+                self.unresolved_cancellations
+                    .lock()
+                    .expect("unresolved_cancellations lock")
+                    .remove(&TbankBrokerOrderIdentity {
+                        route: TbankBrokerOrderRoute::RegularOrder,
+                        broker_order_id: order.broker_request_id.clone(),
+                    });
+            }
         }
+        result
     }
 
     async fn submit_order_request(
@@ -2669,25 +2946,31 @@ impl TbankExecutionRuntime {
         order: &TbankSubmitOrder,
         instrument: &TbankInstrumentMetadata,
         request_timeout: Duration,
+        dispatch_marker: crate::grpc::limited_channel::TbankDispatchMarker,
+        preserve_prior_outcome: bool,
     ) -> std::result::Result<TbankSubmitResponse, TbankCommandError> {
         if let Err(error) = self.config.ensure_submit_allowed() {
-            self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
-            self.mark_pending_submit_stage(
-                order.client_order_id.as_str(),
-                TbankPendingSubmitStage::Rejected,
-                None,
-            );
-            return Err(TbankCommandError::before_rpc(error));
-        }
-        let account_id = match self.config.resolve_account_id() {
-            Ok(account_id) => account_id,
-            Err(error) => {
+            if !preserve_prior_outcome {
                 self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
                 self.mark_pending_submit_stage(
                     order.client_order_id.as_str(),
                     TbankPendingSubmitStage::Rejected,
                     None,
                 );
+            }
+            return Err(TbankCommandError::before_rpc(error));
+        }
+        let account_id = match self.config.resolve_account_id() {
+            Ok(account_id) => account_id,
+            Err(error) => {
+                if !preserve_prior_outcome {
+                    self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
+                    self.mark_pending_submit_stage(
+                        order.client_order_id.as_str(),
+                        TbankPendingSubmitStage::Rejected,
+                        None,
+                    );
+                }
                 return Err(TbankCommandError::before_rpc(error));
             }
         };
@@ -2697,46 +2980,46 @@ impl TbankExecutionRuntime {
         self.record_broker_order_route(route, order.client_order_id.as_str());
         self.record_submit_order_context(order);
 
-        let result = match service {
-            TbankExecutionService::LiveOrders => {
-                match build_post_order_request(order, &account_id, instrument) {
-                    Ok(request) => match self.clients_mut() {
-                        Ok(clients) => clients
-                            .orders
-                            .post_order(with_timeout(request, request_timeout))
-                            .await
-                            .map_err(|status| {
-                                TbankCommandError::rpc_started(TbankAdapterError::from(status))
-                            })
-                            .map(|response| TbankSubmitResponse::Order(response.into_inner())),
-                        Err(error) => Err(TbankCommandError::before_rpc(error)),
-                    },
-                    Err(error) => Err(TbankCommandError::before_rpc(error)),
-                }
-            }
-            TbankExecutionService::LiveStopOrders => {
-                match build_post_stop_order_request(order, &account_id, instrument) {
-                    Ok(request) => match self.clients_mut() {
-                        Ok(clients) => clients
-                            .stop_orders
-                            .post_stop_order(with_timeout(request, request_timeout))
-                            .await
-                            .map_err(|status| {
-                                TbankCommandError::rpc_started(TbankAdapterError::from(status))
-                            })
-                            .map(|response| TbankSubmitResponse::StopOrder(response.into_inner())),
-                        Err(error) => Err(TbankCommandError::before_rpc(error)),
-                    },
-                    Err(error) => Err(TbankCommandError::before_rpc(error)),
-                }
-            }
-            TbankExecutionService::Sandbox => match order.order_type {
-                crate::common::TbankOrderType::Market | crate::common::TbankOrderType::Limit => {
+        let result = if order.submit_method == crate::execution::TbankSubmitMethod::PostOrderAsync {
+            let request =
+                crate::execution::build_post_order_async_request(order, &account_id, instrument)
+                    .map_err(TbankCommandError::before_rpc)?;
+            let live = self.config.environment.is_live();
+            let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
+            let response = if live {
+                clients
+                    .orders
+                    .post_order_async(crate::grpc::request::with_dispatch_marker(
+                        request,
+                        request_timeout,
+                        dispatch_marker.clone(),
+                    ))
+                    .await
+            } else {
+                clients
+                    .sandbox
+                    .post_sandbox_order_async(crate::grpc::request::with_dispatch_marker(
+                        request,
+                        request_timeout,
+                        dispatch_marker.clone(),
+                    ))
+                    .await
+            };
+            response
+                .map(|r| TbankSubmitResponse::Async(r.into_inner()))
+                .map_err(|s| TbankCommandError::rpc_started(s.into()))
+        } else {
+            match service {
+                TbankExecutionService::LiveOrders => {
                     match build_post_order_request(order, &account_id, instrument) {
                         Ok(request) => match self.clients_mut() {
                             Ok(clients) => clients
-                                .sandbox
-                                .post_sandbox_order(with_timeout(request, request_timeout))
+                                .orders
+                                .post_order(crate::grpc::request::with_dispatch_marker(
+                                    request,
+                                    request_timeout,
+                                    dispatch_marker.clone(),
+                                ))
                                 .await
                                 .map_err(|status| {
                                     TbankCommandError::rpc_started(TbankAdapterError::from(status))
@@ -2747,22 +3030,16 @@ impl TbankExecutionRuntime {
                         Err(error) => Err(TbankCommandError::before_rpc(error)),
                     }
                 }
-                crate::common::TbankOrderType::StopMarket
-                | crate::common::TbankOrderType::MarketIfTouched
-                | crate::common::TbankOrderType::TrailingStopMarket
-                | crate::common::TbankOrderType::TrailingStopLimit => {
-                    const RPC: &str = "SandboxService.PostSandboxStopOrder";
-                    tracing::debug!(
-                        rpc = RPC,
-                        instrument_id = %order.instrument_id,
-                        order_type = ?order.order_type,
-                        "calling T-Bank RPC"
-                    );
+                TbankExecutionService::LiveStopOrders => {
                     match build_post_stop_order_request(order, &account_id, instrument) {
                         Ok(request) => match self.clients_mut() {
                             Ok(clients) => clients
-                                .sandbox
-                                .post_sandbox_stop_order(with_timeout(request, request_timeout))
+                                .stop_orders
+                                .post_stop_order(crate::grpc::request::with_dispatch_marker(
+                                    request,
+                                    request_timeout,
+                                    dispatch_marker.clone(),
+                                ))
                                 .await
                                 .map_err(|status| {
                                     TbankCommandError::rpc_started(TbankAdapterError::from(status))
@@ -2775,7 +3052,70 @@ impl TbankExecutionRuntime {
                         Err(error) => Err(TbankCommandError::before_rpc(error)),
                     }
                 }
-            },
+                TbankExecutionService::Sandbox => match order.order_type {
+                    crate::common::TbankOrderType::Market
+                    | crate::common::TbankOrderType::Limit => {
+                        match build_post_order_request(order, &account_id, instrument) {
+                            Ok(request) => match self.clients_mut() {
+                                Ok(clients) => clients
+                                    .sandbox
+                                    .post_sandbox_order(crate::grpc::request::with_dispatch_marker(
+                                        request,
+                                        request_timeout,
+                                        dispatch_marker.clone(),
+                                    ))
+                                    .await
+                                    .map_err(|status| {
+                                        TbankCommandError::rpc_started(TbankAdapterError::from(
+                                            status,
+                                        ))
+                                    })
+                                    .map(|response| {
+                                        TbankSubmitResponse::Order(response.into_inner())
+                                    }),
+                                Err(error) => Err(TbankCommandError::before_rpc(error)),
+                            },
+                            Err(error) => Err(TbankCommandError::before_rpc(error)),
+                        }
+                    }
+                    crate::common::TbankOrderType::StopMarket
+                    | crate::common::TbankOrderType::MarketIfTouched
+                    | crate::common::TbankOrderType::TrailingStopMarket
+                    | crate::common::TbankOrderType::TrailingStopLimit => {
+                        const RPC: &str = "SandboxService.PostSandboxStopOrder";
+                        tracing::debug!(
+                            rpc = RPC,
+                            instrument_id = %order.instrument_id,
+                            order_type = ?order.order_type,
+                            "calling T-Bank RPC"
+                        );
+                        match build_post_stop_order_request(order, &account_id, instrument) {
+                            Ok(request) => match self.clients_mut() {
+                                Ok(clients) => clients
+                                    .sandbox
+                                    .post_sandbox_stop_order(
+                                        crate::grpc::request::with_dispatch_marker(
+                                            request,
+                                            request_timeout,
+                                            dispatch_marker.clone(),
+                                        ),
+                                    )
+                                    .await
+                                    .map_err(|status| {
+                                        TbankCommandError::rpc_started(TbankAdapterError::from(
+                                            status,
+                                        ))
+                                    })
+                                    .map(|response| {
+                                        TbankSubmitResponse::StopOrder(response.into_inner())
+                                    }),
+                                Err(error) => Err(TbankCommandError::before_rpc(error)),
+                            },
+                            Err(error) => Err(TbankCommandError::before_rpc(error)),
+                        }
+                    }
+                },
+            }
         };
 
         if let Err(error) = &result {
@@ -2800,7 +3140,27 @@ impl TbankExecutionRuntime {
 
         match result {
             Ok(response) => {
+                if let TbankSubmitResponse::Async(ack) = &response {
+                    if ack.order_request_id != order.broker_request_id {
+                        return Err(TbankCommandError::rpc_started(
+                            TbankAdapterError::SubmitOutcomeUnknown(
+                                "async response request UUID does not match submitted order".into(),
+                            ),
+                        ));
+                    }
+                    // A stream can already have confirmed the order. Do not regress its state.
+                    if let Some(pending) = self
+                        .pending_submits
+                        .lock()
+                        .expect("pending_submits lock")
+                        .get_mut(&order.client_order_id)
+                    {
+                        pending.trade_intent_id = ack.trade_intent_id.clone();
+                    }
+                    return Ok(response);
+                }
                 let (route, broker_order_id, identity_name) = match &response {
+                    TbankSubmitResponse::Async(_) => unreachable!(),
                     TbankSubmitResponse::Order(response) => (
                         TbankBrokerOrderRoute::RegularOrder,
                         response.order_id.as_str(),
@@ -2836,10 +3196,12 @@ impl TbankExecutionRuntime {
                 Ok(response)
             }
             Err(error) => {
-                if matches!(
-                    classify_command_failure(&error),
-                    CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
-                ) {
+                if !preserve_prior_outcome
+                    && matches!(
+                        classify_command_failure(&error),
+                        CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
+                    )
+                {
                     self.remove_unresolved_broker_order_route(order.client_order_id.as_str());
                     self.mark_pending_submit_stage(
                         order.client_order_id.as_str(),
@@ -2849,6 +3211,36 @@ impl TbankExecutionRuntime {
                 }
                 Err(error)
             }
+        }
+    }
+
+    fn cancel_dispatch_marker(
+        &self,
+        broker_order_id: &str,
+    ) -> crate::grpc::limited_channel::TbankDispatchMarker {
+        let client_order_id = {
+            let index = self
+                .broker_order_index
+                .lock()
+                .expect("broker_order_index lock");
+            index
+                .client_order_id_for_request_id(broker_order_id)
+                .or_else(|| index.client_order_id_for_venue_order_id(broker_order_id))
+        };
+        client_order_id
+            .map(crate::grpc::limited_channel::TbankDispatchMarker::for_order)
+            .unwrap_or_default()
+    }
+
+    fn cancel_command_error(
+        marker: &crate::grpc::limited_channel::TbankDispatchMarker,
+        status: tonic::Status,
+    ) -> TbankCommandError {
+        let error = TbankAdapterError::from(status);
+        if marker.started() {
+            TbankCommandError::rpc_started(error)
+        } else {
+            TbankCommandError::before_rpc(error)
         }
     }
 
@@ -2864,12 +3256,14 @@ impl TbankExecutionRuntime {
         let request = CancelOrderRequest {
             account_id,
             order_id: order_id.to_string(),
-            order_id_type: Some(OrderIdType::Exchange as i32),
+            order_id_type: Some(self.regular_order_id_type(order_id) as i32),
         };
-        let request = with_timeout(
+        let marker = self.cancel_dispatch_marker(order_id);
+        let request = crate::grpc::request::with_dispatch_marker(
             request,
             self.rpc_request_timeout()
                 .map_err(TbankCommandError::before_rpc)?,
+            marker.clone(),
         );
 
         if self.config.environment.is_live() {
@@ -2878,7 +3272,7 @@ impl TbankExecutionRuntime {
                 .orders
                 .cancel_order(request)
                 .await
-                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
+                .map_err(|status| Self::cancel_command_error(&marker, status))?
                 .into_inner())
         } else {
             let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
@@ -2886,7 +3280,7 @@ impl TbankExecutionRuntime {
                 .sandbox
                 .cancel_sandbox_order(request)
                 .await
-                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
+                .map_err(|status| Self::cancel_command_error(&marker, status))?
                 .into_inner())
         }
     }
@@ -2904,10 +3298,12 @@ impl TbankExecutionRuntime {
             account_id,
             stop_order_id: stop_order_id.to_string(),
         };
-        let request = with_timeout(
+        let marker = self.cancel_dispatch_marker(stop_order_id);
+        let request = crate::grpc::request::with_dispatch_marker(
             request,
             self.rpc_request_timeout()
                 .map_err(TbankCommandError::before_rpc)?,
+            marker.clone(),
         );
 
         if self.config.environment.is_live() {
@@ -2916,7 +3312,7 @@ impl TbankExecutionRuntime {
                 .stop_orders
                 .cancel_stop_order(request)
                 .await
-                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
+                .map_err(|status| Self::cancel_command_error(&marker, status))?
                 .into_inner())
         } else {
             let clients = self.clients_mut().map_err(TbankCommandError::before_rpc)?;
@@ -2924,7 +3320,7 @@ impl TbankExecutionRuntime {
                 .sandbox
                 .cancel_sandbox_stop_order(request)
                 .await
-                .map_err(|status| TbankCommandError::rpc_started(TbankAdapterError::from(status)))?
+                .map_err(|status| Self::cancel_command_error(&marker, status))?
                 .into_inner())
         }
     }
@@ -2996,13 +3392,53 @@ impl TbankExecutionRuntime {
         &mut self,
         identity: TbankBrokerOrderIdentity,
     ) -> std::result::Result<(), TbankCommandError> {
-        let broker_order_id = identity.broker_order_id;
+        let mut broker_order_id = identity.broker_order_id;
         match identity.route {
             TbankBrokerOrderRoute::RegularOrder => {
-                TbankExecutionRuntime::cancel_order(self, broker_order_id.as_str()).await?;
+                let (request_client_id, confirmed, route_known) = {
+                    let index = self
+                        .broker_order_index
+                        .lock()
+                        .expect("broker_order_index lock");
+                    let client_id = index.client_order_id_for_request_id(&broker_order_id);
+                    let confirmed = client_id
+                        .as_deref()
+                        .and_then(|id| index.identity_for(Some(id), None));
+                    let route_known = client_id
+                        .as_deref()
+                        .is_none_or(|id| index.route_for_client_order_id(id).is_some());
+                    (client_id, confirmed, route_known)
+                };
+                if !route_known {
+                    return Err(TbankCommandError::before_rpc(
+                        TbankAdapterError::BrokerOrderIdentityUnresolved(
+                            "the cancel target submission was rejected before exchange acceptance"
+                                .into(),
+                        ),
+                    ));
+                }
+                if let Some(confirmed) = confirmed {
+                    broker_order_id = confirmed.broker_order_id;
+                }
+                if let Err(error) =
+                    TbankExecutionRuntime::cancel_order(self, &broker_order_id).await
+                {
+                    let pending_request = request_client_id.as_deref().is_some_and(|id| {
+                        self.pending_submits
+                            .lock()
+                            .expect("pending_submits lock")
+                            .get(id)
+                            .is_none_or(|p| p.stage.blocks_lifecycle_reset())
+                    });
+                    if pending_request && error.error.is_order_absent() {
+                        return Err(TbankCommandError::rpc_started(TbankAdapterError::SubmitOutcomeUnknown(
+                            "cancel target is not indexed yet; retaining the request UUID cancellation intent".into())));
+                    }
+                    return Err(error);
+                }
             }
             TbankBrokerOrderRoute::StopOrder => {
-                TbankExecutionRuntime::cancel_stop_order(self, broker_order_id.as_str()).await?;
+                TbankExecutionRuntime::cancel_stop_order(self, &broker_order_id).await?;
             }
         }
         Ok(())
@@ -3231,9 +3667,21 @@ impl TbankExecutionRuntime {
         }
     }
 
-    /// Queries a regular order by its broker order ID.
+    fn regular_order_id_type(&self, order_id: &str) -> OrderIdType {
+        let index = self
+            .broker_order_index
+            .lock()
+            .expect("broker_order_index lock");
+        if index.is_known_regular_order_request_id(order_id) {
+            OrderIdType::Request
+        } else {
+            OrderIdType::Exchange
+        }
+    }
+
+    /// Queries a regular order by a known exchange identity or pending request UUID.
     pub async fn query_order(&mut self, order_id: &str) -> Result<OrderState> {
-        self.query_order_with_id_type(order_id, OrderIdType::Exchange)
+        self.query_order_with_id_type(order_id, self.regular_order_id_type(order_id))
             .await
     }
 
@@ -5509,6 +5957,8 @@ pub fn tbank_account_id(account_id: &str) -> AccountId {
 pub enum TbankSubmitResponse {
     /// Regular-order response.
     Order(PostOrderResponse),
+    /// Async acknowledgement, without an exchange order identity.
+    Async(crate::grpc::generated::PostOrderAsyncResponse),
     /// Stop-order response.
     StopOrder(PostStopOrderResponse),
 }

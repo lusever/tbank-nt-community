@@ -7,7 +7,7 @@ use crate::{
     config::TbankCandleTimestampMode,
     grpc::generated::{Candle, LastPrice, OrderBook, Trade, TradeDirection},
     market_data::{
-        TbankBar, TbankOrderBookLevel, TbankOrderBookSnapshot, TbankQuoteTick, TbankTradeTick,
+        TbankBar, TbankOrderBookLevel, TbankQuoteTick, TbankTradeTick, TbankWireOrderBookSnapshot,
         trades::TbankTradeSide,
     },
 };
@@ -79,12 +79,12 @@ pub fn last_price_to_quote(last_price: &LastPrice, ts_init: i128) -> Result<Tban
 pub fn orderbook_to_snapshot(
     orderbook: &OrderBook,
     ts_init: i128,
-) -> Result<TbankOrderBookSnapshot> {
+) -> Result<TbankWireOrderBookSnapshot> {
     let ts_event = timestamp_to_unix_nanos(required_timestamp(
         orderbook.time.as_ref(),
         "orderbook.time",
     )?)?;
-    Ok(TbankOrderBookSnapshot {
+    Ok(TbankWireOrderBookSnapshot {
         instrument_uid: orderbook.instrument_uid.clone(),
         depth: orderbook.depth,
         is_consistent: orderbook.is_consistent,

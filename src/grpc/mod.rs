@@ -6,6 +6,11 @@ pub mod channel;
 pub mod clients;
 #[allow(missing_docs)]
 pub mod generated;
+/// Quota-aware transport channel.
+pub mod limited_channel;
+/// Shared transport quota policy and sequenced diagnostics.
+pub mod limiter;
+
 /// Authentication metadata interceptor.
 pub mod metadata;
 /// Request timeout helpers.

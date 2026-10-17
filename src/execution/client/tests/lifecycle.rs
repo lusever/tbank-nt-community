@@ -260,6 +260,7 @@ async fn start_futures_instruments_server() -> FuturesInstrumentsTestServer {
     };
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(service)
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -576,6 +577,7 @@ async fn old_session_spawner_cannot_spawn_after_reconnect() {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(MockOrdersService::default()))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -1263,6 +1265,7 @@ fn reset_and_dispose_refuse_while_mutating_command_is_in_flight() {
     }
     assert!(client.task_owner.operation_tasks.is_empty());
     let pending = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
         instrument_id: "SBER_TQBR.MOEX".to_string(),
         client_order_id: "uncertain-order".to_string(),
         broker_request_id: "uncertain-request".to_string(),
@@ -1390,6 +1393,7 @@ async fn synchronous_reset_clears_projections_after_session_drain() {
         .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
 
     let cancellation = client.task_owner.session_tasks.cancellation_token();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     client
         .task_owner
@@ -1397,6 +1401,7 @@ async fn synchronous_reset_clears_projections_after_session_drain() {
         .spawn_named("reset_waiting_session", async move {
             let _ = started_tx.send(());
             cancellation.cancelled().await;
+            let _ = release_rx.await;
         })
         .unwrap();
     started_rx
@@ -1408,6 +1413,7 @@ async fn synchronous_reset_clears_projections_after_session_drain() {
     assert!(client.task_owner.reset_pending);
     assert!(!client.runtime.instruments.lock().unwrap().is_empty());
 
+    release_tx.send(()).unwrap();
     client
         .task_owner
         .prepare_session_generation(&mut client.runtime)
@@ -1460,6 +1466,7 @@ async fn reset_requires_observing_session_task_failure() {
 fn broker_report_wins_race_with_inconclusive_submit_lookup() {
     let client = test_client(TbankExecutionClientConfig::default());
     let pending_order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
         instrument_id: "SBER_TQBR.MOEX".to_string(),
         client_order_id: "uncertain-order".to_string(),
         broker_request_id: "uncertain-request".to_string(),
@@ -1600,13 +1607,20 @@ fn terminal_order_report_settles_submit_and_ambiguous_cancel_state() {
     let pending_submits = Arc::new(Mutex::new(HashMap::from([(
         "client-order-1".to_string(),
         TbankPendingSubmit {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
+            trade_intent_id: None,
+            broker_trade_order_id: None,
+            broker_receipt_id: None,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             submitted_ts: UnixNanos::from(1_u64),
             quantity_units: Decimal::ONE,
             side: TbankOrderSide::Buy,
             order_type: TbankOrderType::Limit,
             time_in_force: TimeInForce::Day,
+            limit_price: None,
+            trigger_price: None,
             trailing: None,
+            confirm_margin_trade: false,
             venue_order_id: Some("venue-order-1".to_string()),
             last_reconciliation_ts: None,
             stage: TbankPendingSubmitStage::Unknown,
@@ -1917,6 +1931,7 @@ fn reset_clears_execution_lifecycle_state() {
         );
     client.runtime.record_pending_submit(
         &TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             client_order_id: "client-order-1".to_string(),
             broker_request_id: "request-1".to_string(),
@@ -2355,6 +2370,7 @@ async fn uncached_share_by_resolution_classifies_out_of_scope() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(ShareByOnlyInstrumentsService {
                 share: Some(share),
                 lookup_started: None,
@@ -2409,6 +2425,7 @@ async fn malformed_share_metadata_classifies_out_of_scope_without_retry() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(ShareByOnlyInstrumentsService {
                 share: Some(share),
                 lookup_started: None,
@@ -2580,6 +2597,7 @@ fn executed_stop_is_triggered_until_activated_child_finishes() {
 
 #[derive(Clone, Default)]
 struct MockOrdersService {
+    async_calls: Arc<Mutex<Vec<PostOrderAsyncRequest>>>,
     calls: Arc<Mutex<Vec<PostOrderRequest>>>,
     post_gate: Arc<Mutex<Option<MockPostOrderGate>>>,
     post_error: Arc<Mutex<Option<(Code, String)>>>,
@@ -2624,6 +2642,7 @@ struct MockStopOrdersService {
     get_responses: Arc<Mutex<VecDeque<GetStopOrdersResponse>>>,
     get_response: Arc<Mutex<Option<GetStopOrdersResponse>>>,
     cancel_calls: Arc<Mutex<Vec<CancelStopOrderRequest>>>,
+    cancel_error: Arc<Mutex<Option<(Code, String)>>>,
 }
 
 #[derive(Clone, Default)]
@@ -2955,6 +2974,7 @@ async fn reconnect_stop_query_keeps_active_orders_and_bounds_terminal_history() 
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3015,6 +3035,7 @@ async fn unbounded_stop_query_recovers_from_response_limit_in_bounded_windows() 
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3073,6 +3094,7 @@ async fn executed_stop_reconciliation_queries_missing_exchange_child() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3374,6 +3396,7 @@ async fn run_order_status_report_query_test(
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await

@@ -123,13 +123,26 @@ pub(super) struct PreparedNautilusOrder {
     pub(super) cmd: nautilus_common::messages::execution::SubmitOrder,
     pub(super) order: TbankSubmitOrder,
     pub(super) metadata: TbankInstrumentMetadata,
+    pub(super) dispatch_deadline: Option<tokio::time::Instant>,
 }
 
+#[cfg(test)]
 pub(super) async fn prepare_nautilus_order(
     client: &mut TbankExecutionRuntime,
     cmd: nautilus_common::messages::execution::SubmitOrder,
 ) -> anyhow::Result<PreparedNautilusOrder> {
+    let deadline = crate::execution::TbankSubmitOptions::from_params(cmd.params.as_ref())?
+        .monotonic_deadline()?;
+    prepare_nautilus_order_with_deadline(client, cmd, deadline).await
+}
+
+async fn prepare_nautilus_order_with_deadline(
+    client: &mut TbankExecutionRuntime,
+    cmd: nautilus_common::messages::execution::SubmitOrder,
+    dispatch_deadline: Option<tokio::time::Instant>,
+) -> anyhow::Result<PreparedNautilusOrder> {
     client.config.ensure_submit_allowed()?;
+    crate::execution::TbankSubmitOptions::from_params(cmd.params.as_ref())?;
     if cmd.order_init.reduce_only {
         anyhow::bail!("T-Bank does not support reduce-only orders");
     }
@@ -139,12 +152,24 @@ pub(super) async fn prepare_nautilus_order(
     if cmd.order_init.quote_quantity {
         anyhow::bail!("T-Bank orders require quantity in instrument units, not quote currency");
     }
+    if cmd
+        .params
+        .as_ref()
+        .is_some_and(|p| p.get(crate::execution::TBANK_SUBMIT_METHOD_PARAM).is_some())
+        && !matches!(
+            cmd.order_init.order_type,
+            OrderType::Market | OrderType::Limit
+        )
+    {
+        anyhow::bail!("explicit submission methods support only regular market and limit orders");
+    }
     let account_id = client.config.resolve_account_id()?;
     let instrument_id = order_initialized_instrument_id(&cmd);
     let mut cmd = cmd;
     cmd.instrument_id = instrument_id;
     cmd.order_init.instrument_id = instrument_id;
     let order = TbankSubmitOrder {
+        submit_method: crate::execution::TbankSubmitMethod::from_params(cmd.params.as_ref())?,
         instrument_id: instrument_id.to_string(),
         client_order_id: cmd.client_order_id.to_string(),
         broker_request_id: client
@@ -215,6 +240,7 @@ pub(super) async fn prepare_nautilus_order(
         cmd,
         order,
         metadata,
+        dispatch_deadline,
     })
 }
 
@@ -223,12 +249,18 @@ pub(super) async fn prepare_nautilus_order_before_deadline(
     cmd: nautilus_common::messages::execution::SubmitOrder,
     deadline: tokio::time::Instant,
 ) -> anyhow::Result<PreparedNautilusOrder> {
+    let consumer_deadline = crate::execution::TbankSubmitOptions::from_params(cmd.params.as_ref())?
+        .monotonic_deadline()?;
+    let deadline = consumer_deadline.map_or(deadline, |d| d.min(deadline));
     if tokio::time::Instant::now() >= deadline {
         anyhow::bail!("T-Bank submit deadline expired during order preparation");
     }
-    tokio::time::timeout_at(deadline, prepare_nautilus_order(client, cmd))
-        .await
-        .map_err(|_| anyhow::anyhow!("T-Bank submit deadline expired during order preparation"))?
+    tokio::time::timeout_at(
+        deadline,
+        prepare_nautilus_order_with_deadline(client, cmd, consumer_deadline),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("T-Bank submit deadline expired during order preparation"))?
 }
 
 pub(super) async fn submit_prepared_nautilus_order(
@@ -357,6 +389,7 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
         cmd,
         order,
         metadata,
+        dispatch_deadline,
     } = prepared;
 
     tracing::info!(
@@ -370,18 +403,35 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
     );
     // This deadline is captured when the command starts, before metadata preparation. The RPC
     // timeout reserves part of the remaining window for reconciliation.
+    let previous_outcome_pending = client
+        .pending_submits
+        .lock()
+        .expect("pending_submits lock")
+        .get(&order.client_order_id)
+        .is_some_and(|p| {
+            p.stage != TbankPendingSubmitStage::Rejected
+                && p.stage != TbankPendingSubmitStage::DefinitivelyAbsent
+        });
     let response = match client
-        .submit_order_with_recovery_deadline(&order, &metadata, recovery_deadline)
+        .submit_order_with_recovery_deadline(
+            &order,
+            &metadata,
+            dispatch_deadline.map_or(recovery_deadline, |d| d.min(recovery_deadline)),
+        )
         .await
     {
         Ok(response) => response,
         Err(error) => {
             match classify_command_failure(&error) {
-                CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_) => {
+                CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
+                    if !previous_outcome_pending =>
+                {
                     tracing::error!(%error, client_order_id = %cmd.client_order_id, "T-Bank rejected Nautilus order");
                     return Ok(SubmitPipelineOutcome::Rejected(error.to_string()));
                 }
-                CommandFailure::Ambiguous(_) => {}
+                CommandFailure::Ambiguous(_)
+                | CommandFailure::NotSent(_)
+                | CommandFailure::VenueRejected(_) => {}
             }
             tracing::warn!(
                 %error,
@@ -436,11 +486,44 @@ async fn submit_prepared_nautilus_order_reports_with_recovery(
             lots_executed = response.lots_executed,
             "received T-Bank order response"
         ),
+        TbankSubmitResponse::Async(_) => {
+            tracing::info!(client_order_id = %order.client_order_id, "received async broker acknowledgement")
+        }
         TbankSubmitResponse::StopOrder(_) => tracing::info!(
             instrument_id = %order.instrument_id,
             client_order_id = %order.client_order_id,
             "received T-Bank stop-order response"
         ),
+    }
+    if let TbankSubmitResponse::Async(ack) = &response {
+        if client
+            .pending_submits
+            .lock()
+            .expect("pending_submits lock")
+            .get(&order.client_order_id)
+            .is_some_and(|p| p.stage.is_broker_confirmed())
+        {
+            return Ok(SubmitPipelineOutcome::Reports(Vec::new()));
+        }
+        if ack.execution_report_status
+            == TbankOrderExecutionReportStatus::ExecutionReportStatusRejected as i32
+        {
+            client.mark_pending_submit_stage(
+                &order.client_order_id,
+                TbankPendingSubmitStage::Rejected,
+                None,
+            );
+            return Ok(SubmitPipelineOutcome::Rejected(
+                "T-Bank rejected async order".into(),
+            ));
+        }
+        // Run recovery in this command's owned task. Other commands run independently.
+        if let Some(emitter) = recovery_emitter {
+            client
+                .recover_submit_outcome(order, metadata, ts_init, recovery_deadline, emitter)
+                .await;
+        }
+        return Ok(SubmitPipelineOutcome::Reports(Vec::new()));
     }
     submit_response_execution_reports(client, &cmd, &metadata, &response, ts_init)
         .map(SubmitPipelineOutcome::Reports)
@@ -468,6 +551,7 @@ pub(super) fn submit_response_execution_reports(
     ts_init: UnixNanos,
 ) -> anyhow::Result<Vec<ExecutionReport>> {
     let (order_report, fill_reports) = match response {
+        TbankSubmitResponse::Async(_) => return Ok(Vec::new()),
         TbankSubmitResponse::Order(response) => {
             let order_report = order_status_report_from_post_order_response(
                 client.account_id(),
@@ -715,7 +799,9 @@ pub(super) fn pending_stage_after_submit_response(
     response: &TbankSubmitResponse,
 ) -> TbankPendingSubmitStage {
     match response {
-        TbankSubmitResponse::StopOrder(_) => TbankPendingSubmitStage::Submitted,
+        TbankSubmitResponse::Async(_) | TbankSubmitResponse::StopOrder(_) => {
+            TbankPendingSubmitStage::Submitted
+        }
         TbankSubmitResponse::Order(response) => {
             match TbankOrderExecutionReportStatus::try_from(response.execution_report_status).ok() {
                 Some(TbankOrderExecutionReportStatus::ExecutionReportStatusRejected) => {
@@ -801,7 +887,14 @@ pub(super) fn settle_order_report_mutation_state(
         let canonical_order_id = index.canonical_venue_order_id_or_self(&venue_order_id);
         let mut order_ids = index.aliases_for_canonical_venue_order_id(&canonical_order_id);
         order_ids.push(venue_order_id);
-        order_ids.push(canonical_order_id);
+        order_ids.push(canonical_order_id.clone());
+        if let Some(client_id) = report
+            .client_order_id
+            .map(|id| id.to_string())
+            .or_else(|| index.client_order_id_for_venue_order_id(&canonical_order_id))
+        {
+            order_ids.push(tbank_broker_request_id_for_client_order_id(&client_id));
+        }
         order_ids
     };
     unresolved_cancellations

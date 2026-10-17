@@ -75,6 +75,29 @@ impl DataClient for TbankDataClient {
         TbankDataClient::disconnect_async(self).await
     }
 
+    fn subscribe(
+        &mut self,
+        cmd: nautilus_common::messages::data::SubscribeCustomData,
+    ) -> anyhow::Result<()> {
+        let key = TbankBookSubscription::from_data_type(&cmd.data_type)?;
+        if self.custom_book_subscriptions.contains(&key) {
+            return Ok(());
+        }
+        self.schedule_custom_book_stream(key)?;
+        self.custom_book_subscriptions.insert(key);
+        Ok(())
+    }
+
+    fn unsubscribe(
+        &mut self,
+        cmd: &nautilus_common::messages::data::UnsubscribeCustomData,
+    ) -> anyhow::Result<()> {
+        let key = TbankBookSubscription::from_data_type(&cmd.data_type)?;
+        self.abort_stream(&Self::custom_book_task_key(key))?;
+        self.custom_book_subscriptions.remove(&key);
+        Ok(())
+    }
+
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         self.quote_subscriptions.insert(cmd.instrument_id);
         // Nautilus quotes are projected from the exchange order book at depth one, so the restore

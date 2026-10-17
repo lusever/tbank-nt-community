@@ -1282,13 +1282,20 @@ fn futures_stop_stream_report_preserves_point_prices() {
     let pending_submits = Arc::new(Mutex::new(HashMap::from([(
         client_order_id.to_string(),
         TbankPendingSubmit {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
+            trade_intent_id: None,
+            broker_trade_order_id: None,
+            broker_receipt_id: None,
             instrument_id: metadata.instrument_id.clone(),
             submitted_ts: super::current_unix_nanos(),
             quantity_units: Decimal::ONE,
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::StopMarket,
             time_in_force: TimeInForce::Gtc,
+            limit_price: None,
+            trigger_price: None,
             trailing: None,
+            confirm_margin_trade: false,
             venue_order_id: Some("future-stop-stream-1".to_string()),
             last_reconciliation_ts: None,
             stage: TbankPendingSubmitStage::Submitted,
@@ -3015,6 +3022,7 @@ async fn unary_order_report_keeps_canonical_stop_identity_for_child_alias() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3122,9 +3130,24 @@ impl OrdersService for MockOrdersService {
 
     async fn post_order_async(
         &self,
-        _request: Request<PostOrderAsyncRequest>,
+        request: Request<PostOrderAsyncRequest>,
     ) -> std::result::Result<Response<PostOrderAsyncResponse>, Status> {
-        Err(Status::unimplemented("not used"))
+        let request = request.into_inner();
+        self.async_calls.lock().unwrap().push(request.clone());
+        let gate = self.post_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
+        if let Some((code, message)) = self.post_error.lock().unwrap().clone() {
+            return Err(Status::new(code, message));
+        }
+        Ok(Response::new(PostOrderAsyncResponse {
+            order_request_id: request.order_id,
+            execution_report_status: self.post_response.lock().unwrap().as_ref().map_or(
+                OrderExecutionReportStatus::ExecutionReportStatusNew as i32, |r| r.execution_report_status),
+            trade_intent_id: Some("broker-intent-1".to_string()),
+        }))
     }
 
     async fn cancel_order(
@@ -3275,6 +3298,9 @@ impl StopOrdersService for MockStopOrdersService {
         request: Request<CancelStopOrderRequest>,
     ) -> std::result::Result<Response<CancelStopOrderResponse>, Status> {
         self.cancel_calls.lock().unwrap().push(request.into_inner());
+        if let Some((code, message)) = self.cancel_error.lock().unwrap().clone() {
+            return Err(Status::new(code, message));
+        }
         Ok(Response::new(CancelStopOrderResponse::default()))
     }
 }
@@ -3364,6 +3390,7 @@ async fn submit_market_live_calls_orders_service() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3391,6 +3418,7 @@ async fn submit_market_live_calls_orders_service() {
         .runtime
         .submit_order_with_recovery_deadline(
             &TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
                 instrument_id: "SBER_TQBR.MOEX".to_string(),
                 client_order_id: client_order_id.to_string(),
                 broker_request_id: broker_request_id.clone(),
@@ -3426,6 +3454,7 @@ async fn repeated_nautilus_submit_reuses_deterministic_broker_request_id() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3512,6 +3541,7 @@ async fn generate_order_status_report_routes_known_stop_venue_order_id_to_stop_o
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -3569,6 +3599,7 @@ async fn generate_order_status_report_recovers_stop_route_when_local_index_is_em
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -3637,6 +3668,7 @@ async fn generate_order_status_report_resolves_executed_stop_child_after_restart
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -3727,6 +3759,7 @@ async fn generate_order_status_reports_recovers_old_stop_parent_before_window_fi
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -3792,6 +3825,7 @@ async fn generate_order_status_report_routes_known_stop_request_id_to_stop_order
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -3851,6 +3885,7 @@ async fn query_order_routes_known_stop_order_to_stop_orders_service() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -3929,6 +3964,7 @@ async fn reconcile_order_by_request_id_maps_remote_open_order_to_accepted_report
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -4022,6 +4058,7 @@ async fn reconcile_order_by_request_id_maps_remote_fill_to_fill_report_once() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -4165,6 +4202,7 @@ async fn reconcile_order_by_request_id_emits_only_partial_fill_delta() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -4260,6 +4298,7 @@ async fn cancel_stop_order_live_calls_stop_orders_service() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -4291,6 +4330,143 @@ async fn cancel_stop_order_live_calls_stop_orders_service() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].account_id, "account-1");
     assert_eq!(calls[0].stop_order_id, "stop-order-1");
+}
+
+#[tokio::test]
+async fn stop_order_cancel_distinguishes_local_quota_rejection_from_dispatched_failure() {
+    use crate::grpc::limiter::{TbankRateLimiter, TbankRpcQuota};
+
+    async fn use_quota_scope(
+        client: &mut super::TbankExecutionClient,
+        limiter: Arc<TbankRateLimiter>,
+    ) {
+        let channel = crate::grpc::connect_channel(
+            &client.runtime.config.endpoint_uri().unwrap(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let credentials = client.runtime.active_credentials.clone().unwrap();
+        client.runtime.clients = Some(crate::grpc::TbankGrpcClients::new_with_quota_scope(
+            channel,
+            crate::grpc::TbankAuthInterceptor::new(credentials).unwrap(),
+            Some(limiter),
+        ));
+    }
+
+    let service = MockStopOrdersService::default();
+    let cancel_calls = Arc::clone(&service.cancel_calls);
+    let cancel_error = Arc::clone(&service.cancel_error);
+    let get_calls = Arc::clone(&service.get_calls);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(
+                crate::testing::QuotaUsersService,
+            ))
+            .add_service(StopOrdersServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".into()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        enable_trading: true,
+        allow_live_trading: true,
+        ..TbankExecutionClientConfig::default()
+    });
+    client.connect_for_queries().await.unwrap();
+    let identity = TbankBrokerOrderIdentity {
+        route: TbankBrokerOrderRoute::StopOrder,
+        broker_order_id: "stop-order-1".to_string(),
+    };
+    client.runtime.record_broker_order_mapping(
+        TbankBrokerOrderRoute::StopOrder,
+        "client-stop-order-1",
+        &identity.broker_order_id,
+    );
+
+    let limiter = Arc::new(
+        TbankRateLimiter::new(
+            vec![TbankRpcQuota {
+                methods: vec!["CancelStopOrder".to_string()],
+                capacity: 1,
+                window: std::time::Duration::from_secs(30),
+            }],
+            1,
+        )
+        .unwrap(),
+    );
+    limiter
+        .reserve(
+            "CancelStopOrder",
+            false,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    {
+        let waiting_limiter = Arc::clone(&limiter);
+        let waiting = waiting_limiter.reserve_guard(
+            "CancelStopOrder",
+            true,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        use_quota_scope(&mut client, limiter).await;
+
+        let error = client
+            .runtime
+            .cancel_resolved_broker_order_admitted(identity.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.stage, super::TbankCommandStage::BeforeRpc);
+        assert!(matches!(
+            &error.error,
+            TbankAdapterError::RateLimited(_)
+        ));
+        assert!(matches!(
+            super::classify_command_failure(&error),
+            nautilus_live::execution::failure::CommandFailure::NotSent(_)
+        ));
+        assert!(!client.runtime.cancellation_is_unresolved(&identity));
+        assert!(cancel_calls.lock().unwrap().is_empty());
+        assert!(get_calls.lock().unwrap().is_empty());
+    }
+
+    *cancel_error.lock().unwrap() = Some((Code::Unavailable, "transport failed".to_string()));
+    let limiter = Arc::new(
+        TbankRateLimiter::new(
+            vec![TbankRpcQuota {
+                methods: vec!["CancelStopOrder".to_string()],
+                capacity: 1,
+                window: std::time::Duration::from_secs(1),
+            }],
+            1,
+        )
+        .unwrap(),
+    );
+    use_quota_scope(&mut client, limiter).await;
+
+    let error = client
+        .runtime
+        .cancel_stop_order(&identity.broker_order_id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.stage, super::TbankCommandStage::RpcStarted);
+    assert!(matches!(
+        super::classify_command_failure(&error),
+        nautilus_live::execution::failure::CommandFailure::Ambiguous(_)
+    ));
+    assert_eq!(cancel_calls.lock().unwrap().len(), 1);
+    assert!(get_calls.lock().unwrap().is_empty());
+    client.disconnect_async().await.unwrap();
 }
 
 #[tokio::test]
@@ -4538,6 +4714,7 @@ fn custom_broker_request_id_is_rejected() {
     let client_order_id = "strategy-order-1";
     let deterministic = tbank_broker_request_id_for_client_order_id(client_order_id);
     let mut order = TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
         instrument_id: "SBER_TQBR.MOEX".to_string(),
         client_order_id: client_order_id.to_string(),
         broker_request_id: "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
@@ -4585,6 +4762,7 @@ async fn stop_order_cancel_route_recovers_from_broker_after_restart() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -4631,6 +4809,7 @@ async fn activated_stop_recovery_uses_order_request_id_without_exchange_order_id
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -4697,6 +4876,7 @@ async fn query_fills_pages_until_cursor_exhausted() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OperationsServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -4856,6 +5036,7 @@ async fn generate_fill_reports_returns_operation_history_trades() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .add_service(OperationsServiceServer::new(service))
@@ -5124,6 +5305,7 @@ async fn fill_report_identity_queries_only_unresolved_current_operations() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .add_service(OperationsServiceServer::new(operations_service))
@@ -5241,6 +5423,7 @@ async fn mass_status_skips_identity_recovery_for_out_of_scope_operations() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .add_service(OperationsServiceServer::new(operations_service))
@@ -5339,6 +5522,7 @@ async fn fill_report_identity_recovers_from_operation_id_when_order_history_omit
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .add_service(OperationsServiceServer::new(operations_service))
@@ -5427,6 +5611,7 @@ async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .add_service(OperationsServiceServer::new(operations_service))
@@ -5615,6 +5800,7 @@ async fn generate_mass_status_handles_empty_order_id_as_unresolved_fill_identity
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .add_service(OperationsServiceServer::new(operations_service))

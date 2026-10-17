@@ -58,7 +58,7 @@ impl Deref for TbankResolvedStreamOrderIdentity {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct TbankBrokerOrderIndex {
     by_client_order_id: HashMap<String, TbankBrokerOrderIdentity>,
     pending_route_by_client_order_id: HashMap<String, TbankBrokerOrderRoute>,

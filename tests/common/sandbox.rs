@@ -1961,23 +1961,71 @@ async fn submit_market_order_with_client(
     direction: OrderDirection,
     lots: i64,
 ) -> Result<OrderStatusReport> {
+    submit_market_order_with_method(
+        execution,
+        instrument,
+        direction,
+        lots,
+        tbank_nt_community::TbankSubmitMethod::PostOrder,
+    )
+    .await
+}
+
+async fn submit_market_order_with_method(
+    execution: &mut SandboxExecutionHarness,
+    instrument: &TbankInstrumentMetadata,
+    direction: OrderDirection,
+    lots: i64,
+    method: tbank_nt_community::TbankSubmitMethod,
+) -> Result<OrderStatusReport> {
     let side = match direction {
         OrderDirection::Buy => OrderSide::Buy,
         OrderDirection::Sell => OrderSide::Sell,
         _ => bail!("unsupported market test direction {direction:?}"),
     };
-    execution
-        .submit(submit_command(
-            instrument,
-            side,
-            OrderType::Market,
-            TimeInForce::Ioc,
-            None,
-            None,
-            lots,
-        )?)
+    let mut command = submit_command(
+        instrument,
+        side,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        None,
+        None,
+        lots,
+    )?;
+    method.apply(command.params.get_or_insert_with(Default::default));
+    let mut report = execution
+        .submit(command)
         .await?
-        .expect_report("submit sandbox market order through Nautilus")
+        .expect_report("submit sandbox market order through Nautilus")?;
+    if method == tbank_nt_community::TbankSubmitMethod::PostOrderAsync
+        && !report.order_status.is_closed()
+    {
+        report = timeout(Duration::from_secs(30), async {
+            loop {
+                let current = ExecutionClient::generate_order_status_report(
+                    &execution.client,
+                    &GenerateOrderStatusReport::new(
+                        UUID4::new(),
+                        current_test_unix_nanos(),
+                        Some(report.instrument_id),
+                        report.client_order_id,
+                        Some(report.venue_order_id),
+                        None,
+                        None,
+                    ),
+                )
+                .await?
+                .context("async market order state is missing")?;
+                if current.order_status.is_closed() {
+                    return Ok::<OrderStatusReport, anyhow::Error>(current);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("async market order did not reach a terminal state")??;
+    }
+    Ok(report)
 }
 
 #[cfg(all(feature = "sandbox-tests", not(feature = "sandbox-futures-tests")))]
@@ -2471,12 +2519,16 @@ async fn sandbox_market_fill() -> Result<()> {
             .await
             .context("connect execution client for market-fill buy")?;
         let history_start = sandbox_fill_history_start();
+        // Both methods share one Nautilus identity history. Sandbox cannot reconstruct terminal
+        // orders for a fresh independent client from a broad operation-history window.
+        for method in [tbank_nt_community::TbankSubmitMethod::PostOrder, tbank_nt_community::TbankSubmitMethod::PostOrderAsync] {
         cleanup.arm();
-        let buy = submit_market_order_with_client(
+        let buy = submit_market_order_with_method(
             execution,
             &adapter_instrument,
             OrderDirection::Buy,
             1,
+        method,
         )
         .await?;
         ensure!(
@@ -2494,14 +2546,14 @@ async fn sandbox_market_fill() -> Result<()> {
         instrument.lot
     );
 
-    // Buy and sell go through one client on purpose: a fill report needs a venue order id, and the
-    // adapter resolves that id only for trades the querying client observed itself. A separate
-    // reporting client skips every operation it never saw, so the assertion below could not pass.
-    let sell = submit_market_order_with_client(
+    // One client retains canonical identities for both methods. Unknown operation identities
+    // remain a fail-closed reporting error rather than being skipped.
+    let sell = submit_market_order_with_method(
         execution,
         &adapter_instrument,
         OrderDirection::Sell,
         1,
+        method,
     )
     .await?;
     ensure!(
@@ -2526,10 +2578,10 @@ async fn sandbox_market_fill() -> Result<()> {
         |reports| {
             reports
                 .iter()
-                .any(|report| report.order_side == OrderSide::Buy)
+                .any(|report| report.order_side == OrderSide::Buy && report.venue_order_id == buy.venue_order_id)
                 && reports
                     .iter()
-                    .any(|report| report.order_side == OrderSide::Sell)
+                    .any(|report| report.order_side == OrderSide::Sell && report.venue_order_id == sell.venue_order_id)
         },
     )
     .await?;
@@ -2556,6 +2608,8 @@ async fn sandbox_market_fill() -> Result<()> {
         "sandbox operations did not expose fills for recent market round trip"
     );
 
+    eprintln!("SANDBOX_SUBMIT_METHOD method={method:?} buy=filled sell=filled position_restored=true fill_history=verified");
+        }
     Ok(())
     })
     .catch_unwind()
@@ -3179,4 +3233,127 @@ fn futures_search_uses_nearest_unexpired_contract_matching_base_ticker() {
     assert!(select_active_future(&futures[..1], "Si", now).is_none());
     assert!(matches_futures_search_ticker("Si", "Si-12.26"));
     assert!(!matches_futures_search_ticker("Si", "USDRUBF"));
+}
+
+#[cfg(all(feature = "sandbox-tests", not(feature = "sandbox-futures-tests")))]
+async fn acknowledged_book_stream(
+    env: &SandboxEnv,
+    clients: &mut Clients,
+    instrument: &InstrumentMeta,
+    source: generated::OrderBookType,
+) -> Result<Option<tonic::Streaming<generated::MarketDataResponse>>> {
+    let mut stream = call(
+        "MarketDataStreamService.MarketDataServerSideStream",
+        env,
+        clients.market_data_stream.market_data_server_side_stream(
+            generated::MarketDataServerSideStreamRequest {
+                subscribe_order_book_request: Some(generated::SubscribeOrderBookRequest {
+                    subscription_action: SubscriptionAction::Subscribe as i32,
+                    instruments: vec![generated::OrderBookInstrument {
+                        instrument_id: instrument.instrument_uid.clone(),
+                        depth: 10,
+                        order_book_type: source as i32,
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            },
+        ),
+    )
+    .await?;
+    let acknowledged = timeout(Duration::from_secs(20), async {
+        loop {
+            let message = stream
+                .next()
+                .await
+                .context("book stream closed before acknowledgement")?
+                .map_err(|status| {
+                    anyhow!(sanitize_status(
+                        &status,
+                        "MarketDataStreamService.MarketDataServerSideStream",
+                        env
+                    ))
+                })?;
+            if let Some(MarketDataPayload::SubscribeOrderBookResponse(response)) = message.payload {
+                let subscription = response
+                    .order_book_subscriptions
+                    .iter()
+                    .find(|s| s.instrument_uid == instrument.instrument_uid && s.depth == 10)
+                    .context("book acknowledgement omitted requested instrument/depth")?;
+                let status = SubscriptionStatus::try_from(subscription.subscription_status)
+                    .context("unknown book subscription status")?;
+                if status == SubscriptionStatus::SourceIsInvalid
+                    || (source == generated::OrderBookType::OrderbookTypeDealer
+                        && status == SubscriptionStatus::InstrumentNotFound)
+                {
+                    eprintln!(
+                        "CAPABILITY_SKIP source={source:?} depth=10 status={}",
+                        subscription_status_name(subscription.subscription_status)
+                    );
+                    return Ok::<bool, anyhow::Error>(false);
+                }
+                ensure!(
+                    status == SubscriptionStatus::Success,
+                    "book subscription rejected: {}",
+                    subscription_status_name(subscription.subscription_status)
+                );
+                ensure!(
+                    subscription.order_book_type == source as i32,
+                    "broker acknowledgement changed selected book source"
+                );
+                return Ok(true);
+            }
+        }
+    })
+    .await
+    .context("book acknowledgement deadline expired")??;
+    Ok(acknowledged.then_some(stream))
+}
+
+#[cfg(all(feature = "sandbox-tests", not(feature = "sandbox-futures-tests")))]
+#[tokio::test]
+#[ignore]
+async fn sandbox_dual_book_acknowledgements() -> Result<()> {
+    require_sandbox_preflight().await?;
+    let (env, mut clients) = sandbox_context().await?;
+    let instrument = load_instrument(&env, &mut clients).await?;
+    let Some(exchange) = acknowledged_book_stream(
+        &env,
+        &mut clients,
+        &instrument,
+        generated::OrderBookType::OrderbookTypeExchange,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(dealer) = acknowledged_book_stream(
+        &env,
+        &mut clients,
+        &instrument,
+        generated::OrderBookType::OrderbookTypeDealer,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    // Keep dealer connected while exchange is closed and opened again. No freshness threshold or
+    // first-payload requirement is imposed: availability is the broker's acknowledgement.
+    drop(exchange);
+    let exchange = acknowledged_book_stream(
+        &env,
+        &mut clients,
+        &instrument,
+        generated::OrderBookType::OrderbookTypeExchange,
+    )
+    .await?;
+    ensure!(
+        exchange.is_some(),
+        "exchange availability changed during independent resubscribe"
+    );
+    eprintln!(
+        "BROKER_DUAL_BOOK_ACK exchange=ok dealer=ok exchange_resubscribe=ok; payload delivery and adapter network-recovery not asserted"
+    );
+    drop(dealer);
+    Ok(())
 }

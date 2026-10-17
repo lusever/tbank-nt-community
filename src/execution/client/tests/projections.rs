@@ -760,6 +760,7 @@ async fn external_activated_stop_initial_ack_recovers_confirmed_child_in_backgro
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .add_service(StopOrdersServiceServer::new(stop_orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -866,6 +867,7 @@ async fn external_regular_initial_ack_schedules_request_id_reconciliation() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(orders_service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -995,13 +997,20 @@ fn stop_order_state_stream_updates_known_stop_lifecycle() {
     let pending_submits = Arc::new(Mutex::new(HashMap::from([(
         "524b1a03-efdd-4cd0-bd56-7cc6570c7156".to_string(),
         TbankPendingSubmit {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
+            trade_intent_id: None,
+            broker_trade_order_id: None,
+            broker_receipt_id: None,
             instrument_id: "SBER_TQBR.MOEX".to_string(),
             submitted_ts: current_unix_nanos(),
             quantity_units: Decimal::from(20),
             side: TbankOrderSide::Sell,
             order_type: TbankOrderType::StopMarket,
             time_in_force: TimeInForce::Gtc,
+            limit_price: None,
+            trigger_price: None,
             trailing: None,
+            confirm_margin_trade: false,
             venue_order_id: Some("stop-order-1".to_string()),
             last_reconciliation_ts: None,
             stage: TbankPendingSubmitStage::Submitted,
@@ -1233,6 +1242,7 @@ async fn stop_submit_reconciliation_does_not_rebind_known_broker_order() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -2823,6 +2833,7 @@ async fn submit_reconciliation_partial_fill_bundles_status_and_fill_reports() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -2914,6 +2925,7 @@ async fn submit_stop_order_timeout_stays_unknown_when_snapshot_attribution_is_am
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3002,6 +3014,7 @@ async fn stop_order_submit_missing_broker_identity_remains_unknown() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3067,6 +3080,7 @@ async fn submit_stop_order_unknown_outcome_recovers_in_background() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3155,6 +3169,7 @@ async fn submit_stop_order_response_returns_accepted_without_preflight_query() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(StopOrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3215,6 +3230,7 @@ async fn submit_with_post_error(
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3265,6 +3281,7 @@ async fn submit_unresolved_reconciliation_keeps_unknown_pending() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3400,6 +3417,7 @@ async fn submit_unknown_outcome_recovers_within_admitted_operation_after_initial
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3532,6 +3550,7 @@ async fn repeated_submit_not_found_keeps_identity_unresolved_and_blocks_reset() 
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3615,6 +3634,7 @@ async fn submit_recovery_polls_transport_failures_to_the_bound_then_reports_unre
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3866,6 +3886,7 @@ async fn submit_recovery_cancels_a_slow_rpc_at_the_remaining_deadline() {
 
     tokio::spawn(async move {
         Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
             .add_service(OrdersServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -3897,6 +3918,7 @@ async fn submit_recovery_cancels_a_slow_rpc_at_the_remaining_deadline() {
 
 fn pending_submit_order(client_order_id: &str) -> TbankSubmitOrder {
     TbankSubmitOrder {
+            submit_method: crate::execution::TbankSubmitMethod::PostOrder,
         instrument_id: "SBER_TQBR.MOEX".to_string(),
         client_order_id: client_order_id.to_string(),
         broker_request_id: format!("request-{client_order_id}"),

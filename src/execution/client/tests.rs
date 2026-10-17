@@ -31,3 +31,5 @@ include!("tests/submission.rs");
 include!("tests/projections.rs");
 include!("tests/reports.rs");
 include!("tests/translation.rs");
+
+include!("tests/async_submit.rs");

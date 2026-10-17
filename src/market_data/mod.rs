@@ -11,6 +11,10 @@ pub(crate) mod continuity;
 /// Protobuf-to-domain conversions.
 pub mod converters;
 mod events;
+/// Source-specific custom order books.
+pub mod snapshot;
+pub use snapshot::{TbankBookSource, TbankBookSubscription, TbankOrderBookSnapshot};
+
 /// Subscription registry.
 pub mod subscriptions;
 pub(crate) mod supervisor;
@@ -18,7 +22,9 @@ pub(crate) mod supervisor;
 pub mod trades;
 
 pub use bars::TbankBar;
-pub use book::{SyntheticBookDelta, TbankBookSide, TbankOrderBookLevel, TbankOrderBookSnapshot};
+pub use book::{
+    SyntheticBookDelta, TbankBookSide, TbankOrderBookLevel, TbankWireOrderBookSnapshot,
+};
 pub use client::TbankDataClient;
 pub use converters::{candle_to_bar, last_price_to_quote, orderbook_to_snapshot, trade_to_tick};
 pub use events::{

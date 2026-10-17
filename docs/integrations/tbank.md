@@ -141,3 +141,7 @@ an adapter client must call `register_tbank_currencies()` first.
 The adapter is distributed only from immutable signed Git tags. It is not published to crates.io.
 There are no Python bindings, downloader crate, catalog CLI, strategy, portfolio, or live-runner
 components in this repository.
+
+## Explicit submit methods and independent book sources
+
+See [the execution, book-routing and recording contract](dual_execution_and_books.md) for per-command submission methods, custom book subscriptions, quotas and replay examples.

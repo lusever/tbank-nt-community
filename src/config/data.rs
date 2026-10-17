@@ -50,6 +50,10 @@ pub struct TbankDataClientConfig {
     pub token: Option<SecretString>,
     /// Optional gRPC endpoint override.
     pub endpoint: Option<String>,
+    #[serde(skip)]
+    /// Optional explicit quota scope shared by clients/tokens belonging to one broker limit domain.
+    /// When absent, clients with identical credentials share authoritative GetUserTariff limits.
+    pub quota_scope: Option<std::sync::Arc<crate::grpc::limiter::TbankRateLimiter>>,
     #[builder(default = DEFAULT_REQUEST_TIMEOUT)]
     /// Timeout for unary broker requests.
     pub request_timeout: Duration,

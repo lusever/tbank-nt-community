@@ -31,11 +31,13 @@ pub use config::{
     TbankDataClientConfig, TbankEnvironment, TbankExecutionClientConfig,
     TbankIndicativeInstrumentConfig,
 };
+pub use execution::{TbankSubmitMethod, TbankSubmitOptions};
 pub use factory::{TbankDataClientFactory, TbankExecutionClientFactory};
 pub use instruments::{
     TbankInstrumentMapper, TbankInstrumentMetadata, TbankInstrumentProvider,
     TbankMarketDataInstrumentMetadata,
 };
+pub use market_data::{TbankBookSource, TbankBookSubscription, TbankOrderBookSnapshot};
 pub use market_data::{
     TbankCandleReadinessState, TbankMarketDataEvent, TbankMarketDataStreamState,
     register_tbank_market_data_custom_data,
@@ -47,5 +49,6 @@ pub use market_data::{
 /// market-data and execution registrations are idempotent and process-local.
 pub fn register_tbank_custom_data() {
     register_tbank_market_data_custom_data();
+    market_data::snapshot::register_tbank_book_custom_data();
     execution::register_tbank_execution_custom_data();
 }

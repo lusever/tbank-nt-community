@@ -122,7 +122,11 @@ impl TbankInstrumentProvider {
         self.config.validate_settings()?;
         let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
         let interceptor = TbankAuthInterceptor::new(credentials)?;
-        Ok(TbankGrpcClients::new(channel, interceptor))
+        Ok(TbankGrpcClients::new_with_quota_scope(
+            channel,
+            interceptor,
+            self.config.quota_scope.clone(),
+        ))
     }
 
     fn add_share(&mut self, share: &crate::grpc::generated::Share) -> anyhow::Result<()> {

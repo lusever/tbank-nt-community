@@ -1,3 +1,4 @@
+use super::limited_channel::TbankLimitedChannel;
 use tonic::{codegen::InterceptedService, service::Interceptor, transport::Channel};
 
 use crate::grpc::generated::{
@@ -19,25 +20,27 @@ where
     I: Interceptor + Clone,
 {
     /// Instruments service client.
-    pub instruments: InstrumentsServiceClient<InterceptedService<Channel, I>>,
+    pub instruments: InstrumentsServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Unary market-data service client.
-    pub market_data: MarketDataServiceClient<InterceptedService<Channel, I>>,
+    pub market_data: MarketDataServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Streaming market-data service client.
-    pub market_data_stream: MarketDataStreamServiceClient<InterceptedService<Channel, I>>,
+    pub market_data_stream:
+        MarketDataStreamServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Regular orders service client.
-    pub orders: OrdersServiceClient<InterceptedService<Channel, I>>,
+    pub orders: OrdersServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Orders stream service client.
-    pub orders_stream: OrdersStreamServiceClient<InterceptedService<Channel, I>>,
+    pub orders_stream: OrdersStreamServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Stop-orders service client.
-    pub stop_orders: StopOrdersServiceClient<InterceptedService<Channel, I>>,
+    pub stop_orders: StopOrdersServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Portfolio operations service client.
-    pub operations: OperationsServiceClient<InterceptedService<Channel, I>>,
+    pub operations: OperationsServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Portfolio operations stream service client.
-    pub operations_stream: OperationsStreamServiceClient<InterceptedService<Channel, I>>,
+    pub operations_stream:
+        OperationsStreamServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// Sandbox service client.
-    pub sandbox: SandboxServiceClient<InterceptedService<Channel, I>>,
+    pub sandbox: SandboxServiceClient<InterceptedService<TbankLimitedChannel, I>>,
     /// User accounts service client.
-    pub users: UsersServiceClient<InterceptedService<Channel, I>>,
+    pub users: UsersServiceClient<InterceptedService<TbankLimitedChannel, I>>,
 }
 
 impl<I> TbankGrpcClients<I>
@@ -46,6 +49,16 @@ where
 {
     /// Creates a new instance.
     pub fn new(channel: Channel, interceptor: I) -> Self {
+        Self::new_with_quota_scope(channel, interceptor, None)
+    }
+
+    /// Creates clients using a consumer-provided shared quota scope, or automatic tariff discovery.
+    pub fn new_with_quota_scope(
+        channel: Channel,
+        interceptor: I,
+        scope: Option<std::sync::Arc<super::limiter::TbankRateLimiter>>,
+    ) -> Self {
+        let channel = TbankLimitedChannel::with_quota_scope(channel, scope);
         Self {
             instruments: InstrumentsServiceClient::with_interceptor(
                 channel.clone(),

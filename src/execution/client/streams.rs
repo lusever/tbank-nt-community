@@ -181,6 +181,44 @@ pub(super) async fn publish_order_state_stream(
                             state.order_id.as_str(),
                             state.trade_order_id.as_str(),
                         );
+                        crate::grpc::limiter::diagnostic_with_context(
+                            0,
+                            "OrderStateStream",
+                            "broker_event",
+                            client_order_id.as_deref(),
+                            state
+                                .created_at
+                                .as_ref()
+                                .and_then(|t| crate::common::time::timestamp_to_unix_nanos(t).ok())
+                                .and_then(|t| u64::try_from(t).ok()),
+                        );
+                        if let Some(id) = client_order_id.as_deref() {
+                            let confirmed = context
+                                .broker_order_index
+                                .lock()
+                                .expect("broker_order_index lock")
+                                .identity_for(Some(id), None)
+                                .is_some();
+                            if let Some(pending) = context
+                                .pending_submits
+                                .lock()
+                                .expect("pending_submits lock")
+                                .get_mut(id)
+                            {
+                                if !state.trade_order_id.is_empty() {
+                                    pending.broker_trade_order_id =
+                                        Some(state.trade_order_id.clone());
+                                }
+                                if !confirmed
+                                    && state.execution_report_status
+                                        == TbankOrderExecutionReportStatus::ExecutionReportStatusNew
+                                            as i32
+                                    && !state.order_id.is_empty()
+                                {
+                                    pending.broker_receipt_id = Some(state.order_id.clone());
+                                }
+                            }
+                        }
                         let managed_context = client_order_id.as_deref().and_then(|client_id| {
                             context
                                 .broker_order_index

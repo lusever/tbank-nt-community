@@ -51,12 +51,16 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 dotenvy = { version = "0.15", optional = true }
 futures-util = "0.3"
 http = "1"
+http-body = "1"
+bytes = "1"
 jiff = { version = "=0.2.38", default-features = false, features = ["std"] }
 nautilus-common = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7", features = ["live", "tracing-bridge"] }
 nautilus-core = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7" }
 nautilus-execution = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7" }
 nautilus-live = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7" }
 nautilus-model = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7" }
+nautilus-serialization = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7", features = ["arrow"] }
+arrow = { version = "59.3.0", default-features = false }
 prost = { version = "0.14.4", default-features = false, features = ["std"] }
 prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
@@ -73,6 +77,8 @@ uuid = { version = "1", features = ["v4", "v5"] }
 zeroize = "1"
 
 [dev-dependencies]
+nautilus-persistence = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7" }
+nautilus-data = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7" }
 nautilus-model = { version = "=0.66.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc7", features = ["test-support"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "std"] }

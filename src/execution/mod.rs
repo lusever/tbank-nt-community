@@ -22,6 +22,8 @@ pub use events::{
     register_tbank_execution_custom_data,
 };
 pub use orders::{
-    TbankExecutionService, TbankSubmitOrder, TbankTrailingStopParams, build_post_order_request,
+    TBANK_SUBMIT_DEADLINE_PARAM, TBANK_SUBMIT_METHOD_PARAM, TbankExecutionService,
+    TbankSubmitMethod, TbankSubmitOptions, TbankSubmitOrder, TbankTrailingStopParams,
+    build_post_order_async_request, build_post_order_request,
 };
 pub use stop_orders::build_post_stop_order_request;
