@@ -1,6 +1,6 @@
 [package]
 name = "tbank-nt-community"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99.0"
 authors = ["lusever"]
