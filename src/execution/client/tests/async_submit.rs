@@ -725,16 +725,17 @@ async fn lost_async_reply_restores_from_cached_submitted_order_without_resubmiss
         1,
         "recovery must not re-post an order"
     );
-    let queries = state_calls.lock().unwrap();
-    assert_eq!(
-        queries.last().unwrap().order_id,
-        tbank_broker_request_id_for_client_order_id(id.as_str())
-    );
-    assert_eq!(
-        queries.last().unwrap().order_id_type,
-        Some(OrderIdType::Request as i32)
-    );
-    drop(queries);
+    {
+        let queries = state_calls.lock().unwrap();
+        assert_eq!(
+            queries.last().unwrap().order_id,
+            tbank_broker_request_id_for_client_order_id(id.as_str())
+        );
+        assert_eq!(
+            queries.last().unwrap().order_id_type,
+            Some(OrderIdType::Request as i32)
+        );
+    }
     release.notify_waiters();
     fresh.disconnect_async().await.unwrap();
 }

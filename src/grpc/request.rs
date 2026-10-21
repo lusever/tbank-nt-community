@@ -9,6 +9,17 @@ pub fn with_timeout<T>(message: T, timeout: Duration) -> Request<T> {
     request
 }
 
+/// Creates a request with evidence of whether quota admission reached actual dispatch.
+pub fn with_dispatch_marker<T>(
+    message: T,
+    timeout: Duration,
+    marker: super::limited_channel::TbankDispatchMarker,
+) -> Request<T> {
+    let mut request = with_timeout(message, timeout);
+    request.extensions_mut().insert(marker);
+    request
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19,15 +30,4 @@ mod tests {
 
         assert_eq!(request.metadata().get("grpc-timeout").unwrap(), "1500000u");
     }
-}
-
-/// Creates a request with evidence of whether quota admission reached actual dispatch.
-pub fn with_dispatch_marker<T>(
-    message: T,
-    timeout: Duration,
-    marker: super::limited_channel::TbankDispatchMarker,
-) -> Request<T> {
-    let mut request = with_timeout(message, timeout);
-    request.extensions_mut().insert(marker);
-    request
 }
