@@ -44,6 +44,10 @@ pub struct TbankBookSubscription {
     pub depth: i32,
 }
 impl TbankBookSubscription {
+    /// Stable lifecycle stream ID shared by all active custom book subscriptions.
+    /// `Connected` confirms the complete group; reconnect or membership changes invalidate it.
+    pub const STREAM_ID: &'static str = "custom_book:all:group";
+
     /// Validates a subscription before transport admission.
     pub fn new(
         instrument_id: InstrumentId,

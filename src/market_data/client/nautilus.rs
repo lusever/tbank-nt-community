@@ -83,8 +83,15 @@ impl DataClient for TbankDataClient {
         if self.custom_book_subscriptions.contains(&key) {
             return Ok(());
         }
-        self.schedule_custom_book_stream(key)?;
+        anyhow::ensure!(
+            self.custom_book_subscriptions.len() < MAX_SUBSCRIPTIONS_PER_STREAM,
+            "T-Bank custom order book group supports at most {MAX_SUBSCRIPTIONS_PER_STREAM} subscriptions"
+        );
         self.custom_book_subscriptions.insert(key);
+        if let Err(error) = self.schedule_custom_book_stream() {
+            self.custom_book_subscriptions.remove(&key);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -93,8 +100,15 @@ impl DataClient for TbankDataClient {
         cmd: &nautilus_common::messages::data::UnsubscribeCustomData,
     ) -> anyhow::Result<()> {
         let key = TbankBookSubscription::from_data_type(&cmd.data_type)?;
-        self.abort_stream(&Self::custom_book_task_key(key))?;
-        self.custom_book_subscriptions.remove(&key);
+        if !self.custom_book_subscriptions.remove(&key) {
+            return Ok(());
+        }
+        if self.custom_book_subscriptions.is_empty() {
+            self.abort_stream(&Self::custom_book_task_key())?;
+        } else if let Err(error) = self.schedule_custom_book_stream() {
+            self.custom_book_subscriptions.insert(key);
+            return Err(error);
+        }
         Ok(())
     }
 

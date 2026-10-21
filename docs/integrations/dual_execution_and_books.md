@@ -72,10 +72,19 @@ let dealer = TbankBookSubscription::new(instrument_id, TbankBookSource::Dealer, 
 
 Each subscription's complete key is `(InstrumentId, source, depth)`. It is checked against broker
 acknowledgements and payloads, retained across reconnect, and used for unsubscribe. Duplicate
-subscription admission is idempotent. Unsubscribing one source does not remove another source
-or the existing standard exchange depth/quote subscriptions. Dealer payloads cannot update
+subscription admission is idempotent. All active custom book keys are sent together in one
+server-side stream request; the shared stream becomes ready only after the broker confirms every
+requested `(InstrumentId, source, depth)` key. Adding or removing a key rebuilds that grouped
+subscription, while reconnect restores the complete active set. Unsubscribing one source does not
+remove another source or the existing standard exchange depth/quote subscriptions. Dealer payloads cannot update
 standard exchange book/quote projections. Broker subscription responses determine availability;
 pending or failed acknowledgements do not establish availability.
+
+The public lifecycle ID is `TbankBookSubscription::STREAM_ID` (`custom_book:all:group`),
+including for a single subscription. `Connected` confirms all active keys; reconnect and
+membership changes invalidate the whole group's readiness. Internal task generations do not
+appear in this public ID. Consumers must use this grouped lifecycle contract when deploying
+this adapter revision.
 
 `TbankOrderBookSnapshot` is the registered custom type. Its real InstrumentId stays
 `SBER_TQBR.MOEX`. Source and depth occur in the payload, DataType metadata and identifier:

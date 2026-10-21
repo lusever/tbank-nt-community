@@ -12,7 +12,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::{
@@ -120,7 +120,7 @@ impl TbankDataConnection {
     }
 }
 
-const MAX_QUOTES_PER_STREAM: usize = 300;
+const MAX_SUBSCRIPTIONS_PER_STREAM: usize = 300;
 const MAX_PRE_ACK_MESSAGES: usize = 2_048;
 type SharedInstrumentMetadata = Arc<RwLock<HashMap<String, MarketDataInstrumentMetadata>>>;
 type SharedInstrumentStreamIds = Arc<RwLock<HashMap<String, String>>>;
@@ -948,7 +948,7 @@ fn quote_subscription_groups(
     let mut entries = subscriptions.to_vec();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     entries
-        .chunks(MAX_QUOTES_PER_STREAM)
+        .chunks(MAX_SUBSCRIPTIONS_PER_STREAM)
         .map(|chunk| {
             let stream_ids = chunk
                 .iter()
@@ -1733,13 +1733,8 @@ impl TbankDataClient {
         for (instrument_id, depth) in order_book_depth_subscriptions {
             self.schedule_order_book_depth_stream(instrument_id, depth)?;
         }
-        for key in self
-            .custom_book_subscriptions
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-        {
-            self.schedule_custom_book_stream(key)?;
+        if !self.custom_book_subscriptions.is_empty() {
+            self.schedule_custom_book_stream()?;
         }
 
         Ok(())
@@ -2627,36 +2622,41 @@ impl TbankDataClient {
         )
     }
 
-    fn custom_book_task_key(key: TbankBookSubscription) -> String {
-        stream_task_key(
-            "custom_book",
-            &key.instrument_id.to_string(),
-            &format!("{}:{}", key.source.as_str(), key.depth),
-        )
+    fn custom_book_task_key() -> String {
+        TbankBookSubscription::STREAM_ID.to_string()
     }
 
-    fn schedule_custom_book_stream(&mut self, key: TbankBookSubscription) -> anyhow::Result<()> {
-        let instrument_uid = self.stream_id(key.instrument_id);
+    fn schedule_custom_book_stream(&mut self) -> anyhow::Result<()> {
+        let mut subscriptions = self
+            .custom_book_subscriptions
+            .iter()
+            .copied()
+            .map(|key| (key, self.stream_id(key.instrument_id)))
+            .collect::<Vec<_>>();
+        subscriptions.sort_by_key(|(key, instrument_uid)| {
+            (instrument_uid.clone(), key.source.as_str(), key.depth)
+        });
+        let instruments = subscriptions
+            .iter()
+            .map(|(key, instrument_uid)| OrderBookInstrument {
+                instrument_id: instrument_uid.clone(),
+                depth: key.depth,
+                order_book_type: key.source.broker_type(),
+                ..Default::default()
+            })
+            .collect();
         let request = MarketDataServerSideStreamRequest {
             subscribe_order_book_request: Some(SubscribeOrderBookRequest {
                 subscription_action: SubscriptionAction::Subscribe as i32,
-                instruments: vec![OrderBookInstrument {
-                    instrument_id: instrument_uid.clone(),
-                    depth: key.depth,
-                    order_book_type: key.source.broker_type(),
-                    ..Default::default()
-                }],
+                instruments,
             }),
             ..Default::default()
         };
-        self.spawn_stream(
-            Self::custom_book_task_key(key),
+        self.spawn_stream_after(
+            Self::custom_book_task_key(),
             request,
-            TbankStreamKind::BookDepth {
-                custom: Some(key),
-                instrument_id: key.instrument_id,
-                instrument_uid,
-            },
+            TbankStreamKind::CustomBooks { subscriptions },
+            Duration::from_millis(50),
         )
     }
 
@@ -2682,7 +2682,6 @@ impl TbankDataClient {
             stream_task_key("book_depth", &instrument_id.to_string(), "book"),
             request,
             TbankStreamKind::BookDepth {
-                custom: None,
                 instrument_id,
                 instrument_uid,
             },
@@ -2695,6 +2694,16 @@ impl TbankDataClient {
         request: MarketDataServerSideStreamRequest,
         kind: TbankStreamKind,
     ) -> anyhow::Result<()> {
+        self.spawn_stream_after(logical_task_key, request, kind, Duration::ZERO)
+    }
+
+    fn spawn_stream_after(
+        &mut self,
+        logical_task_key: String,
+        request: MarketDataServerSideStreamRequest,
+        kind: TbankStreamKind,
+        initial_delay: Duration,
+    ) -> anyhow::Result<()> {
         let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
         let (market_data_stream, market_data_client) = self
             .live_clients_ref()
@@ -2705,40 +2714,25 @@ impl TbankDataClient {
                 )
             })
             .ok_or_else(|| anyhow::anyhow!("data client is not connected"))?;
-        if let Some(previous_task_key) = self.active_stream_task_keys.remove(&logical_task_key) {
-            self.stream_health.retire_task_key(
-                &previous_task_key,
-                "logical market-data stream generation was replaced",
-            );
-            if let Some(mut existing) = self.stream_tasks.remove(&previous_task_key) {
-                existing.cancellation.cancel();
-                drain_singular_task(
-                    &spawner,
-                    std::mem::take(&mut existing.task),
-                    "market-data-stream-task-drain",
-                    Arc::clone(&self.incomplete_stream_tasks),
-                    Arc::clone(&self.stream_task_failures),
-                )?;
-            }
-        }
-        let generation = self.next_stream_generation(&logical_task_key);
-        let task_key = Self::generation_task_key(&logical_task_key, generation);
-        // Ownership is established before the task is spawned. A stale supervisor can therefore
-        // only observe an old key after a replacement and cannot change the new task's health.
-        self.stream_health.register(&task_key);
-        let sender = get_data_event_sender();
-        self.stream_health.bind_event_sender(sender.clone());
-        let config = self.config.clone();
         let credentials = self
             .active_credentials
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("data client credentials are not connected"))?;
+        let generation = self.next_stream_generation(&logical_task_key);
+        let task_key = Self::generation_task_key(&logical_task_key, generation);
+        // Keep the current generation registered until its replacement has been admitted. This
+        // lets a failed setup leave the running stream and its readiness untouched.
+        self.stream_health.register(&task_key);
+        let sender = get_data_event_sender();
+        self.stream_health.bind_event_sender(sender.clone());
+        let config = self.config.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
         let message_sequence = self.message_sequence.clone();
         let cancellation = TaskCancellation::new();
-        let future = run_market_data_stream(MarketDataStreamContext {
+        let (start_sender, start_receiver) = oneshot::channel();
+        let context = MarketDataStreamContext {
             market_data_stream,
             market_data_client,
             sender,
@@ -2756,7 +2750,15 @@ impl TbankDataClient {
             stream_health: self.stream_health.clone(),
             task_spawner: spawner.clone(),
             session_cancellation: self.session_cancellation.clone(),
-        });
+        };
+        let future = async move {
+            if start_receiver.await.is_ok() {
+                if !initial_delay.is_zero() {
+                    tokio::time::sleep(initial_delay).await;
+                }
+                run_market_data_stream(context).await
+            }
+        };
         let task = match spawn_singular_task(
             &spawner,
             "market-data-stream-supervisor",
@@ -2772,8 +2774,36 @@ impl TbankDataClient {
         };
         self.stream_tasks
             .insert(task_key.clone(), SingularStreamTask { cancellation, task });
-        self.active_stream_task_keys
+        let previous_task_key = self
+            .active_stream_task_keys
             .insert(logical_task_key, task_key);
+        if let Some(previous_task_key) = previous_task_key {
+            self.stream_health.retire_task_key(
+                &previous_task_key,
+                "logical market-data stream generation was replaced",
+            );
+            if let Some(mut existing) = self.stream_tasks.remove(&previous_task_key) {
+                existing.cancellation.cancel();
+                if let Err(error) = drain_singular_task(
+                    &spawner,
+                    std::mem::take(&mut existing.task),
+                    "market-data-stream-task-drain",
+                    Arc::clone(&self.incomplete_stream_tasks),
+                    Arc::clone(&self.stream_task_failures),
+                ) {
+                    let failure = format!(
+                        "failed to register retired market-data stream task drain: {error}"
+                    );
+                    tracing::error!(%error, "failed to register T-Bank stream task drain");
+                    self.stream_task_failures
+                        .lock()
+                        .expect("market-data task failures lock")
+                        .push(failure);
+                }
+            }
+        }
+        // Do not run the new stream until the old generation is retired and cancellation requested.
+        let _ = start_sender.send(());
         Ok(())
     }
 
@@ -4018,31 +4048,24 @@ fn is_usable_market_data_response(response: &MarketDataResponse, kind: &TbankStr
         ) => instrument_ids.contains_key(&orderbook.instrument_uid),
         (
             Some(market_data_response::Payload::Orderbook(orderbook)),
-            TbankStreamKind::BookDepth {
-                instrument_uid,
-                custom,
-                ..
-            },
-        ) => {
+            TbankStreamKind::CustomBooks { subscriptions },
+        ) => subscriptions.iter().any(|(key, instrument_uid)| {
             orderbook.instrument_uid == *instrument_uid
-                && custom.is_none_or(|key| {
-                    orderbook.depth == key.depth
-                        && orderbook.order_book_type == key.source.broker_type()
-                })
-        }
+                && orderbook.depth == key.depth
+                && orderbook.order_book_type == key.source.broker_type()
+        }),
+        (
+            Some(market_data_response::Payload::Orderbook(orderbook)),
+            TbankStreamKind::BookDepth { instrument_uid, .. },
+        ) => orderbook.instrument_uid == *instrument_uid,
         _ => false,
     }
 }
 
 fn is_market_data_subscription_ack(response: &MarketDataResponse, kind: &TbankStreamKind) -> bool {
-    if let TbankStreamKind::BookDepth {
-        custom: Some(key),
-        instrument_uid,
-        ..
-    } = kind
-    {
+    if let TbankStreamKind::CustomBooks { subscriptions } = kind {
         return matches!(response.payload.as_ref(), Some(market_data_response::Payload::SubscribeOrderBookResponse(ack))
-            if ack.order_book_subscriptions.iter().any(|s| s.instrument_uid == *instrument_uid && s.depth == key.depth && s.order_book_type == key.source.broker_type()));
+            if ack.order_book_subscriptions.iter().any(|ack| subscriptions.iter().any(|(key, instrument_uid)| ack.instrument_uid == *instrument_uid && ack.depth == key.depth && ack.order_book_type == key.source.broker_type())));
     }
     matches!(
         (response.payload.as_ref(), kind),
@@ -4361,22 +4384,55 @@ fn validate_market_data_subscription_ack(
         ),
         (
             Some(market_data_response::Payload::SubscribeOrderBookResponse(response)),
-            TbankStreamKind::BookDepth {
-                instrument_uid,
-                custom,
-                ..
-            },
+            TbankStreamKind::CustomBooks { subscriptions },
+        ) => {
+            let mut failures = Vec::new();
+            let mut acknowledged_count = 0;
+            for (key, instrument_uid) in subscriptions {
+                let matching = response
+                    .order_book_subscriptions
+                    .iter()
+                    .find(|subscription| {
+                        subscription.instrument_uid == *instrument_uid
+                            && subscription.depth == key.depth
+                            && subscription.order_book_type == key.source.broker_type()
+                    });
+                if let Some(subscription) = matching {
+                    acknowledged_count += 1;
+                    if let Some(mut failure) = subscription_failure(
+                        &subscription.instrument_uid,
+                        subscription.subscription_status,
+                    ) {
+                        failure.reason = format!(
+                            "{} source={} depth={}",
+                            failure.reason,
+                            key.source.as_str(),
+                            key.depth
+                        );
+                        failures.push(failure);
+                    }
+                } else {
+                    failures.push(SubscriptionFailure {
+                        instrument_uid: instrument_uid.clone(),
+                        reason: format!(
+                            "missing order-book subscription acknowledgement: instrument_uid={instrument_uid} source={} depth={}",
+                            key.source.as_str(),
+                            key.depth
+                        ),
+                        retryable: true,
+                    });
+                }
+            }
+            (failures, acknowledged_count)
+        }
+        (
+            Some(market_data_response::Payload::SubscribeOrderBookResponse(response)),
+            TbankStreamKind::BookDepth { instrument_uid, .. },
         ) => (
             response
                 .order_book_subscriptions
                 .iter()
-                .filter(|subscription| {
-                    subscription.instrument_uid == *instrument_uid
-                        && custom.is_none_or(|key| {
-                            subscription.depth == key.depth
-                                && subscription.order_book_type == key.source.broker_type()
-                        })
-                })
+                .filter(|subscription| subscription.instrument_uid == *instrument_uid)
                 .filter_map(|subscription| {
                     subscription_failure(
                         subscription.instrument_uid.as_str(),
@@ -4387,13 +4443,7 @@ fn validate_market_data_subscription_ack(
             response
                 .order_book_subscriptions
                 .iter()
-                .filter(|subscription| {
-                    subscription.instrument_uid == *instrument_uid
-                        && custom.is_none_or(|key| {
-                            subscription.depth == key.depth
-                                && subscription.order_book_type == key.source.broker_type()
-                        })
-                })
+                .filter(|subscription| subscription.instrument_uid == *instrument_uid)
                 .count(),
         ),
         _ => return Ok(()),
@@ -4933,8 +4983,10 @@ enum TbankStreamKind {
     Quotes {
         instrument_ids: HashMap<String, InstrumentId>,
     },
+    CustomBooks {
+        subscriptions: Vec<(TbankBookSubscription, String)>,
+    },
     BookDepth {
-        custom: Option<TbankBookSubscription>,
         instrument_id: InstrumentId,
         instrument_uid: String,
     },
@@ -4946,6 +4998,7 @@ impl TbankStreamKind {
             Self::Bars { .. } => "bars",
             Self::Trades { .. } => "trades",
             Self::Quotes { .. } => "quotes",
+            Self::CustomBooks { .. } => "custom_books",
             Self::BookDepth { .. } => "book_depth",
         }
     }
@@ -4954,6 +5007,7 @@ impl TbankStreamKind {
         match self {
             Self::Bars { bar_types } => bar_types.len(),
             Self::Quotes { instrument_ids } => instrument_ids.len(),
+            Self::CustomBooks { subscriptions } => subscriptions.len(),
             Self::Trades { .. } | Self::BookDepth { .. } => 1,
         }
     }
@@ -5207,8 +5261,32 @@ fn publish_market_data_response(
         }
         (
             market_data_response::Payload::Orderbook(orderbook),
+            TbankStreamKind::CustomBooks { subscriptions },
+        ) => {
+            let (key, _) = subscriptions
+                .iter()
+                .find(|(key, instrument_uid)| {
+                    orderbook.instrument_uid == *instrument_uid
+                        && orderbook.depth == key.depth
+                        && orderbook.order_book_type == key.source.broker_type()
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "received order book outside the custom subscription group: uid={} depth={} source={}",
+                        orderbook.instrument_uid,
+                        orderbook.depth,
+                        orderbook.order_book_type
+                    )
+                })?;
+            let snapshot = TbankOrderBookSnapshot::from_broker(&orderbook, *key, received_at)?;
+            sender
+                .send(DataEvent::Data(Data::Custom(snapshot.into_custom_data())))
+                .map_err(|e| anyhow::anyhow!("book receiver dropped: {e}"))?;
+            return Ok(());
+        }
+        (
+            market_data_response::Payload::Orderbook(orderbook),
             TbankStreamKind::BookDepth {
-                custom,
                 instrument_id,
                 instrument_uid,
             },
@@ -5219,13 +5297,6 @@ fn publish_market_data_response(
                     orderbook.instrument_uid,
                     instrument_uid
                 );
-            }
-            if let Some(key) = custom {
-                let snapshot = TbankOrderBookSnapshot::from_broker(&orderbook, *key, received_at)?;
-                sender
-                    .send(DataEvent::Data(Data::Custom(snapshot.into_custom_data())))
-                    .map_err(|e| anyhow::anyhow!("book receiver dropped: {e}"))?;
-                return Ok(());
             }
             anyhow::ensure!(
                 orderbook.order_book_type != OrderBookType::OrderbookTypeDealer as i32,
@@ -5287,6 +5358,8 @@ fn stream_kind_from_task_key(task_key: &str) -> &'static str {
         "quotes"
     } else if task_key.starts_with("trades:") {
         "trades"
+    } else if task_key.starts_with("custom_book:") {
+        "custom_books"
     } else if task_key.starts_with("book_depth:") {
         "book_depth"
     } else {
@@ -6387,6 +6460,16 @@ mod tests {
 
     #[test]
     fn public_market_data_ids_hide_stream_generations() {
+        for generation in [1, 2, 100] {
+            let task_key = TbankDataClient::generation_task_key(
+                &TbankDataClient::custom_book_task_key(),
+                generation,
+            );
+            assert_eq!(
+                logical_stream_id(&task_key),
+                TbankBookSubscription::STREAM_ID
+            );
+        }
         assert_eq!(
             logical_stream_id("bars:generation:3:group:0:1m"),
             "bars:group:0:1m"
@@ -6842,8 +6925,8 @@ mod tests {
         let groups = quote_subscription_groups(&subscriptions);
 
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].0.len(), MAX_QUOTES_PER_STREAM);
-        assert_eq!(groups[0].1.len(), MAX_QUOTES_PER_STREAM);
+        assert_eq!(groups[0].0.len(), MAX_SUBSCRIPTIONS_PER_STREAM);
+        assert_eq!(groups[0].1.len(), MAX_SUBSCRIPTIONS_PER_STREAM);
         assert_eq!(groups[1].0.len(), 1);
         assert_eq!(groups[1].1.len(), 1);
     }
@@ -8330,13 +8413,19 @@ mod tests {
         use crate::market_data::TbankBookSource;
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let sender = sender.into();
-        for source in [TbankBookSource::Exchange, TbankBookSource::Dealer] {
-            let key = TbankBookSubscription::new(sber_id(), source, 10).unwrap();
-            let kind = TbankStreamKind::BookDepth {
-                custom: Some(key),
-                instrument_id: sber_id(),
-                instrument_uid: "uid".into(),
-            };
+        let subscriptions = [TbankBookSource::Exchange, TbankBookSource::Dealer]
+            .map(|source| {
+                (
+                    TbankBookSubscription::new(sber_id(), source, 10).unwrap(),
+                    "uid".to_string(),
+                )
+            })
+            .to_vec();
+        let kind = TbankStreamKind::CustomBooks {
+            subscriptions: subscriptions.clone(),
+        };
+        for (key, _) in subscriptions {
+            let source = key.source;
             let book = OrderBook {
                 instrument_uid: "uid".into(),
                 depth: 10,
@@ -8388,14 +8477,14 @@ mod tests {
             grpc::generated::{OrderBookSubscription, SubscribeOrderBookResponse},
             market_data::TbankBookSource,
         };
-        let key = TbankBookSubscription::new(sber_id(), TbankBookSource::Dealer, 10).unwrap();
-        let kind = TbankStreamKind::BookDepth {
-            custom: Some(key),
-            instrument_id: sber_id(),
-            instrument_uid: "uid".into(),
+        let exchange =
+            TbankBookSubscription::new(sber_id(), TbankBookSource::Exchange, 10).unwrap();
+        let dealer = TbankBookSubscription::new(sber_id(), TbankBookSource::Dealer, 10).unwrap();
+        let kind = TbankStreamKind::CustomBooks {
+            subscriptions: vec![(exchange, "uid".into()), (dealer, "uid".into())],
         };
-        for (source, depth, expected) in [
-            (TbankBookSource::Exchange, 10, false),
+        for (source, depth, expected_book) in [
+            (TbankBookSource::Exchange, 10, true),
             (TbankBookSource::Dealer, 20, false),
             (TbankBookSource::Dealer, 10, true),
         ] {
@@ -8414,7 +8503,27 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            assert_eq!(is_market_data_subscription_ack(&response, &kind), expected);
+            assert_eq!(
+                is_market_data_subscription_ack(&response, &kind),
+                expected_book
+            );
+            let ack_result = validate_market_data_subscription_ack(&response, &kind);
+            if source == TbankBookSource::Dealer && depth == 20 {
+                let rejection = ack_result.unwrap_err();
+                assert_eq!(rejection.acknowledged_count, 0);
+                assert_eq!(rejection.failures.len(), 2);
+                assert!(rejection.retryable);
+            } else {
+                let rejection = ack_result.unwrap_err();
+                assert_eq!(rejection.acknowledged_count, 1);
+                assert_eq!(rejection.failures.len(), 1);
+                assert!(rejection.retryable);
+                assert!(
+                    rejection
+                        .reason
+                        .contains("missing order-book subscription acknowledgement")
+                );
+            }
             let response = MarketDataResponse {
                 payload: Some(market_data_response::Payload::Orderbook(OrderBook {
                     instrument_uid: "uid".into(),
@@ -8424,22 +8533,43 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            assert_eq!(is_usable_market_data_response(&response, &kind), expected);
+            assert_eq!(
+                is_usable_market_data_response(&response, &kind),
+                expected_book
+            );
         }
-        let other = TbankBookSubscription::new(sber_id(), TbankBookSource::Exchange, 10).unwrap();
-        assert_ne!(
-            TbankDataClient::custom_book_task_key(key),
-            TbankDataClient::custom_book_task_key(other)
+        let complete_ack = MarketDataResponse {
+            payload: Some(market_data_response::Payload::SubscribeOrderBookResponse(
+                SubscribeOrderBookResponse {
+                    order_book_subscriptions: [exchange, dealer]
+                        .map(|key| OrderBookSubscription {
+                            instrument_uid: "uid".into(),
+                            depth: key.depth,
+                            order_book_type: key.source.broker_type(),
+                            subscription_status: SubscriptionStatus::Success as i32,
+                            ..Default::default()
+                        })
+                        .to_vec(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(is_market_data_subscription_ack(&complete_ack, &kind));
+        assert!(validate_market_data_subscription_ack(&complete_ack, &kind).is_ok());
+        assert_eq!(
+            TbankDataClient::custom_book_task_key(),
+            "custom_book:all:group"
         );
-        let mut desired = HashSet::from([key, other]);
-        desired.remove(&other);
-        assert!(desired.contains(&key));
+        assert_eq!(
+            stream_kind_from_task_key(&TbankDataClient::custom_book_task_key()),
+            "custom_books"
+        );
     }
 
     #[test]
     fn single_instrument_book_depth_stream_rejects_mismatched_uid() {
         let kind = TbankStreamKind::BookDepth {
-            custom: None,
             instrument_id: sber_id(),
             instrument_uid: "expected-uid".to_string(),
         };
