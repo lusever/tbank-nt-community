@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::Notify, time::Instant};
+use tonic::Status;
 
 /// One quota shared by all matching RPC methods (empty methods means all RPCs).
 #[derive(Clone, Debug)]
@@ -401,6 +402,41 @@ pub struct TbankRpcDiagnostic {
     pub client_order_id: Option<String>,
     /// Broker timestamp, when supplied; never used to measure local durations.
     pub broker_time_ns: Option<u64>,
+    /// Bounded failure details. Never includes request payloads or metadata.
+    pub failure: Option<TbankRpcFailure>,
+}
+/// Error context attached to a failed transport diagnostic.
+#[derive(Clone, Debug)]
+pub struct TbankRpcFailure {
+    /// Transport phase where the RPC failed.
+    pub phase: &'static str,
+    /// gRPC status variant or `Transport` for an underlying channel error.
+    pub code: String,
+    /// Sanitized, bounded status message.
+    pub message: String,
+}
+const MAX_RPC_FAILURE_MESSAGE_CHARS: usize = 512;
+pub(crate) fn rpc_failure(phase: &'static str, status: &Status) -> TbankRpcFailure {
+    rpc_failure_message(phase, format!("{:?}", status.code()), status.message())
+}
+pub(crate) fn rpc_failure_message(
+    phase: &'static str,
+    code: impl Into<String>,
+    raw_message: &str,
+) -> TbankRpcFailure {
+    let mut chars = raw_message.chars().filter(|ch| !ch.is_control());
+    let mut message = chars
+        .by_ref()
+        .take(MAX_RPC_FAILURE_MESSAGE_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        message.push('…');
+    }
+    TbankRpcFailure {
+        phase,
+        code: code.into(),
+        message,
+    }
 }
 fn diagnostics() -> &'static tokio::sync::broadcast::Sender<TbankRpcDiagnostic> {
     static CHANNEL: OnceLock<tokio::sync::broadcast::Sender<TbankRpcDiagnostic>> = OnceLock::new();
@@ -421,6 +457,31 @@ pub(crate) fn diagnostic_with_context(
     client_order_id: Option<&str>,
     broker_time_ns: Option<u64>,
 ) {
+    diagnostic_with_failure(rpc_id, method, stage, client_order_id, broker_time_ns, None);
+}
+pub(crate) fn diagnostic_failure_with_context(
+    rpc_id: u64,
+    method: &str,
+    client_order_id: Option<&str>,
+    failure: TbankRpcFailure,
+) {
+    diagnostic_with_failure(
+        rpc_id,
+        method,
+        "rpc_failed",
+        client_order_id,
+        None,
+        Some(failure),
+    );
+}
+fn diagnostic_with_failure(
+    rpc_id: u64,
+    method: &str,
+    stage: &'static str,
+    client_order_id: Option<&str>,
+    broker_time_ns: Option<u64>,
+    failure: Option<TbankRpcFailure>,
+) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
@@ -438,6 +499,7 @@ pub(crate) fn diagnostic_with_context(
             .get_or_init(std::time::Instant::now)
             .elapsed()
             .as_nanos(),
+        failure,
     });
 }
 
@@ -460,6 +522,21 @@ pub(crate) fn shared_scope(key: u64) -> Arc<Scope> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rpc_failure_details_keep_code_and_bound_the_message() {
+        let status = Status::unavailable(format!("{}\nextra", "x".repeat(520)));
+        let failure = rpc_failure("await_headers", &status);
+
+        assert_eq!(failure.phase, "await_headers");
+        assert_eq!(failure.code, "Unavailable");
+        assert_eq!(
+            failure.message.chars().count(),
+            MAX_RPC_FAILURE_MESSAGE_CHARS + 1
+        );
+        assert!(failure.message.ends_with('…'));
+        assert!(!failure.message.chars().any(char::is_control));
+    }
+
     fn quota(methods: &[&str], capacity: usize) -> TbankRpcQuota {
         TbankRpcQuota {
             methods: methods.iter().map(|s| s.to_string()).collect(),

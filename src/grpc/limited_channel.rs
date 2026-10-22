@@ -1,5 +1,8 @@
 //! Transport-wide quota admission before a request can reach the channel.
-use super::limiter::{Scope, method_name, shared_scope};
+use super::limiter::{
+    Scope, TbankRpcFailure, diagnostic_failure_with_context, method_name, rpc_failure,
+    rpc_failure_message, shared_scope,
+};
 use std::{
     future::Future,
     pin::Pin,
@@ -88,7 +91,12 @@ impl Service<http::Request<Body>> for TbankLimitedChannel {
                     None,
                 )
             };
+            let record_failure = |failure| {
+                diagnostic_failure_with_context(id, &method, client_order_id.as_deref(), failure)
+            };
             record("received");
+            let mut failure = None::<TbankRpcFailure>;
+            let mut failure_phase = "quota_admission";
             let result = tokio::time::timeout_at(deadline, async {
                 use std::hash::{Hash, Hasher};
                 let auth = request
@@ -152,12 +160,19 @@ impl Service<http::Request<Body>> for TbankLimitedChannel {
                 record("quota_reserved");
                 std::future::poll_fn(|cx| channel.poll_ready(cx))
                     .await
-                    .map_err(|_| Status::unavailable("channel is not ready"))?;
+                    .map_err(|error| {
+                        failure = Some(rpc_failure_message(
+                            "channel_ready",
+                            "Transport",
+                            &format!("{error:?}"),
+                        ));
+                        Status::unavailable("channel is not ready")
+                    })?;
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(Status::deadline_exceeded(
-                        "RPC deadline expired before dispatch",
-                    ));
+                    let status = Status::deadline_exceeded("RPC deadline expired before dispatch");
+                    failure = Some(rpc_failure("before_dispatch", &status));
+                    return Err(status);
                 }
                 // Admission/opening is bounded, but a stream without a consumer deadline must
                 // not acquire an invented lifetime through grpc-timeout metadata.
@@ -181,20 +196,35 @@ impl Service<http::Request<Body>> for TbankLimitedChannel {
                 if let Some(marker) = request.extensions().get::<TbankDispatchMarker>() {
                     marker.dispatched.store(true, Ordering::Release);
                 }
+                failure_phase = "await_headers";
                 record("rpc_started");
                 let response = tokio::time::timeout_at(deadline, channel.call(request))
                     .await
-                    .map_err(|_| Status::deadline_exceeded("RPC deadline expired after dispatch"))?
-                    .map_err(|_| Status::unavailable("broker transport failed after dispatch"))?;
+                    .map_err(|_| {
+                        let status =
+                            Status::deadline_exceeded("RPC deadline expired after dispatch");
+                        failure = Some(rpc_failure("await_headers", &status));
+                        status
+                    })?
+                    .map_err(|error| {
+                        failure = Some(rpc_failure_message(
+                            "await_headers",
+                            "Transport",
+                            &format!("{error:?}"),
+                        ));
+                        Status::unavailable("broker transport failed after dispatch")
+                    })?;
                 drop(stream_admission);
                 record("rpc_headers");
+                failure_phase = "response_body";
                 let finished = http_body::Body::is_end_stream(response.body());
                 if finished {
-                    let failed = response
-                        .headers()
-                        .get("grpc-status")
-                        .is_some_and(|s| s.as_bytes() != b"0");
-                    record(if failed { "rpc_failed" } else { "rpc_finished" });
+                    match Status::from_header_map(response.headers()) {
+                        Some(status) if status.code() != tonic::Code::Ok => {
+                            record_failure(rpc_failure("response_headers", &status));
+                        }
+                        _ => record("rpc_finished"),
+                    }
                 }
                 Ok(response.map(|inner| {
                     Body::new(RpcBody {
@@ -209,10 +239,13 @@ impl Service<http::Request<Body>> for TbankLimitedChannel {
                     })
                 }))
             })
-            .await
-            .unwrap_or_else(|_| Err(Status::deadline_exceeded("RPC deadline expired")));
-            if result.is_err() {
-                record("rpc_failed");
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => Err(Status::deadline_exceeded("RPC deadline expired")),
+            };
+            if let Err(status) = &result {
+                record_failure(failure.unwrap_or_else(|| rpc_failure(failure_phase, status)));
             }
             result
         })
@@ -309,25 +342,22 @@ impl http_body::Body for RpcBody {
             .is_some_and(|timer| timer.as_mut().poll(cx).is_ready())
         {
             self.finished = true;
-            super::limiter::diagnostic_with_context(
+            let status = Status::deadline_exceeded("RPC body exceeded the consumer deadline");
+            diagnostic_failure_with_context(
                 self.id,
                 &self.method,
-                "rpc_failed",
                 self.client_order_id.as_deref(),
-                None,
+                rpc_failure("response_body", &status),
             );
-            return Poll::Ready(Some(Err(Status::deadline_exceeded(
-                "RPC body exceeded the consumer deadline",
-            ))));
+            return Poll::Ready(Some(Err(status)));
         }
         let frame = Pin::new(&mut self.inner).poll_frame(cx);
         let terminal = match &frame {
             Poll::Ready(None) => Some(false),
             Poll::Ready(Some(Err(_))) => Some(true),
             Poll::Ready(Some(Ok(frame))) => frame.trailers_ref().map(|trailers| {
-                trailers
-                    .get("grpc-status")
-                    .is_none_or(|status| status.as_bytes() != b"0")
+                Status::from_header_map(trailers)
+                    .is_none_or(|status| status.code() != tonic::Code::Ok)
             }),
             Poll::Pending => None,
         };
@@ -335,13 +365,32 @@ impl http_body::Body for RpcBody {
             && !self.finished
         {
             self.finished = true;
-            super::limiter::diagnostic_with_context(
-                self.id,
-                &self.method,
-                if failed { "rpc_failed" } else { "rpc_finished" },
-                self.client_order_id.as_deref(),
-                None,
-            );
+            if failed {
+                let status = match &frame {
+                    Poll::Ready(Some(Err(status))) => Some(status.clone()),
+                    Poll::Ready(Some(Ok(frame))) => {
+                        frame.trailers_ref().and_then(Status::from_header_map)
+                    }
+                    _ => None,
+                }
+                .unwrap_or_else(|| {
+                    Status::unknown("gRPC response trailers are missing grpc-status")
+                });
+                diagnostic_failure_with_context(
+                    self.id,
+                    &self.method,
+                    self.client_order_id.as_deref(),
+                    rpc_failure("response_body", &status),
+                );
+            } else {
+                super::limiter::diagnostic_with_context(
+                    self.id,
+                    &self.method,
+                    "rpc_finished",
+                    self.client_order_id.as_deref(),
+                    None,
+                );
+            }
         }
         frame
     }
@@ -386,19 +435,29 @@ mod tests {
             self.sent = true;
             let mut headers = http::HeaderMap::new();
             headers.insert("grpc-status", http::HeaderValue::from_static(self.status));
+            headers.insert(
+                "grpc-message",
+                http::HeaderValue::from_static("permission%20denied"),
+            );
             Poll::Ready(Some(Ok(http_body::Frame::trailers(headers))))
         }
     }
     #[tokio::test]
     async fn grpc_trailers_finish_diagnostics_before_tonic_drops_the_body() {
+        let mut diagnostics = super::super::limiter::subscribe_tbank_rpc_diagnostics();
         for status in ["0", "7"] {
+            let rpc_id = if status == "7" {
+                u64::MAX - 1
+            } else {
+                u64::MAX - 2
+            };
             let mut body = RpcBody {
                 inner: Body::new(Trailers {
                     status,
                     sent: false,
                 }),
                 _permits: vec![],
-                id: u64::MAX,
+                id: rpc_id,
                 method: "diagnostic-test".into(),
                 client_order_id: None,
                 finished: false,
@@ -413,6 +472,27 @@ mod tests {
                 body.finished,
                 "completed RPC must not be recorded as abandoned"
             );
+            if status == "7" {
+                let event = loop {
+                    match diagnostics.try_recv() {
+                        Ok(event) if event.rpc_id == rpc_id => break event,
+                        Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                            panic!("failed RPC diagnostic was not emitted")
+                        }
+                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                            panic!("RPC diagnostic channel closed")
+                        }
+                    }
+                };
+                assert_eq!(event.stage, "rpc_failed");
+                let failure = event
+                    .failure
+                    .expect("failed RPC should include status details");
+                assert_eq!(failure.phase, "response_body");
+                assert_eq!(failure.code, "PermissionDenied");
+                assert_eq!(failure.message, "permission denied");
+            }
         }
     }
     struct PendingBody;
