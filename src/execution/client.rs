@@ -189,6 +189,7 @@ type TbankPendingCancelWaiters = Arc<Mutex<HashMap<String, Vec<TbankPendingCance
 
 #[derive(Clone)]
 struct TbankExecutionRuntime {
+    session: Option<crate::grpc::TbankSession>,
     client_id: ClientId,
     account_id: AccountId,
     pub config: TbankExecutionClientConfig,
@@ -648,6 +649,28 @@ impl TbankExecutionClient {
             task_owner: TbankExecutionTaskOwner::new(),
             instrument_subscriptions: Vec::new(),
         }
+    }
+
+    /// Uses an application-owned session without taking ownership of other clients' lifecycles.
+    pub fn with_session(mut self, session: crate::grpc::TbankSession) -> Result<Self> {
+        self.bind_session(session)?;
+        Ok(self)
+    }
+
+    /// Binds the runtime transport before connecting, without recreating the client.
+    pub fn bind_session(&mut self, session: crate::grpc::TbankSession) -> Result<()> {
+        if self.runtime.clients.is_some() || self.core.is_connected() {
+            return Err(TbankAdapterError::ConfigError(
+                "bind the session before connecting the client".into(),
+            ));
+        }
+        session.validate_settings(
+            self.runtime.config.environment,
+            &self.runtime.config.endpoint_uri()?,
+        )?;
+        self.runtime.credential_source.bind_session(&session)?;
+        self.runtime.session = Some(session);
+        Ok(())
     }
 
     /// Subscribes the execution client to every public venue handled by the broker.
@@ -1439,6 +1462,7 @@ impl TbankExecutionRuntime {
     ) -> Self {
         let credential_source = TbankCredentialSource::take_from_config(&mut config.token);
         Self {
+            session: None,
             client_id,
             account_id,
             config,
@@ -1781,7 +1805,10 @@ impl TbankExecutionRuntime {
         let endpoint = self.config.endpoint_uri()?;
         let credentials = self.credential_source.resolve(self.config.environment)?;
         self.config.validate_settings()?;
-        let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
+        let channel = match &self.session {
+            Some(channel) => channel.channel(),
+            None => connect_channel(&endpoint, self.config.request_timeout).await?,
+        };
         let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
         self.clients = Some(TbankGrpcClients::new_with_quota_scope(
             channel,
@@ -1840,7 +1867,10 @@ impl TbankExecutionRuntime {
         let endpoint = self.config.endpoint_uri()?;
         let credentials = self.credential_source.resolve(self.config.environment)?;
         self.config.validate_settings()?;
-        let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
+        let channel = match &self.session {
+            Some(channel) => channel.channel(),
+            None => connect_channel(&endpoint, self.config.request_timeout).await?,
+        };
         let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
         self.clients = Some(TbankGrpcClients::new_with_quota_scope(
             channel,
@@ -4507,6 +4537,7 @@ impl TbankExecutionRuntime {
 
     fn detached_query_clone(&self) -> Self {
         Self {
+            session: self.session.clone(),
             client_id: self.client_id,
             account_id: self.account_id,
             config: self.config.clone(),

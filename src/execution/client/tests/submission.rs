@@ -2910,3 +2910,22 @@ fn stop_order_matches_submit_requires_exact_identity_and_prices() {
         &wrong_direction
     ));
 }
+
+#[tokio::test]
+async fn prevalidated_orders_delegate_dynamic_permissions_to_broker() {
+    for broker_validates in [false, true] {
+        let mut client = test_client(TbankExecutionClientConfig {
+            account_id: Some("account-1".to_owned()), enable_trading: true,
+            broker_validates_trading_permissions: broker_validates,
+            ..Default::default()
+        });
+        let mut metadata = sber_metadata();
+        metadata.api_trade_available = false;
+        metadata.buy_available = false;
+        metadata.required_tests = vec!["test".to_owned()];
+        client.runtime.instruments.lock().unwrap().insert(metadata.instrument_id.clone(), metadata);
+        let cmd = submit_order_cmd_for("SBER_TQBR.MOEX", OrderType::Limit, None);
+        let result = super::submit::prepare_nautilus_order(&mut client.runtime, cmd).await;
+        assert_eq!(result.is_ok(), broker_validates, "{:#?}", result.err());
+    }
+}

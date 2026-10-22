@@ -36,6 +36,7 @@ const FUTURES_MARGIN_MAX_RETRIES: u32 = 2;
 /// Loads selected T-Bank definitions into NautilusTrader's canonical instrument store.
 #[derive(Debug)]
 pub struct TbankInstrumentProvider {
+    session: Option<crate::grpc::TbankSession>,
     config: TbankDataClientConfig,
     credential_source: TbankCredentialSource,
     store: InstrumentStore,
@@ -65,6 +66,7 @@ impl TbankInstrumentProvider {
         credential_source: TbankCredentialSource,
     ) -> Self {
         Self {
+            session: None,
             config,
             credential_source,
             store: InstrumentStore::new(),
@@ -72,6 +74,17 @@ impl TbankInstrumentProvider {
             market_data_metadata: HashMap::new(),
             unresolved_futures: HashSet::new(),
         }
+    }
+
+    /// Uses the broker session selected by the embedding application.
+    pub fn with_session(
+        mut self,
+        session: crate::grpc::TbankSession,
+    ) -> crate::common::Result<Self> {
+        session.validate_settings(self.config.environment, &self.config.endpoint_uri()?)?;
+        self.credential_source.bind_session(&session)?;
+        self.session = Some(session);
+        Ok(self)
     }
 
     /// Returns the instrument mapper maintained by the provider.
@@ -120,7 +133,10 @@ impl TbankInstrumentProvider {
         let endpoint = self.config.endpoint_uri()?;
         let credentials = self.credential_source.resolve(self.config.environment)?;
         self.config.validate_settings()?;
-        let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
+        let channel = match &self.session {
+            Some(channel) => channel.channel(),
+            None => connect_channel(&endpoint, self.config.request_timeout).await?,
+        };
         let interceptor = TbankAuthInterceptor::new(credentials)?;
         Ok(TbankGrpcClients::new_with_quota_scope(
             channel,

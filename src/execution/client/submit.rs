@@ -189,33 +189,35 @@ async fn prepare_nautilus_order_with_deadline(
     let metadata = client
         .load_instrument_metadata(&order.instrument_id)
         .await?;
-    if !metadata.api_trade_available {
-        anyhow::bail!(
-            "T-Bank API trading is unavailable for {}",
-            metadata.instrument_id
-        );
-    }
-    if !metadata.required_tests.is_empty() {
-        anyhow::bail!(
-            "T-Bank instrument tests are required for {}: {}",
-            metadata.instrument_id,
-            metadata.required_tests.join(", ")
-        );
-    }
-    match order.side {
-        crate::common::TbankOrderSide::Buy if !metadata.buy_available => {
+    if !client.config.broker_validates_trading_permissions {
+        if !metadata.api_trade_available {
             anyhow::bail!(
-                "T-Bank buying is unavailable for {}",
+                "T-Bank API trading is unavailable for {}",
                 metadata.instrument_id
             );
         }
-        crate::common::TbankOrderSide::Sell if !metadata.sell_available => {
+        if !metadata.required_tests.is_empty() {
             anyhow::bail!(
-                "T-Bank selling is unavailable for {}",
-                metadata.instrument_id
+                "T-Bank instrument tests are required for {}: {}",
+                metadata.instrument_id,
+                metadata.required_tests.join(", ")
             );
         }
-        _ => {}
+        match order.side {
+            crate::common::TbankOrderSide::Buy if !metadata.buy_available => {
+                anyhow::bail!(
+                    "T-Bank buying is unavailable for {}",
+                    metadata.instrument_id
+                );
+            }
+            crate::common::TbankOrderSide::Sell if !metadata.sell_available => {
+                anyhow::bail!(
+                    "T-Bank selling is unavailable for {}",
+                    metadata.instrument_id
+                );
+            }
+            _ => {}
+        }
     }
     match order.service(client.config.environment) {
         TbankExecutionService::LiveOrders => {

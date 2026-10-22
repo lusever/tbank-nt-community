@@ -9,15 +9,24 @@ use nautilus_common::{
 
 use crate::{common::consts::TBANK, config::TbankDataClientConfig, market_data::TbankDataClient};
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 /// Factory for creating T-Bank market-data clients.
-pub struct TbankDataClientFactory;
+pub struct TbankDataClientFactory {
+    session: Option<crate::grpc::TbankSession>,
+}
 
 impl TbankDataClientFactory {
     /// Creates a new instance.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { session: None }
+    }
+
+    /// Shares an application-owned broker session with every client created by this factory.
+    #[must_use]
+    pub fn with_session(mut self, session: crate::grpc::TbankSession) -> Self {
+        self.session = Some(session);
+        self
     }
 }
 
@@ -38,12 +47,19 @@ impl NautilusDataClientFactory for TbankDataClientFactory {
                     "invalid config type for TbankDataClientFactory: expected TbankDataClientConfig"
                 )
             })?;
-        config.validate()?;
-        Ok(Box::new(
-            TbankDataClient::new(config)
-                .with_client_id(name.into())
-                .with_cache(cache),
-        ))
+        if self.session.is_some() {
+            config.endpoint_uri()?;
+            config.validate_settings()?;
+        } else {
+            config.validate()?;
+        }
+        let mut client = TbankDataClient::new(config)
+            .with_client_id(name.into())
+            .with_cache(cache);
+        if let Some(session) = &self.session {
+            client = client.with_session(session.clone())?;
+        }
+        Ok(Box::new(client))
     }
 
     fn name(&self) -> &str {

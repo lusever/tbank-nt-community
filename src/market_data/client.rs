@@ -1006,6 +1006,7 @@ fn commit_refreshed_instrument_catalogue(
 }
 
 struct InstrumentCatalogueRefreshContext<'a> {
+    session: Option<&'a crate::grpc::TbankSession>,
     config: &'a TbankDataClientConfig,
     configured_stream_ids: &'a HashMap<String, String>,
     credentials: Arc<SecretString>,
@@ -1020,6 +1021,7 @@ async fn refresh_published_instrument_catalogue(
     context: InstrumentCatalogueRefreshContext<'_>,
 ) -> Result<bool> {
     let InstrumentCatalogueRefreshContext {
+        session,
         config,
         configured_stream_ids,
         credentials,
@@ -1030,7 +1032,8 @@ async fn refresh_published_instrument_catalogue(
         generation,
     } = context;
     let catalogue =
-        load_resolved_instrument_catalogue(config, configured_stream_ids, credentials).await?;
+        load_resolved_instrument_catalogue(config, configured_stream_ids, credentials, session)
+            .await?;
 
     // Successful refreshes merge so a transient miss cannot remove an active route.
     commit_refreshed_instrument_catalogue(
@@ -1043,16 +1046,53 @@ async fn refresh_published_instrument_catalogue(
     )
 }
 
+fn catalogue_from_instruments(
+    instruments: &[InstrumentAny],
+    configured_stream_ids: &HashMap<String, String>,
+) -> Result<ResolvedInstrumentCatalogue> {
+    let mut stream_ids = configured_stream_ids.clone();
+    let mut metadata = HashMap::new();
+    for definition in instruments {
+        let instrument = TbankInstrumentMetadata::from_instrument(definition)
+            .filter(|metadata| metadata.is_supported())
+            .ok_or_else(|| {
+                TbankAdapterError::ConfigError("instrument lacks supported T-Bank metadata".into())
+            })?;
+        stream_ids.insert(
+            instrument.instrument_id.clone(),
+            instrument.instrument_uid.clone(),
+        );
+        let resolved = MarketDataInstrumentMetadata {
+            lot_size: instrument.lot,
+            price_precision: u8::try_from(instrument.price_precision).map_err(|_| {
+                TbankAdapterError::ConfigError("invalid initialized price precision".into())
+            })?,
+            preserve_instrument_id: false,
+        };
+        metadata.insert(instrument.instrument_id, resolved);
+        metadata.insert(instrument.instrument_uid, resolved);
+    }
+    Ok(ResolvedInstrumentCatalogue {
+        definitions: instruments.to_vec(),
+        stream_ids,
+        metadata,
+    })
+}
+
 async fn load_resolved_instrument_catalogue(
     config: &TbankDataClientConfig,
     configured_stream_ids: &HashMap<String, String>,
     credentials: Arc<SecretString>,
+    session: Option<&crate::grpc::TbankSession>,
 ) -> Result<ResolvedInstrumentCatalogue> {
     // Keep provider selection tied to the immutable user configuration. Runtime stream routing
     // may contain auto-discovered shares after connect, but must never widen futures enrichment.
     let mut provider_config = config.clone();
     provider_config.instrument_stream_ids = configured_stream_ids.clone();
     let mut provider = TbankInstrumentProvider::new_with_credentials(provider_config, credentials);
+    if let Some(session) = session {
+        provider = provider.with_session(session.clone())?;
+    }
     provider
         .load_all_current(None)
         .await
@@ -1108,6 +1148,8 @@ fn resolve_instrument_metadata<'a>(
 
 /// Nautilus market-data client backed by T-Bank gRPC streams.
 pub struct TbankDataClient {
+    session: Option<crate::grpc::TbankSession>,
+    initialized_instruments: Option<Vec<InstrumentAny>>,
     client_id: ClientId,
     config: TbankDataClientConfig,
     credential_source: TbankCredentialSource,
@@ -1163,6 +1205,37 @@ pub struct TbankDataClient {
 }
 
 impl TbankDataClient {
+    /// Uses a session whose lifetime is managed by the embedding application.
+    pub fn with_session(mut self, session: crate::grpc::TbankSession) -> Result<Self> {
+        self.bind_session(session)?;
+        Ok(self)
+    }
+
+    /// Binds the runtime transport before connecting, without recreating the client.
+    pub fn bind_session(&mut self, session: crate::grpc::TbankSession) -> Result<()> {
+        if self.connection.is_some() {
+            return Err(TbankAdapterError::ConfigError(
+                "bind the session before connecting the client".into(),
+            ));
+        }
+        session.validate_settings(self.config.environment, &self.config.endpoint_uri()?)?;
+        self.credential_source.bind_session(&session)?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    /// Initializes canonical instrument definitions before connecting, without broker discovery.
+    pub fn initialize_instruments(&mut self, instruments: Vec<InstrumentAny>) -> Result<()> {
+        if self.connection.is_some() {
+            return Err(TbankAdapterError::ConfigError(
+                "initialize instruments before connecting".into(),
+            ));
+        }
+        catalogue_from_instruments(&instruments, &self.config.instrument_stream_ids)?;
+        self.initialized_instruments = Some(instruments);
+        Ok(())
+    }
+
     /// Creates a new instance.
     pub fn new(mut config: TbankDataClientConfig) -> Self {
         register_tbank_market_data_custom_data();
@@ -1173,6 +1246,8 @@ impl TbankDataClient {
         let historical_request_limiter =
             HistoricalRequestLimiter::new(config.historical_candle_request_delay);
         Self {
+            session: None,
+            initialized_instruments: None,
             client_id: *TBANK_CLIENT_ID,
             config,
             credential_source,
@@ -1497,13 +1572,21 @@ impl TbankDataClient {
         self.prepare_session_generation()
             .await
             .map_err(|error| TbankAdapterError::ConfigError(error.to_string()))?;
-        let catalogue = load_resolved_instrument_catalogue(
-            &self.config,
-            &self.config.instrument_stream_ids,
-            Arc::clone(&credentials),
-        )
-        .await?;
-        let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
+        let catalogue = if let Some(instruments) = &self.initialized_instruments {
+            catalogue_from_instruments(instruments, &self.config.instrument_stream_ids)?
+        } else {
+            load_resolved_instrument_catalogue(
+                &self.config,
+                &self.config.instrument_stream_ids,
+                Arc::clone(&credentials),
+                self.session.as_ref(),
+            )
+            .await?
+        };
+        let channel = match &self.session {
+            Some(channel) => channel.channel(),
+            None => connect_channel(&endpoint, self.config.request_timeout).await?,
+        };
         let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
 
         let catalogue_generation = self.session_publication.advance();
@@ -1619,7 +1702,10 @@ impl TbankDataClient {
         let endpoint = self.config.endpoint_uri()?;
         let credentials = self.credential_source.resolve(self.config.environment)?;
         self.config.validate_settings()?;
-        let channel = connect_channel(&endpoint, self.config.request_timeout).await?;
+        let channel = match &self.session {
+            Some(channel) => channel.channel(),
+            None => connect_channel(&endpoint, self.config.request_timeout).await?,
+        };
         let interceptor = TbankAuthInterceptor::new(Arc::clone(&credentials))?;
         self.connection = Some(TbankDataConnection::HistoricalDownload(
             TbankGrpcClients::new_with_quota_scope(
@@ -1750,10 +1836,11 @@ impl TbankDataClient {
             task.cancel();
         }
         let refresh_interval = self.config.instrument_refresh_interval;
-        if refresh_interval.is_zero() {
+        if refresh_interval.is_zero() || self.initialized_instruments.is_some() {
             return Ok(());
         }
         let config = self.config.clone();
+        let session = self.session.clone();
         let credentials = self
             .active_credentials
             .as_ref()
@@ -1775,6 +1862,7 @@ impl TbankDataClient {
                 interval.tick().await;
                 if let Err(error) =
                     refresh_published_instrument_catalogue(InstrumentCatalogueRefreshContext {
+                        session: session.as_ref(),
                         config: &config,
                         configured_stream_ids: &configured_stream_ids,
                         credentials: Arc::clone(&credentials),
@@ -2274,6 +2362,7 @@ impl TbankDataClient {
         self.stream_health.bind_event_sender(sender.clone());
         let timestamp_mode = self.config.candle_timestamp_mode;
         let config = self.config.clone();
+        let session = self.session.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
         let batch_size = self.config.max_candle_instruments_per_stream.max(1);
@@ -2413,6 +2502,7 @@ impl TbankDataClient {
             );
             for (task_key, request, kind) in groups {
                 let future = run_market_data_stream(MarketDataStreamContext {
+                    session: session.clone(),
                     market_data_stream: market_data_stream.clone(),
                     market_data_client: stream_market_data_client.clone(),
                     sender: stream_sender.clone(),
@@ -2534,6 +2624,7 @@ impl TbankDataClient {
         let sender = get_data_event_sender();
         self.stream_health.bind_event_sender(sender.clone());
         let config = self.config.clone();
+        let session = self.session.clone();
         let credentials = self
             .active_credentials
             .as_ref()
@@ -2566,6 +2657,7 @@ impl TbankDataClient {
                 ..MarketDataServerSideStreamRequest::default()
             };
             let future = run_market_data_stream(MarketDataStreamContext {
+                session: session.clone(),
                 market_data_stream: market_data_stream.clone(),
                 market_data_client: market_data_client.clone(),
                 sender: sender.clone(),
@@ -2727,12 +2819,14 @@ impl TbankDataClient {
         let sender = get_data_event_sender();
         self.stream_health.bind_event_sender(sender.clone());
         let config = self.config.clone();
+        let session = self.session.clone();
         let instrument_metadata = self.instrument_metadata.clone();
         let historical_request_limiter = self.historical_request_limiter.clone();
         let message_sequence = self.message_sequence.clone();
         let cancellation = TaskCancellation::new();
         let (start_sender, start_receiver) = oneshot::channel();
         let context = MarketDataStreamContext {
+            session,
             market_data_stream,
             market_data_client,
             sender,
@@ -3086,6 +3180,7 @@ async fn run_periodic_candle_poll(
 
 #[derive(Clone)]
 struct MarketDataStreamContext {
+    session: Option<crate::grpc::TbankSession>,
     market_data_stream: MarketDataStreamClient,
     market_data_client: MarketDataClient,
     sender: EventSender<DataEvent>,
@@ -3228,6 +3323,7 @@ fn run_market_data_stream_worker(
 ) -> Pin<Box<dyn Future<Output = std::result::Result<(), StreamWorkerExit>> + Send>> {
     Box::pin(async move {
         let MarketDataStreamContext {
+            session,
             mut market_data_stream,
             mut market_data_client,
             sender,
@@ -3264,7 +3360,9 @@ fn run_market_data_stream_worker(
             {
                 return Err(StreamWorkerExit::RetryBudgetExhausted);
             }
-            match reconnect_market_data_clients(&config, Arc::clone(&credentials)).await {
+            match reconnect_market_data_clients(&config, Arc::clone(&credentials), session.as_ref())
+                .await
+            {
                 Ok((next_stream, next_data)) => {
                     market_data_stream = next_stream;
                     market_data_client = next_data;
@@ -3474,6 +3572,7 @@ fn run_market_data_stream_worker(
                                                     );
                                                     let future = run_market_data_stream(
                                                         MarketDataStreamContext {
+                                                            session: session.clone(),
                                                             market_data_stream: market_data_stream
                                                                 .clone(),
                                                             market_data_client: market_data_client
@@ -3782,6 +3881,7 @@ fn run_market_data_stream_worker(
                                 match reconnect_market_data_clients(
                                     &config,
                                     Arc::clone(&credentials),
+                                    session.as_ref(),
                                 )
                                 .await
                                 {
@@ -3823,6 +3923,7 @@ fn run_market_data_stream_worker(
                                 let trigger = match reconnect_market_data_clients(
                                     &config,
                                     Arc::clone(&credentials),
+                                    session.as_ref(),
                                 )
                                 .await
                                 {
@@ -3868,7 +3969,13 @@ fn run_market_data_stream_worker(
                     if let Some(exit) = permanent_stream_status(&error) {
                         return Err(exit);
                     }
-                    match reconnect_market_data_clients(&config, Arc::clone(&credentials)).await {
+                    match reconnect_market_data_clients(
+                        &config,
+                        Arc::clone(&credentials),
+                        session.as_ref(),
+                    )
+                    .await
+                    {
                         Ok((next_stream, next_data)) => {
                             market_data_stream = next_stream;
                             market_data_client = next_data;
@@ -3934,8 +4041,12 @@ fn run_market_data_stream_worker(
                     config.max_market_data_reconnect_attempts,
                 ))
                 .await;
-                if let Ok((next_stream, next_data)) =
-                    reconnect_market_data_clients(&config, Arc::clone(&credentials)).await
+                if let Ok((next_stream, next_data)) = reconnect_market_data_clients(
+                    &config,
+                    Arc::clone(&credentials),
+                    session.as_ref(),
+                )
+                .await
                 {
                     market_data_stream = next_stream;
                     market_data_client = next_data;
@@ -4962,9 +5073,13 @@ fn filter_market_data_response_for_continuity(
 async fn reconnect_market_data_clients(
     config: &TbankDataClientConfig,
     credentials: Arc<SecretString>,
+    session: Option<&crate::grpc::TbankSession>,
 ) -> Result<(MarketDataStreamClient, MarketDataClient)> {
     let endpoint = config.endpoint_uri()?;
-    let channel = connect_channel(&endpoint, config.request_timeout).await?;
+    let channel = match session {
+        Some(channel) => channel.channel(),
+        None => connect_channel(&endpoint, config.request_timeout).await?,
+    };
     let interceptor = TbankAuthInterceptor::new(credentials)?;
     let clients =
         TbankGrpcClients::new_with_quota_scope(channel, interceptor, config.quota_scope.clone());
@@ -5613,6 +5728,41 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn preloaded_definitions_do_not_query_instrument_catalogue() {
+        let metadata = crate::instruments::TbankInstrumentMetadata::from_share(
+            &crate::grpc::generated::Share {
+                ticker: "SBER".into(),
+                class_code: "TQBR".into(),
+                uid: "sber-uid".into(),
+                lot: 10,
+                currency: "rub".into(),
+                real_exchange: crate::grpc::generated::RealExchange::Moex as i32,
+                min_price_increment: Some(Quotation {
+                    units: 0,
+                    nano: 10_000_000,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = TbankDataClientConfig {
+            endpoint: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        let mut client = TbankDataClient::new(config);
+        let instrument = crate::instruments::build_equity_instrument(&metadata).unwrap();
+        client.initialize_instruments(vec![instrument]).unwrap();
+        let catalogue = catalogue_from_instruments(
+            client.initialized_instruments.as_ref().unwrap(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(catalogue.definitions.len(), 1);
+        assert_eq!(catalogue.stream_ids[&metadata.instrument_id], "sber-uid");
+        assert_eq!(catalogue.metadata["sber-uid"].lot_size, 10);
+    }
 
     include!("client/tests/dual_books.rs");
 

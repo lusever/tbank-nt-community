@@ -38,3 +38,5 @@ impl Default for TbankReconnectPolicy {
         }
     }
 }
+
+pub(crate) use data::validate_endpoint;

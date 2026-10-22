@@ -30,6 +30,20 @@ impl TbankCredentialSource {
         Ok(credential)
     }
 
+    pub(crate) fn bind_session(&mut self, session: &crate::grpc::TbankSession) -> Result<()> {
+        if self
+            .configured
+            .as_ref()
+            .is_some_and(|token| !session.uses_credentials(token))
+        {
+            return Err(TbankAdapterError::ConfigError(
+                "session credentials differ from configured credentials".into(),
+            ));
+        }
+        self.configured = Some(session.credentials());
+        Ok(())
+    }
+
     pub(crate) fn from_resolved(credential: Arc<SecretString>) -> Self {
         Self {
             configured: Some(credential),

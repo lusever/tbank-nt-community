@@ -5,6 +5,8 @@
 
 #![warn(missing_docs)]
 
+/// Venue operations for account tools, inspection and observations.
+pub mod broker;
 /// Shared constants, conversions, identifiers, and errors.
 pub mod common;
 /// Adapter configuration types.

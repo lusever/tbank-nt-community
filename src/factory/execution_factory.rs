@@ -17,14 +17,23 @@ use crate::{
 };
 
 /// Factory for creating T-Bank execution clients.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TbankExecutionClientFactory;
+#[derive(Debug, Clone, Default)]
+pub struct TbankExecutionClientFactory {
+    session: Option<crate::grpc::TbankSession>,
+}
 
 impl TbankExecutionClientFactory {
     /// Creates a new instance.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { session: None }
+    }
+
+    /// Shares an application-owned broker session with every client created by this factory.
+    #[must_use]
+    pub fn with_session(mut self, session: crate::grpc::TbankSession) -> Self {
+        self.session = Some(session);
+        self
     }
 }
 
@@ -46,7 +55,12 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
                     "invalid config type for TbankExecutionClientFactory: expected TbankExecutionClientConfig"
                 )
             })?;
-        config.validate()?;
+        if self.session.is_some() {
+            config.endpoint_uri()?;
+            config.validate_settings()?;
+        } else {
+            config.validate()?;
+        }
         let account_id = tbank_account_id(&config.resolve_account_id()?);
         let core = ExecutionClientCore::new(
             trader_id,
@@ -59,6 +73,9 @@ impl NautilusExecutionClientFactory for TbankExecutionClientFactory {
             cache.clone(),
         );
         let mut client = TbankExecutionClient::new(core, config);
+        if let Some(session) = &self.session {
+            client = client.with_session(session.clone())?;
+        }
         for venue in TbankVenue::all() {
             for instrument in cache.borrow().instruments(&venue.venue(), None) {
                 client.on_instrument(instrument.clone());
@@ -125,7 +142,7 @@ mod tests {
 
         assert_eq!(client.client_id(), ClientId::from("TBANK-CUSTOM"));
         assert_eq!(
-            TbankExecutionClientFactory.config_type(),
+            TbankExecutionClientFactory::new().config_type(),
             "TbankExecutionClientConfig"
         );
     }

@@ -29,6 +29,9 @@ pub struct TbankExecutionClientConfig {
     pub account_id: Option<String>,
     /// Optional gRPC endpoint override.
     pub endpoint: Option<String>,
+    #[builder(default = false)]
+    /// Delegate dynamic API/side/test permission checks to the broker for prevalidated orders.
+    pub broker_validates_trading_permissions: bool,
     #[serde(skip)]
     /// Optional explicit quota scope shared by clients/tokens belonging to one broker limit domain.
     /// When absent, clients with identical credentials share authoritative GetUserTariff limits.

@@ -19,6 +19,9 @@ pub mod request;
 pub mod retry;
 
 pub use channel::{connect_channel, tbank_tls_config};
+/// Application-owned authenticated broker session.
+pub mod session;
 pub use clients::TbankGrpcClients;
 pub use metadata::TbankAuthInterceptor;
 pub use request::with_timeout;
+pub use session::TbankSession;
