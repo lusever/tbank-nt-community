@@ -2118,6 +2118,39 @@ async fn reset_invalidates_stale_futures_margin_clone() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_futures_margin_refresh_publishes_instrument_to_runner() {
+    let server = start_futures_instruments_server().await;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    nautilus_common::live::runner::replace_data_event_sender(sender);
+    let mut client = live_query_client(server.endpoint.clone());
+    client
+        .runtime
+        .connect_for_queries(&mut client.task_owner)
+        .await
+        .unwrap();
+
+    let mut metadata = si_futures_metadata();
+    metadata.instrument_type = crate::common::venue::TbankInstrumentType::Futures;
+    metadata.initial_margin_rate_on_buy = Some(Decimal::ONE);
+    metadata.initial_margin_rate_on_sell = Some(Decimal::ONE);
+    let mut worker = client.runtime.detached_query_clone();
+    let refresh = tokio::spawn(async move {
+        assert!(nautilus_common::live::runner::try_get_data_event_sender().is_none());
+        worker.refresh_futures_margin(metadata).await
+    });
+    server.margin_started.notified().await;
+    server.margin_release.notify_one();
+    let metadata = refresh.await.unwrap().unwrap();
+
+    let event = receiver.try_recv().expect("worker must publish updated instrument");
+    let nautilus_common::messages::DataEvent::Instrument(instrument) = event else {
+        panic!("expected instrument update, got {event:?}");
+    };
+    assert_eq!(instrument.id().to_string(), metadata.instrument_id);
+    assert_eq!(server.margin_calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn concurrent_futures_margin_refreshes_share_one_request() {
     let server = start_futures_instruments_server().await;

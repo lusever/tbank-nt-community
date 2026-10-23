@@ -3724,6 +3724,16 @@ impl TbankExecutionRuntime {
             .await
     }
 
+    /// Queries the order owning an OperationsService operation ID.
+    ///
+    /// T-Bank documents the operation ID as a direct `GetOrderState.order_id` lookup key. It is
+    /// neither an exchange order ID nor the client's idempotency key, so keep the ID type
+    /// unspecified instead of routing it through either namespace.
+    pub async fn query_order_by_operation_id(&mut self, operation_id: &str) -> Result<OrderState> {
+        self.query_order_with_id_type(operation_id, OrderIdType::Unspecified)
+            .await
+    }
+
     /// Queries all open regular orders for the configured account.
     pub async fn query_open_orders(&mut self) -> Result<GetOrdersResponse> {
         self.query_orders(false).await
@@ -5201,7 +5211,7 @@ impl TbankExecutionRuntime {
                     metadata.instrument_id
                 ))
             })?;
-        if let Some(sender) = try_get_data_event_sender() {
+        if let Some(sender) = self.current_data_event_sender() {
             sender
                 .send(DataEvent::Instrument(instrument))
                 .map_err(|error| {

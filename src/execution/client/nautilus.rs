@@ -72,7 +72,10 @@ async fn recover_operation_order_identities(
         }
 
         if !order_id_by_operation_id.contains_key(item.id.as_str()) {
-            let canonical_order_id = match client.query_order(item.id.as_str()).await {
+            let canonical_order_id = match client
+                .query_order_by_operation_id(item.id.as_str())
+                .await
+            {
                 Ok(state) => {
                     if state.order_id.is_empty() {
                         return Err(anyhow::Error::new(TbankFillIdentityUnresolved::new(
@@ -1399,6 +1402,26 @@ impl ExecutionClient for TbankExecutionClient {
         client
             .query_order_status_report_by_ids(cmd.client_order_id, cmd.venue_order_id, cmd.ts_init)
             .await
+    }
+
+    fn generate_order_status_report_task(
+        &self,
+        cmd: &nautilus_common::messages::execution::GenerateOrderStatusReport,
+    ) -> Option<nautilus_common::clients::ExecutionReportTask<Option<OrderStatusReport>>> {
+        let report_request = self.runtime.begin_report_request().ok()?;
+        let mut client = self.runtime.clone();
+        let client_order_id = cmd.client_order_id;
+        let venue_order_id = cmd.venue_order_id;
+        let ts_init = cmd.ts_init;
+        Some(nautilus_common::clients::ExecutionReportTask::new(
+            async move {
+                let _report_request = report_request;
+                client
+                    .query_order_status_report_by_ids(client_order_id, venue_order_id, ts_init)
+                    .await
+            },
+            Ok,
+        ))
     }
 
     async fn generate_order_status_reports(

@@ -5569,6 +5569,96 @@ async fn fill_report_identity_recovers_from_operation_id_when_order_history_omit
 }
 
 #[tokio::test]
+async fn fill_report_identity_queries_operation_uuid_without_order_id_namespace() {
+    let operations_service = MockOperationsService::default();
+    operations_service
+        .pages
+        .lock()
+        .unwrap()
+        .push_back(GetOperationsByCursorResponse {
+            items: vec![OperationItem {
+                id: "operation-request-uuid".to_string(),
+                r#type: TbankOperationType::Buy as i32,
+                state: OperationState::Executed as i32,
+                instrument_uid: "sber-uid".to_string(),
+                figi: "BBG004730N88".to_string(),
+                ticker: "SBER".to_string(),
+                class_code: "TQBR".to_string(),
+                trades_info: Some(OperationItemTrades {
+                    trades: vec![OperationItemTrade {
+                        num: "sandbox-operation-trade".to_string(),
+                        quantity: 1,
+                        price: Some(MoneyValue {
+                            currency: "rub".to_string(),
+                            units: 275,
+                            ..MoneyValue::default()
+                        }),
+                        ..OperationItemTrade::default()
+                    }],
+                }),
+                ..OperationItem::default()
+            }],
+            ..GetOperationsByCursorResponse::default()
+        });
+
+    let orders_service = MockOrdersService::default();
+    *orders_service.get_orders_response.lock().unwrap() = Some(GetOrdersResponse::default());
+    *orders_service.state_response.lock().unwrap() = Some(OrderState {
+        order_id: "sandbox-exchange-order".to_string(),
+        order_request_id: "operation-request-uuid".to_string(),
+        ..OrderState::default()
+    });
+    let state_calls = Arc::clone(&orders_service.state_calls);
+    let stop_orders_service = MockStopOrdersService::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(crate::grpc::generated::users_service_server::UsersServiceServer::new(crate::testing::QuotaUsersService))
+            .add_service(OrdersServiceServer::new(orders_service))
+            .add_service(StopOrdersServiceServer::new(stop_orders_service))
+            .add_service(OperationsServiceServer::new(operations_service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".into()),
+        account_id: Some("account-1".to_string()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    seed_sber_metadata(&mut client);
+    client.connect_for_queries().await.unwrap();
+    let (today, _) = super::current_utc_day_bounds();
+    let reports = <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::generate_fill_reports(
+        &client,
+        GenerateFillReports::new(
+            UUID4::new(),
+            current_unix_nanos(),
+            None,
+            None,
+            Some(UnixNanos::from(u64::try_from(today.seconds).unwrap() * 1_000_000_000)),
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].venue_order_id.to_string(), "sandbox-exchange-order");
+    assert_eq!(reports[0].trade_id.to_string(), "sandbox-operation-trade");
+    let calls = state_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].order_id, "operation-request-uuid");
+    assert_eq!(calls[0].order_id_type, Some(OrderIdType::Unspecified as i32));
+}
+
+#[tokio::test]
 async fn generate_mass_status_clamps_cross_day_lookback_to_current_day() {
     const NANOS_PER_DAY: u64 = 86_400 * 1_000_000_000;
 
