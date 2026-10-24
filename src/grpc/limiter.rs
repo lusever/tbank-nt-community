@@ -1,6 +1,7 @@
 //! Shared atomic RPC quotas and bounded, cancellation-safe admission.
 use std::{
     collections::{HashMap, VecDeque},
+    hash::{Hash, Hasher},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -505,13 +506,44 @@ fn diagnostic_with_failure(
 
 #[derive(Default)]
 pub(crate) struct Scope {
+    pub(crate) tariff: tokio::sync::OnceCell<Arc<super::generated::GetUserTariffResponse>>,
+    latest_tariff: Mutex<Option<Arc<super::generated::GetUserTariffResponse>>>,
     pub(crate) limiter: tokio::sync::OnceCell<Arc<TbankRateLimiter>>,
 }
-pub(crate) fn shared_scope(key: u64) -> Arc<Scope> {
+impl Scope {
+    /// Publishes a validated tariff snapshot for the session's synchronous cache accessor.
+    pub(crate) fn cache_tariff(&self, tariff: Arc<super::generated::GetUserTariffResponse>) {
+        *self.latest_tariff.lock().expect("tariff snapshot lock") = Some(tariff);
+    }
+
+    /// Returns the newest validated snapshot, falling back to the initial quota snapshot.
+    pub(crate) fn cached_tariff(&self) -> Option<Arc<super::generated::GetUserTariffResponse>> {
+        self.latest_tariff
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.clone())
+            .or_else(|| self.tariff.get().cloned())
+    }
+}
+
+fn scopes() -> &'static Mutex<HashMap<u64, Arc<Scope>>> {
     static SCOPES: OnceLock<Mutex<HashMap<u64, Arc<Scope>>>> = OnceLock::new();
+    SCOPES.get_or_init(Mutex::default)
+}
+
+pub(crate) fn scope_key(authorization: &[u8]) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    authorization.hash(&mut hash);
+    hash.finish()
+}
+
+pub(crate) fn cached_scope(key: u64) -> Option<Arc<Scope>> {
+    scopes().lock().ok()?.get(&key).cloned()
+}
+
+pub(crate) fn shared_scope(key: u64) -> Arc<Scope> {
     Arc::clone(
-        SCOPES
-            .get_or_init(Mutex::default)
+        scopes()
             .lock()
             .expect("quota scope lock")
             .entry(key)

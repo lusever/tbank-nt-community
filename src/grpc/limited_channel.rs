@@ -98,15 +98,12 @@ impl Service<http::Request<Body>> for TbankLimitedChannel {
             let mut failure = None::<TbankRpcFailure>;
             let mut failure_phase = "quota_admission";
             let result = tokio::time::timeout_at(deadline, async {
-                use std::hash::{Hash, Hasher};
                 let auth = request
                     .headers()
                     .get("authorization")
                     .cloned()
                     .ok_or_else(|| Status::unauthenticated("missing authorization"))?;
-                let mut hash = std::collections::hash_map::DefaultHasher::new();
-                auth.as_bytes().hash(&mut hash);
-                let scope = shared_scope(hash.finish());
+                let scope = shared_scope(super::limiter::scope_key(auth.as_bytes()));
                 let limiter = match explicit_scope {
                     Some(limiter) => limiter,
                     None => quota_scope(&scope, channel.clone(), auth.clone(), deadline).await?,
@@ -143,9 +140,13 @@ impl Service<http::Request<Body>> for TbankLimitedChannel {
                             .map_err(|e| Status::resource_exhausted(e.to_string()))?;
                         reservation.commit();
                         let tariff = fetch_tariff(channel.clone(), auth.clone(), deadline).await?;
-                        if super::limiter::TbankRateLimiter::stream_available(&tariff, &method)
-                            .map_err(|e| Status::failed_precondition(e.to_string()))?
-                        {
+                        let stream_available =
+                            super::limiter::TbankRateLimiter::stream_available(&tariff, &method)
+                                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                        super::limiter::TbankRateLimiter::from_tariff(&tariff)
+                            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                        scope.cache_tariff(Arc::new(tariff));
+                        if stream_available {
                             break admission;
                         }
                         drop(admission);
@@ -257,10 +258,21 @@ async fn quota_scope(
     auth: http::HeaderValue,
     deadline: tokio::time::Instant,
 ) -> Result<Arc<super::limiter::TbankRateLimiter>, Status> {
+    let tariff = scope
+        .tariff
+        .get_or_try_init(|| async move {
+            let tariff = fetch_tariff(channel, auth, deadline).await?;
+            super::limiter::TbankRateLimiter::from_tariff(&tariff)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            let tariff = Arc::new(tariff);
+            scope.cache_tariff(Arc::clone(&tariff));
+            Ok::<_, Status>(tariff)
+        })
+        .await?
+        .clone();
     scope
         .limiter
         .get_or_try_init(|| async move {
-            let tariff = fetch_tariff(channel, auth, deadline).await?;
             super::limiter::TbankRateLimiter::from_tariff(&tariff)
                 .map(|limiter| {
                     limiter.record_discovery();

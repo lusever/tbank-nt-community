@@ -43,6 +43,16 @@ impl TbankSession {
             TbankAuthInterceptor::new(self.credentials()).expect("validated session credentials"),
         )
     }
+
+    /// Returns the tariff snapshot already loaded by the quota-aware transport, if available.
+    /// This reads the process cache and never sends a broker request.
+    pub fn cached_user_tariff(&self) -> Option<Arc<super::generated::GetUserTariffResponse>> {
+        let authorization = super::metadata::authorization_metadata(&self.0.credentials).ok()?;
+        let scope =
+            super::limiter::cached_scope(super::limiter::scope_key(authorization.as_bytes()))?;
+        scope.cached_tariff()
+    }
+
     /// Creates an authenticated view on the same transport, for example for account discovery.
     pub fn with_credentials(&self, credentials: Arc<SecretString>) -> Result<Self> {
         TbankAuthInterceptor::validate_secret(&credentials)?;

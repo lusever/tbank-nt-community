@@ -57,7 +57,7 @@ impl TbankAuthInterceptor {
     }
 }
 
-fn authorization_metadata(credentials: &SecretString) -> Result<AsciiMetadataValue> {
+pub(crate) fn authorization_metadata(credentials: &SecretString) -> Result<AsciiMetadataValue> {
     TbankAuthInterceptor::validate_secret(credentials)?;
     let token = credentials.expose_secret();
 
