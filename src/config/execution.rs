@@ -36,6 +36,10 @@ pub struct TbankExecutionClientConfig {
     /// Optional explicit quota scope shared by clients/tokens belonging to one broker limit domain.
     /// When absent, clients with identical credentials share authoritative GetUserTariff limits.
     pub quota_scope: Option<std::sync::Arc<crate::grpc::limiter::TbankRateLimiter>>,
+    #[serde(skip)]
+    /// Optional consumer revocation signals for submissions. Revocation releases queued quota
+    /// admission and prevents dispatch; already started RPCs retain their recovery lifetime.
+    pub submit_admission: Option<crate::grpc::limited_channel::TbankSubmitAdmission>,
     #[builder(default = DEFAULT_REQUEST_TIMEOUT)]
     /// Timeout for broker requests.
     pub request_timeout: Duration,

@@ -15,11 +15,68 @@ use std::{
 };
 use tonic::{Status, body::Body, codegen::Service, transport::Channel};
 
+/// Optional consumer-owned admission registry for submissions. It contains only command IDs:
+/// the consumer retains all scheduling and stop-policy semantics.
+#[derive(Clone, Default)]
+pub struct TbankSubmitAdmission(
+    Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>>>,
+);
+impl PartialEq for TbankSubmitAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for TbankSubmitAdmission {}
+impl TbankSubmitAdmission {
+    /// Registers a revocation signal before handing the command to ExecutionEngine.
+    /// `true` or a closed sender forbids starting a new RPC; admitted RPCs are never aborted.
+    /// A duplicate identity is rejected without replacing the original owner's signal.
+    pub fn register(
+        &self,
+        id: String,
+        revoked: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        use std::collections::hash_map::Entry;
+        anyhow::ensure!(!id.is_empty(), "empty submit admission identity");
+        match self.0.lock().expect("submit admission poisoned").entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(revoked);
+                Ok(())
+            }
+            Entry::Occupied(_) => anyhow::bail!("submit admission identity already registered"),
+        }
+    }
+    /// Releases the registry entry. Existing transport markers retain their revocation signal.
+    pub fn remove(&self, id: &str) {
+        self.0.lock().expect("submit admission poisoned").remove(id);
+    }
+    pub(crate) fn marker(&self, id: String) -> TbankDispatchMarker {
+        let revoked = self
+            .0
+            .lock()
+            .expect("submit admission poisoned")
+            .get(&id)
+            .cloned();
+        let mut marker = TbankDispatchMarker::for_order(id);
+        marker.admission = revoked.map_or(SubmitAdmission::Missing, SubmitAdmission::Revocable);
+        marker
+    }
+}
+
+#[derive(Clone, Default)]
+enum SubmitAdmission {
+    #[default]
+    Unrestricted,
+    Missing,
+    Revocable(tokio::sync::watch::Receiver<bool>),
+}
+
 /// Evidence shared with a mutating command to distinguish local expiry from an unknown outcome.
 #[derive(Clone, Default)]
 pub struct TbankDispatchMarker {
     dispatched: Arc<AtomicBool>,
     client_order_id: Option<String>,
+    admission: SubmitAdmission,
 }
 impl TbankDispatchMarker {
     /// Associates all transport stages with a Nautilus command.
@@ -27,7 +84,68 @@ impl TbankDispatchMarker {
         Self {
             dispatched: Arc::default(),
             client_order_id: Some(client_order_id),
+            admission: SubmitAdmission::Unrestricted,
         }
+    }
+    fn revoked_status() -> Status {
+        Status::cancelled("submission admission revoked before dispatch")
+    }
+
+    async fn revoked(&self) {
+        match &self.admission {
+            SubmitAdmission::Unrestricted => std::future::pending().await,
+            SubmitAdmission::Missing => {}
+            SubmitAdmission::Revocable(signal) => {
+                let mut signal = signal.clone();
+                loop {
+                    if *signal.borrow_and_update() {
+                        return;
+                    }
+                    if signal.changed().await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Only pre-dispatch work is cancelable. Dropping it releases quota tickets and tentative
+    /// reservations; a started broker mutation must keep its independent recovery lifetime.
+    async fn while_waiting<T>(
+        &self,
+        work: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        if matches!(self.admission, SubmitAdmission::Unrestricted) {
+            return work.await;
+        }
+        tokio::select! {
+            biased;
+            _=self.revoked()=>Err(Self::revoked_status()),
+            result=work=>result,
+        }
+    }
+
+    /// Linearizes revocation with the synchronous transport call. Hold the signal's read borrow
+    /// only across quota commit and Channel::call, never while awaiting a broker response.
+    fn dispatch<T>(&self, start: impl FnOnce() -> T) -> Result<T, Status> {
+        match &self.admission {
+            SubmitAdmission::Unrestricted => Ok(start()),
+            SubmitAdmission::Missing => Err(Self::revoked_status()),
+            SubmitAdmission::Revocable(signal) => {
+                let revoked = signal.borrow();
+                if *revoked || signal.has_changed().is_err() {
+                    return Err(Self::revoked_status());
+                }
+                let result = start();
+                drop(revoked);
+                Ok(result)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn check_admission(&self) -> Result<(), Status> {
+        self.dispatch(|| ())
     }
     /// True only after quota admission and channel readiness, immediately before dispatch.
     pub fn started(&self) -> bool {
@@ -97,109 +215,141 @@ impl Service<http::Request<Body>> for TbankLimitedChannel {
             record("received");
             let mut failure = None::<TbankRpcFailure>;
             let mut failure_phase = "quota_admission";
+            let marker = request
+                .extensions()
+                .get::<TbankDispatchMarker>()
+                .cloned()
+                .unwrap_or_default();
+            let authorization = request.headers().get("authorization").cloned();
             let result = tokio::time::timeout_at(deadline, async {
-                let auth = request
-                    .headers()
-                    .get("authorization")
-                    .cloned()
-                    .ok_or_else(|| Status::unauthenticated("missing authorization"))?;
-                let scope = shared_scope(super::limiter::scope_key(auth.as_bytes()));
-                let limiter = match explicit_scope {
-                    Some(limiter) => limiter,
-                    None => quota_scope(&scope, channel.clone(), auth.clone(), deadline).await?,
-                };
-                record("quota_wait");
-                let streaming = method.ends_with("Stream") || method.ends_with("ServerSideStream");
-                let stream_permits = if streaming {
-                    limiter
-                        .reserve_stream(&method, deadline)
-                        .await
-                        .map_err(|e| Status::resource_exhausted(e.to_string()))?
-                } else {
-                    Vec::new()
-                };
-                let reservation = if !streaming {
-                    let urgent = method.starts_with("Cancel") || method.ends_with("OrderState");
-                    Some(
-                        limiter
-                            .reserve_guard(&method, urgent, deadline)
-                            .await
-                            .map_err(|e| Status::resource_exhausted(e.to_string()))?,
-                    )
-                } else {
-                    None
-                };
-                // Hold admission from the fresh snapshot through opening headers.
-                // A full external quota releases the gate so other groups can progress.
-                let stream_admission = if streaming {
-                    Some(loop {
-                        let admission = limiter.stream_admission.lock().await;
-                        let reservation = limiter
-                            .reserve_guard("GetUserTariff", false, deadline)
-                            .await
-                            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
-                        reservation.commit();
-                        let tariff = fetch_tariff(channel.clone(), auth.clone(), deadline).await?;
-                        let stream_available =
-                            super::limiter::TbankRateLimiter::stream_available(&tariff, &method)
-                                .map_err(|e| Status::failed_precondition(e.to_string()))?;
-                        super::limiter::TbankRateLimiter::from_tariff(&tariff)
-                            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-                        scope.cache_tariff(Arc::new(tariff));
-                        if stream_available {
-                            break admission;
-                        }
-                        drop(admission);
-                        tokio::time::sleep_until(
-                            deadline.min(tokio::time::Instant::now() + Duration::from_secs(1)),
-                        )
-                        .await;
+                let (auth, scope, limiter) = marker
+                    .while_waiting(async {
+                        let auth = authorization
+                            .ok_or_else(|| Status::unauthenticated("missing authorization"))?;
+                        let scope = shared_scope(super::limiter::scope_key(auth.as_bytes()));
+                        let limiter = match explicit_scope {
+                            Some(limiter) => limiter,
+                            None => {
+                                quota_scope(&scope, channel.clone(), auth.clone(), deadline).await?
+                            }
+                        };
+                        Ok((auth, scope, limiter))
                     })
-                } else {
-                    None
-                };
-                record("quota_reserved");
-                std::future::poll_fn(|cx| channel.poll_ready(cx))
+                    .await?;
+                let streaming = method.ends_with("Stream") || method.ends_with("ServerSideStream");
+                let (stream_permits, reservation, stream_admission) = marker
+                    .while_waiting(async {
+                        record("quota_wait");
+                        let stream_permits = if streaming {
+                            limiter
+                                .reserve_stream(&method, deadline)
+                                .await
+                                .map_err(|e| Status::resource_exhausted(e.to_string()))?
+                        } else {
+                            Vec::new()
+                        };
+                        let reservation = if !streaming {
+                            let urgent =
+                                method.starts_with("Cancel") || method.ends_with("OrderState");
+                            Some(
+                                limiter
+                                    .reserve_guard(&method, urgent, deadline)
+                                    .await
+                                    .map_err(|e| Status::resource_exhausted(e.to_string()))?,
+                            )
+                        } else {
+                            None
+                        };
+                        // Hold admission from the fresh snapshot through opening headers.
+                        // A full external quota releases the gate so other groups can progress.
+                        let stream_admission = if streaming {
+                            Some(loop {
+                                let admission = limiter.stream_admission.lock().await;
+                                let reservation = limiter
+                                    .reserve_guard("GetUserTariff", false, deadline)
+                                    .await
+                                    .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+                                reservation.commit();
+                                let tariff =
+                                    fetch_tariff(channel.clone(), auth.clone(), deadline).await?;
+                                let stream_available =
+                                    super::limiter::TbankRateLimiter::stream_available(
+                                        &tariff, &method,
+                                    )
+                                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                                super::limiter::TbankRateLimiter::from_tariff(&tariff)
+                                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                                scope.cache_tariff(Arc::new(tariff));
+                                if stream_available {
+                                    break admission;
+                                }
+                                drop(admission);
+                                tokio::time::sleep_until(
+                                    deadline
+                                        .min(tokio::time::Instant::now() + Duration::from_secs(1)),
+                                )
+                                .await;
+                            })
+                        } else {
+                            None
+                        };
+                        record("quota_reserved");
+                        std::future::poll_fn(|cx| channel.poll_ready(cx))
+                            .await
+                            .map_err(|error| {
+                                failure = Some(rpc_failure_message(
+                                    "channel_ready",
+                                    "Transport",
+                                    &format!("{error:?}"),
+                                ));
+                                Status::unavailable("channel is not ready")
+                            })?;
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            let status =
+                                Status::deadline_exceeded("RPC deadline expired before dispatch");
+                            failure = Some(rpc_failure("before_dispatch", &status));
+                            return Err(status);
+                        }
+                        // Admission/opening is bounded, but a stream without a consumer deadline must
+                        // not acquire an invented lifetime through grpc-timeout metadata.
+                        if !streaming || explicit_deadline {
+                            let timeout_request = super::with_timeout((), remaining);
+                            let value = timeout_request
+                                .metadata()
+                                .get("grpc-timeout")
+                                .expect("timeout metadata");
+                            request.headers_mut().insert(
+                                "grpc-timeout",
+                                http::HeaderValue::from_bytes(value.as_bytes())
+                                    .map_err(|_| Status::internal("invalid remaining timeout"))?,
+                            );
+                        }
+                        Ok((stream_permits, reservation, stream_admission))
+                    })
                     .await
-                    .map_err(|error| {
-                        failure = Some(rpc_failure_message(
-                            "channel_ready",
-                            "Transport",
-                            &format!("{error:?}"),
-                        ));
-                        Status::unavailable("channel is not ready")
+                    .inspect_err(|status| {
+                        if status.code() == tonic::Code::Cancelled {
+                            failure = Some(rpc_failure("before_dispatch", status));
+                        }
                     })?;
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    let status = Status::deadline_exceeded("RPC deadline expired before dispatch");
-                    failure = Some(rpc_failure("before_dispatch", &status));
-                    return Err(status);
-                }
-                // Admission/opening is bounded, but a stream without a consumer deadline must
-                // not acquire an invented lifetime through grpc-timeout metadata.
-                if !streaming || explicit_deadline {
-                    let timeout_request = super::with_timeout((), remaining);
-                    let value = timeout_request
-                        .metadata()
-                        .get("grpc-timeout")
-                        .expect("timeout metadata");
-                    request.headers_mut().insert(
-                        "grpc-timeout",
-                        http::HeaderValue::from_bytes(value.as_bytes())
-                            .map_err(|_| Status::internal("invalid remaining timeout"))?,
-                    );
-                }
-                // Charge the sliding windows at the actual dispatch boundary. A local expiry
-                // or cancelled readiness wait drops the reservation without consuming quota.
-                if let Some(reservation) = reservation {
-                    reservation.commit();
-                }
-                if let Some(marker) = request.extensions().get::<TbankDispatchMarker>() {
-                    marker.dispatched.store(true, Ordering::Release);
-                }
+                // The revocation borrow closes the check/call race without holding any guard
+                // over network I/O. A failed dispatch drops the uncommitted quota reservation.
+                let response_future = marker
+                    .dispatch(|| {
+                        if let Some(reservation) = reservation {
+                            reservation.commit();
+                        }
+                        marker.dispatched.store(true, Ordering::Release);
+                        record("rpc_started");
+                        channel.call(request)
+                    })
+                    .inspect_err(|status| {
+                        failure = Some(rpc_failure("before_dispatch", status));
+                    })?;
                 failure_phase = "await_headers";
-                record("rpc_started");
-                let response = tokio::time::timeout_at(deadline, channel.call(request))
+                let response = tokio::time::timeout_at(deadline, response_future)
                     .await
                     .map_err(|_| {
                         let status =
@@ -454,6 +604,176 @@ mod tests {
             Poll::Ready(Some(Ok(http_body::Frame::trailers(headers))))
         }
     }
+    #[test]
+    fn submit_revocation_is_rechecked_after_registration_and_is_command_scoped() {
+        let admission = TbankSubmitAdmission::default();
+        let (one, rx) = tokio::sync::watch::channel(false);
+        let (two, other) = tokio::sync::watch::channel(false);
+        admission.register("one".into(), rx).unwrap();
+        admission.register("two".into(), other).unwrap();
+        let (_replacement, replacement) = tokio::sync::watch::channel(false);
+        assert!(admission.register("one".into(), replacement).is_err());
+        let marker = admission.marker("one".into());
+        let other = admission.marker("two".into());
+        assert!(marker.check_admission().is_ok());
+        one.send_replace(true);
+        assert_eq!(
+            marker.check_admission().unwrap_err().code(),
+            tonic::Code::Cancelled
+        );
+        assert!(other.check_admission().is_ok());
+        assert!(!marker.started());
+        admission.remove("two");
+        assert!(admission.marker("two".into()).check_admission().is_err());
+        drop(two);
+        assert!(other.check_admission().is_err());
+    }
+    #[tokio::test]
+    async fn revoked_transport_waiter_releases_its_quota_ticket_without_dispatch() {
+        use super::super::limiter::{TbankRateLimiter, TbankRpcQuota};
+        let limiter = Arc::new(
+            TbankRateLimiter::new(
+                vec![TbankRpcQuota {
+                    methods: vec!["PostOrder".into()],
+                    capacity: 1,
+                    window: Duration::from_secs(3600),
+                }],
+                1,
+            )
+            .unwrap(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let occupied = limiter
+            .reserve_guard("PostOrder", false, deadline)
+            .await
+            .unwrap();
+        let registry = TbankSubmitAdmission::default();
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        registry.register("queued-order".into(), receiver).unwrap();
+        let marker = registry.marker("queued-order".into());
+        let channel = Channel::from_static("http://127.0.0.1:9").connect_lazy();
+        let mut transport = TbankLimitedChannel::with_quota_scope(channel, Some(limiter.clone()));
+        let mut request = http::Request::builder()
+            .uri("/orders/PostOrder")
+            .header("authorization", "Bearer transport-admission-test")
+            .header("grpc-timeout", "60S")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(marker.clone());
+        let pending = transport.call(request);
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        stop.send_replace(true);
+        let error = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .err()
+            .expect("revoked call must fail locally");
+        assert_eq!(error.code(), tonic::Code::Cancelled);
+        assert!(!marker.started());
+        // The queue has just one slot. A stale cancelled ticket would prevent this new waiter.
+        let other = limiter.reserve_guard("PostOrder", false, deadline);
+        tokio::pin!(other);
+        assert!(futures_util::poll!(other.as_mut()).is_pending());
+        drop(occupied);
+        let reservation = tokio::time::timeout(Duration::from_secs(1), other)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(reservation);
+        // Neither the cancelled request nor the tentative reservations charged the sliding window.
+        let _available = tokio::time::timeout(
+            Duration::from_secs(1),
+            limiter.reserve_guard("PostOrder", false, deadline),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoked_channel_readiness_wait_refunds_reserved_quota() {
+        use super::super::limiter::{TbankRateLimiter, TbankRpcQuota};
+        let limiter = Arc::new(
+            TbankRateLimiter::new(
+                vec![TbankRpcQuota {
+                    methods: vec![],
+                    capacity: 1,
+                    window: Duration::from_secs(3600),
+                }],
+                1,
+            )
+            .unwrap(),
+        );
+        let registry = TbankSubmitAdmission::default();
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        registry.register("ready-order".into(), receiver).unwrap();
+        let marker = registry.marker("ready-order".into());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let preparing = marker.while_waiting(async {
+            let reservation = limiter
+                .reserve_guard("PostOrder", false, deadline)
+                .await
+                .unwrap();
+            // Channel readiness has not completed, although quota was tentatively reserved.
+            std::future::pending::<()>().await;
+            Ok(reservation)
+        });
+        tokio::pin!(preparing);
+        assert!(futures_util::poll!(preparing.as_mut()).is_pending());
+        stop.send_replace(true);
+        assert_eq!(
+            preparing.await.err().unwrap().code(),
+            tonic::Code::Cancelled
+        );
+        assert!(!marker.started());
+        let _available = tokio::time::timeout(
+            Duration::from_secs(1),
+            limiter.reserve_guard("PostOrder", false, deadline),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn revocation_and_the_transport_call_have_an_ordered_boundary() {
+        let registry = TbankSubmitAdmission::default();
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        registry.register("racing-order".into(), receiver).unwrap();
+        let marker = registry.marker("racing-order".into());
+        let (enter_tx, enter_rx) = std::sync::mpsc::channel();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let revoker = std::thread::spawn(move || {
+            enter_rx.recv().unwrap();
+            attempt_tx.send(()).unwrap();
+            stop.send_replace(true);
+            done_tx.send(()).unwrap();
+        });
+        marker
+            .dispatch(|| {
+                enter_tx.send(()).unwrap();
+                attempt_rx.recv().unwrap();
+                assert!(matches!(
+                    done_rx.recv_timeout(Duration::from_millis(10)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                marker.dispatched.store(true, Ordering::Release);
+            })
+            .unwrap();
+        revoker.join().unwrap();
+        done_rx.recv().unwrap();
+        assert!(
+            marker.started(),
+            "revocation does not erase an already started RPC"
+        );
+        assert!(
+            marker.check_admission().is_err(),
+            "subsequent dispatch is revoked"
+        );
+    }
+
     #[tokio::test]
     async fn grpc_trailers_finish_diagnostics_before_tonic_drops_the_body() {
         let mut diagnostics = super::super::limiter::subscribe_tbank_rpc_diagnostics();

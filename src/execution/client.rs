@@ -2911,8 +2911,13 @@ impl TbankExecutionRuntime {
             ));
         }
         self.record_pending_submit(order, current_unix_nanos());
-        let dispatch_marker = crate::grpc::limited_channel::TbankDispatchMarker::for_order(
-            order.client_order_id.clone(),
+        let dispatch_marker = self.config.submit_admission.as_ref().map_or_else(
+            || {
+                crate::grpc::limited_channel::TbankDispatchMarker::for_order(
+                    order.client_order_id.clone(),
+                )
+            },
+            |admission| admission.marker(order.client_order_id.clone()),
         );
         let result = match tokio::time::timeout_at(
             submit_deadline,
