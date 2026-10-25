@@ -17,7 +17,7 @@ pub fn tbank_tls_config() -> ClientTlsConfig {
         .ca_certificate(Certificate::from_pem(RUSSIAN_TRUSTED_SUB_CA))
 }
 
-/// Connects a TLS gRPC channel to a validated endpoint.
+/// Connects a gRPC channel on the Nautilus runtime, independent of the caller's executor.
 pub async fn connect_channel(endpoint_uri: &str, timeout: Duration) -> Result<Channel> {
     let mut endpoint = Channel::from_shared(endpoint_uri.to_string())
         .map_err(|_| TbankAdapterError::InvalidEndpoint)?
@@ -29,13 +29,33 @@ pub async fn connect_channel(endpoint_uri: &str, timeout: Duration) -> Result<Ch
             .map_err(|e| TbankAdapterError::ConfigError(format!("TLS config failed: {e}")))?;
     }
 
-    endpoint
-        .connect()
+    // Execution operation tasks already run on the global Nautilus runtime. The
+    // socket, channel buffer and HTTP/2 driver must live there too: a consumer's
+    // LocalSet/current-thread runtime may be blocked by synchronous persistence.
+    // Entering only a Handle or moving an already connected Channel would leave
+    // I/O resources and spawned connection tasks bound to that consumer runtime.
+    let mut connecting = tokio::task::JoinSet::new();
+    connecting.spawn_on(
+        async move {
+            endpoint
+                .connect()
+                .await
+                .map_err(|e| TbankAdapterError::GrpcStatus {
+                    code: tonic::Code::Unavailable,
+                    message: classify_transport_error(&e),
+                })
+        },
+        nautilus_common::live::get_runtime().handle(),
+    );
+    // JoinSet owns and aborts the connection attempt if this future is cancelled.
+    connecting
+        .join_next()
         .await
-        .map_err(|e| TbankAdapterError::GrpcStatus {
+        .expect("one owned connect task")
+        .map_err(|_| TbankAdapterError::GrpcStatus {
             code: tonic::Code::Unavailable,
-            message: classify_transport_error(&e),
-        })
+            message: "transport connection task failed".into(),
+        })?
 }
 
 fn classify_transport_error(error: &tonic::transport::Error) -> String {
@@ -72,6 +92,55 @@ fn classify_transport_error(error: &tonic::transport::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn channel_progresses_when_caller_runtime_is_blocked() {
+        use crate::grpc::generated::{
+            GetUserTariffRequest, users_service_client::UsersServiceClient,
+            users_service_server::UsersServiceServer,
+        };
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        // Both the mock broker and the command worker are independent of the host
+        // current-thread runtime, just like Nautilus execution operation tasks.
+        let runtime = nautilus_common::live::get_runtime();
+        let listener = runtime
+            .spawn(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() })
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn_on(
+            async move {
+                tonic::transport::Server::builder()
+                    .add_service(UsersServiceServer::new(crate::testing::QuotaUsersService))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            },
+            runtime.handle(),
+        );
+        let channel = connect_channel(&format!("http://{address}"), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut client = UsersServiceClient::new(channel);
+        client
+            .get_user_tariff(GetUserTariffRequest {})
+            .await
+            .unwrap();
+        let (completed, result) = std::sync::mpsc::channel();
+        tasks.spawn_on(
+            async move {
+                let response = client.get_user_tariff(GetUserTariffRequest {}).await;
+                completed.send(response.is_ok()).unwrap();
+            },
+            runtime.handle(),
+        );
+
+        // Deliberately block the host executor as a synchronous disk write would.
+        // A channel owned by Nautilus must still complete its read-only RPC.
+        assert_eq!(result.recv_timeout(Duration::from_secs(2)), Ok(true));
+    }
 
     #[test]
     fn vendored_russian_ca_chain_is_accepted_by_tls_config() {

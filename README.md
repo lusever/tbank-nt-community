@@ -191,6 +191,12 @@ TBANK_SANDBOX_ACCOUNT_ID=...
 
 `grpc::TbankSession::connect(environment, endpoint, credentials, timeout)` открывает общий
 транспорт по правилам адаптера: выбирает адрес сервера, настраивает TLS и авторизацию.
+Сокет, буфер канала и HTTP/2-задачи создаются в фоновом runtime Nautilus, где
+выполняются execution-команды. Синхронная работа приложения в своём однопоточном
+runtime (например, запись журнала на диск) не должна останавливать сетевую часть
+общей сессии. Отмена подключения отменяет и принадлежащую ему задачу подключения.
+Воспроизведение дефекта и границы приёмки описаны в
+[проверке изоляции runtime](docs/validation/runtime-isolation-2026-10-25.md).
 `TbankDataClient`, `TbankExecutionClient`, `TbankInstrumentProvider` и обе фабрики клиентов
 `LiveNode` принимают сессию через `with_session`. Метод `bind_session(&mut self, session)`
 позволяет привязать транспорт к уже созданному клиенту данных или исполнения в фазе подключения,

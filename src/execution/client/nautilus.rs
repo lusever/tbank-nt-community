@@ -897,6 +897,9 @@ impl ExecutionClient for TbankExecutionClient {
             &self.runtime,
             "submit_order",
             async move {
+                crate::grpc::limiter::diagnostic_with_context(
+                    0, "SubmitOrder", "command_task_started", Some(client_order_id.as_str()), None,
+                );
                 let prepared = match prepare_nautilus_order_before_deadline(
                     &mut client,
                     cmd,
@@ -912,6 +915,9 @@ impl ExecutionClient for TbankExecutionClient {
                         return;
                     }
                 };
+                crate::grpc::limiter::diagnostic_with_context(
+                    0, "SubmitOrder", "preflight_finished", Some(client_order_id.as_str()), None,
+                );
                 emitter.emit_order_submitted(&order);
                 if let Err(error) = submit_prepared_nautilus_order(
                     &mut client,
