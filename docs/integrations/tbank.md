@@ -1,6 +1,6 @@
 # T-Bank adapter capability matrix
 
-This matrix describes the public behavior of `tbank-nt-community` `0.4.0` with NautilusTrader
+This matrix describes the current source of `tbank-nt-community` (based on `0.4.0`) with NautilusTrader
 `v2.0.0rc7`.
 
 ## Instruments and data
@@ -57,12 +57,34 @@ rejected locally. Live order submission requires both `enable_trading = true` an
 | `CancelAllOrders` / `BatchCancelOrders` | Supported | `CancelAllOrders` is scoped to its instrument and optional side across regular and stop orders |
 | Order/fill/position reports | Supported | Query-backed reports and reconnect reconciliation |
 
-Fill snapshots use `OperationsByCursor` for operation trade data and the broker order index for
+Account-wide fill snapshots use `OperationsByCursor` for operation trade data and the broker order index for
 `venue_order_id`. If an operation trade is missing from that index, the adapter looks up its
 operation ID with `GetOrderState` and uses the returned broker order ID. Operation IDs are only
 transient lookup keys because T-Bank says they can change between history reads. If the lookup
 cannot establish an order identity, including when `GetOrderState` no longer retains that order,
 the snapshot stays incomplete and does not publish partial fill reports.
+
+A fill query with an explicit regular `venue_order_id` queries that order through `GetOrderState`
+and reconstructs its exact stages: broker trade IDs, execution timestamps, prices and lot-adjusted
+quantities. A nonempty stage list must cover `lots_executed`; missing prices, timestamps,
+identities or a partial stage list fail the query. Commission is allocated over all stages before
+applying the requested time/instrument filters. Repeated snapshots do not consume the stream's
+execution-deduplication ledger. A missing order is an error, not evidence of zero historical fills.
+If a final filled/canceled order omits stages entirely, a whole-order query can return the
+existing cumulative reconciliation snapshot: a stable synthetic `reconciled` trade identity,
+broker-confirmed executed quantity, execution average and commission. Its timestamp is the
+broker order time, not an asserted execution time. This summary requires the query start to
+precede order creation and the query end to include the observation (or be omitted); narrower
+execution-time windows fail closed. Active orders with executed quantity but without complete
+stages are rejected.
+Known stop-order identities keep their activated-child/account-history reconciliation route.
+
+Sandbox cursor operations can expose synthetic operation/trade IDs which `GetSandboxOrderState`
+cannot resolve, while `GetSandboxOrders` omits the terminal orders. Scoped order-state snapshots
+support reconciliation of explicitly identified regular orders in this situation. Account-wide
+unresolved identities still fail closed; no operation is assigned by matching price, size or time.
+The market-fill acceptance checks both filled orders through their explicit venue IDs and restores
+the pre-test position baseline. It does not claim complete account-wide sandbox fill history.
 
 Futures quantities are contracts in Nautilus and whole broker lots at the transport boundary.
 Regular and stop futures orders use point prices and send `PriceType::Point`; stop-order reports

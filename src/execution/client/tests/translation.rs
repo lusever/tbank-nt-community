@@ -687,3 +687,170 @@ fn base_order_status_report(order_type: OrderType) -> OrderStatusReport {
         Some(UUID4::new()),
     )
 }
+
+fn scoped_stage_state() -> OrderState {
+    OrderState {
+        order_id: "scoped-order".into(),
+        instrument_uid: "sber-uid".into(),
+        ticker: "SBER".into(),
+        class_code: "TQBR".into(),
+        lots_requested: 3,
+        lots_executed: 3,
+        direction: OrderDirection::Buy as i32,
+        executed_commission: Some(MoneyValue {
+            currency: "rub".into(),
+            units: 3,
+            nano: 10_000_000,
+        }),
+        stages: vec![
+            OrderStage {
+                trade_id: "stage-a".into(),
+                quantity: 2,
+                price: Some(MoneyValue {
+                    currency: "rub".into(),
+                    units: 275,
+                    nano: 0,
+                }),
+                execution_time: Some(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: 100,
+                }),
+            },
+            OrderStage {
+                trade_id: "stage-b".into(),
+                quantity: 1,
+                price: Some(MoneyValue {
+                    currency: "rub".into(),
+                    units: 276,
+                    nano: 0,
+                }),
+                execution_time: Some(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: 200,
+                }),
+            },
+        ],
+        ..OrderState::default()
+    }
+}
+
+#[test]
+fn scoped_order_stages_preserve_ids_execution_times_lots_and_total_commission() {
+    let state = scoped_stage_state();
+    let metadata = sber_metadata();
+    let fills = super::fill_reports_from_order_state_query(
+        "account-1".into(),
+        &state,
+        &metadata,
+        "scoped-order",
+        None,
+        UnixNanos::from(300),
+    )
+    .unwrap();
+    assert_eq!(fills.len(), 2);
+    assert_eq!(fills[0].report.trade_id.as_str(), "stage-a");
+    assert_eq!(
+        fills[0].report.last_qty.as_decimal(),
+        Decimal::from(2 * metadata.lot)
+    );
+    assert_eq!(fills[1].report.ts_event, UnixNanos::from(200));
+    assert_eq!(fills[1].report.last_px.as_decimal(), Decimal::from(276));
+    assert_eq!(
+        fills
+            .iter()
+            .map(|f| f.report.commission.as_decimal())
+            .sum::<Decimal>(),
+        Decimal::new(301, 2)
+    );
+    assert!(
+        fills
+            .iter()
+            .all(|f| f.source == TbankFillCommissionSource::OrderStateQuery)
+    );
+}
+
+#[test]
+fn scoped_order_stages_reject_partial_duplicate_or_untimed_snapshots() {
+    let state = scoped_stage_state();
+    let metadata = sber_metadata();
+    for bad in [
+        {
+            let mut s = state.clone();
+            s.stages.pop();
+            s
+        },
+        {
+            let mut s = state.clone();
+            s.stages[1].trade_id = s.stages[0].trade_id.clone();
+            s
+        },
+        {
+            let mut s = state.clone();
+            s.stages[1].execution_time = None;
+            s
+        },
+        {
+            let mut s = state.clone();
+            s.stages[1].quantity = 0;
+            s
+        },
+    ] {
+        assert!(
+            super::fill_reports_from_order_state_query(
+                "account-1".into(),
+                &bad,
+                &metadata,
+                "scoped-order",
+                None,
+                UnixNanos::from(300)
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn scoped_order_stages_convert_futures_money_to_points() {
+    let mut state = scoped_stage_state();
+    state.stages.truncate(1);
+    state.lots_executed = 2;
+    state.stages[0].price.as_mut().unwrap().units = 125;
+    let metadata = si_futures_metadata();
+    let fills = super::fill_reports_from_order_state_query(
+        "account-1".into(),
+        &state,
+        &metadata,
+        "scoped-order",
+        None,
+        UnixNanos::from(300),
+    )
+    .unwrap();
+    assert_eq!(fills[0].report.last_px.as_decimal(), Decimal::from(10));
+    assert_eq!(fills[0].report.last_qty.as_decimal(), Decimal::from(2));
+}
+
+fn final_summary_state() -> OrderState {
+    let mut state = scoped_stage_state();
+    state.stages.clear();
+    state.lots_executed = 1;
+    state.lots_requested = 1;
+    state.execution_report_status = OrderExecutionReportStatus::ExecutionReportStatusFill as i32;
+    state.order_date = Some(prost_types::Timestamp { seconds: 0, nanos: 50 });
+    state.executed_order_price = Some(MoneyValue { currency: "rub".into(), units: 275, nano: 0 });
+    state
+}
+
+#[test]
+fn final_order_summary_uses_existing_stable_cumulative_identity_and_broker_order_time() {
+    let state = final_summary_state(); let metadata = sber_metadata();
+    for _ in 0..2 {
+        let fills = super::fill_reports_from_final_order_summary_query("account-1".into(), &state, &metadata, "scoped-order", None, UnixNanos::from(300)).unwrap();
+        assert_eq!(fills.len(),1);
+        assert_eq!(fills[0].report.trade_id.as_str(), synthetic_fill_trade_id("reconciled", "scoped-order", Decimal::from(metadata.lot)));
+        assert_eq!(fills[0].report.last_qty.as_decimal(), Decimal::from(metadata.lot));
+        assert_eq!(fills[0].report.ts_event, UnixNanos::from(50));
+        assert_eq!(fills[0].report.commission.as_decimal(), Decimal::new(301,2));
+    }
+    let mut active = state; active.execution_report_status = OrderExecutionReportStatus::ExecutionReportStatusPartiallyfill as i32;
+    assert!(super::fill_reports_from_final_order_summary_query("account-1".into(), &active, &metadata, "scoped-order", None, UnixNanos::from(300)).is_err());
+}

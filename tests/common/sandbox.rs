@@ -27,7 +27,9 @@ use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType},
     events::{AccountState, OrderEventAny},
-    identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue},
+    identifiers::{
+        ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
+    },
     orders::OrderTestBuilder,
     reports::{FillReport, OrderStatusReport},
     types::{Price, Quantity},
@@ -1355,31 +1357,34 @@ async fn wait_for_position_report(
 async fn wait_for_fill_reports(
     client: &TbankExecutionClient,
     instrument_id: InstrumentId,
+    venue_order_ids: &[VenueOrderId],
     start: UnixNanos,
     predicate: impl Fn(&[FillReport]) -> bool,
 ) -> Result<Vec<FillReport>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut seen = Vec::new();
     loop {
-        let reports = ExecutionClient::generate_fill_reports(
-            client,
-            GenerateFillReports::new(
-                UUID4::new(),
-                current_test_unix_nanos(),
-                Some(instrument_id),
-                None,
-                Some(start),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-        for report in reports {
-            if !seen.iter().any(|seen: &FillReport| {
-                seen.venue_order_id == report.venue_order_id && seen.trade_id == report.trade_id
-            }) {
-                seen.push(report);
+        for venue_order_id in venue_order_ids {
+            let reports = ExecutionClient::generate_fill_reports(
+                client,
+                GenerateFillReports::new(
+                    UUID4::new(),
+                    current_test_unix_nanos(),
+                    Some(instrument_id),
+                    Some(*venue_order_id),
+                    Some(start),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await?;
+            for report in reports {
+                if !seen.iter().any(|seen: &FillReport| {
+                    seen.venue_order_id == report.venue_order_id && seen.trade_id == report.trade_id
+                }) {
+                    seen.push(report);
+                }
             }
         }
         if predicate(&seen) {
@@ -2546,8 +2551,8 @@ async fn sandbox_market_fill() -> Result<()> {
         instrument.lot
     );
 
-    // One client retains canonical identities for both methods. Unknown operation identities
-    // remain a fail-closed reporting error rather than being skipped.
+    // Explicit venue IDs scope each snapshot to its broker-confirmed order state. Sandbox
+    // operation IDs do not establish account-wide fill identities.
     let sell = submit_market_order_with_method(
         execution,
         &adapter_instrument,
@@ -2574,6 +2579,7 @@ async fn sandbox_market_fill() -> Result<()> {
     wait_for_fill_reports(
         &execution.client,
         buy.instrument_id,
+        &[buy.venue_order_id, sell.venue_order_id],
         history_start,
         |reports| {
             reports
@@ -2608,7 +2614,7 @@ async fn sandbox_market_fill() -> Result<()> {
         "sandbox operations did not expose fills for recent market round trip"
     );
 
-    eprintln!("SANDBOX_SUBMIT_METHOD method={method:?} buy=filled sell=filled position_restored=true fill_history=verified");
+    eprintln!("SANDBOX_SUBMIT_METHOD method={method:?} buy=filled sell=filled position_restored=true fill_snapshot=per_order_broker_state_verified");
         }
     Ok(())
     })
@@ -2899,6 +2905,7 @@ async fn sandbox_futures_market_fill() -> Result<()> {
         let reports = wait_for_fill_reports(
             &execution.client,
             buy.instrument_id,
+            &[buy.venue_order_id, sell.venue_order_id],
             history_start,
             |reports| {
                 reports

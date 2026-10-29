@@ -424,11 +424,120 @@ pub(super) fn submit_commands_from_list(
         .collect()
 }
 
+// A venue-order filter is an authoritative single-order query. It must not fail because an
+// unrelated account operation has no order identity (notably synthetic sandbox operation IDs).
+async fn prepare_scoped_order_fill_reports(
+    client: &mut TbankExecutionRuntime,
+    cmd: nautilus_common::messages::execution::GenerateFillReports,
+) -> anyhow::Result<PreparedFillReports> {
+    let requested = cmd
+        .venue_order_id
+        .context("scoped fill query requires venue_order_id")?;
+    let state = client.query_order(requested.as_str()).await?;
+    let observed_at = current_unix_nanos();
+    anyhow::ensure!(
+        !state.order_id.is_empty(),
+        "scoped order state has no broker order identity"
+    );
+    let (canonical, requested_canonical, client_order_id) = {
+        let index = client
+            .broker_order_index
+            .lock()
+            .expect("broker_order_index lock");
+        (
+            index.canonical_venue_order_id_or_self(&state.order_id),
+            index.canonical_venue_order_id_or_self(requested.as_str()),
+            index.client_order_id_for_venue_order_id(&state.order_id),
+        )
+    };
+    anyhow::ensure!(
+        canonical == requested_canonical,
+        "scoped order lookup returned a different broker order identity"
+    );
+    let metadata = client.metadata_for_order_state(&state).await?;
+    let fills = if state.stages.is_empty() && state.lots_executed > 0 {
+        // Sandbox can provide final cumulative execution without individual stages. Only an
+        // entire-order window can be answered from that snapshot; never invent stage timestamps.
+        let order_time = timestamp_to_unix_nanos(
+            state
+                .order_date
+                .as_ref()
+                .context("cumulative order snapshot has no broker order timestamp")?,
+        )?;
+        anyhow::ensure!(
+            cmd.start.is_none_or(|start| start <= order_time)
+                && cmd.end.is_none_or(|end| end >= observed_at),
+            "cumulative order snapshot cannot answer a partial execution-time window"
+        );
+        fill_reports_from_final_order_summary_query(
+            client.account_id(),
+            &state,
+            &metadata,
+            &canonical,
+            client_order_id.as_deref(),
+            cmd.ts_init,
+        )?
+    } else {
+        fill_reports_from_order_state_query(
+            client.account_id(),
+            &state,
+            &metadata,
+            &canonical,
+            client_order_id.as_deref(),
+            cmd.ts_init,
+        )
+        .with_context(|| {
+            format!(
+                "scoped order {}: executed_lots={} stage_count={}",
+                state.order_id,
+                state.lots_executed,
+                state.stages.len()
+            )
+        })?
+    };
+    let projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let mut reports = Vec::new();
+    let mut provenance = Vec::new();
+    for fill in fills {
+        // Allocate commission on the entire order first, then apply execution-time filters.
+        if !fill_report_matches_command(&fill.report, &cmd) {
+            continue;
+        }
+        let (report, pending) = project_managed_trade_fill_report_deferred(
+            &client.broker_order_index,
+            &projection,
+            fill,
+        )?;
+        provenance.extend(pending);
+        if let Some(report) = report {
+            reports.push(report);
+        }
+    }
+    Ok(PreparedFillReports {
+        reports,
+        provenance,
+        complete: true,
+    })
+}
+
 async fn prepare_fill_reports(
     execution_client: &TbankExecutionClient,
     cmd: nautilus_common::messages::execution::GenerateFillReports,
 ) -> anyhow::Result<PreparedFillReports> {
     let mut client = execution_client.runtime.clone();
+    if let Some(venue_order_id) = cmd.venue_order_id {
+        let known = client.known_broker_order_identity(None, Some(&venue_order_id));
+        let regular_order = match known {
+            Some(identity) => identity.route == TbankBrokerOrderRoute::RegularOrder,
+            None => client
+                .stop_order_from_broker(Some(venue_order_id.as_str()))
+                .await?
+                .is_none(),
+        };
+        if regular_order {
+            return prepare_scoped_order_fill_reports(&mut client, cmd).await;
+        }
+    }
     // T-Bank exposes terminal order states only through the current-day GetOrders filters, whose
     // from/to fields are explicitly limited to orders created today. Operation history contains
     // trade IDs but no broker order IDs, so it cannot produce canonical fill identities outside

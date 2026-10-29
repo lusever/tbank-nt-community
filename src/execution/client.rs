@@ -3166,7 +3166,19 @@ impl TbankExecutionRuntime {
                 {
                     "SandboxService.PostSandboxStopOrder"
                 }
+                TbankExecutionService::Sandbox
+                    if order.submit_method
+                        == crate::execution::TbankSubmitMethod::PostOrderAsync =>
+                {
+                    "SandboxService.PostSandboxOrderAsync"
+                }
                 TbankExecutionService::Sandbox => "SandboxService.PostSandboxOrder",
+                TbankExecutionService::LiveOrders
+                    if order.submit_method
+                        == crate::execution::TbankSubmitMethod::PostOrderAsync =>
+                {
+                    "OrdersService.PostOrderAsync"
+                }
                 TbankExecutionService::LiveOrders => "OrdersService.PostOrder",
                 TbankExecutionService::LiveStopOrders => "StopOrdersService.PostStopOrder",
             };

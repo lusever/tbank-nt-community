@@ -5991,3 +5991,118 @@ async fn generate_mass_status_handles_empty_order_id_as_unresolved_fill_identity
         "an incomplete mass-status snapshot must not publish fill provenance"
     );
 }
+
+#[tokio::test]
+async fn scoped_fill_snapshot_queries_order_state_repeats_and_filters_after_commission_allocation()
+{
+    let orders = MockOrdersService::default();
+    *orders.state_response.lock().unwrap() = Some(scoped_stage_state());
+    let state_calls = Arc::clone(&orders.state_calls);
+    let state_error = Arc::clone(&orders.state_error);
+    let state_response = Arc::clone(&orders.state_response);
+    let order_history_calls = Arc::clone(&orders.get_orders_calls);
+    let operations = MockOperationsService::default();
+    let operation_calls = Arc::clone(&operations.calls);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(
+                crate::grpc::generated::users_service_server::UsersServiceServer::new(
+                    crate::testing::QuotaUsersService,
+                ),
+            )
+            .add_service(OrdersServiceServer::new(orders))
+            .add_service(OperationsServiceServer::new(operations))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let mut client = test_client(TbankExecutionClientConfig {
+        environment: TbankEnvironment::Live,
+        token: Some("test-token".into()),
+        account_id: Some("account-1".into()),
+        endpoint: Some(format!("http://{addr}")),
+        ..TbankExecutionClientConfig::default()
+    });
+    seed_sber_metadata(&mut client);
+    client.runtime.record_broker_order_mapping(
+        TbankBrokerOrderRoute::RegularOrder,
+        "client-1",
+        "scoped-order",
+    );
+    client.connect_for_queries().await.unwrap();
+    for _ in 0..2 {
+        let reports = ExecutionClient::generate_fill_reports(
+            &client,
+            GenerateFillReports::new(
+                UUID4::new(),
+                UnixNanos::from(300),
+                None,
+                Some("scoped-order".into()),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].trade_id.as_str(), "stage-a");
+        assert_eq!(
+            reports
+                .iter()
+                .map(|r| r.commission.as_decimal())
+                .sum::<Decimal>(),
+            Decimal::new(301, 2)
+        );
+    }
+    let filtered = ExecutionClient::generate_fill_reports(
+        &client,
+        GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::from(300),
+            None,
+            Some("scoped-order".into()),
+            Some(UnixNanos::from(150)),
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].trade_id.as_str(), "stage-b");
+    assert_eq!(filtered[0].commission.as_decimal(), Decimal::new(101, 2));
+    assert_eq!(state_calls.lock().unwrap().len(), 3);
+    assert_eq!(order_history_calls.load(Ordering::SeqCst), 0);
+    assert!(operation_calls.lock().unwrap().is_empty());
+    *state_response.lock().unwrap()=Some(final_summary_state());
+    let summary=ExecutionClient::generate_fill_reports(&client,GenerateFillReports::new(UUID4::new(),UnixNanos::from(300),None,Some("scoped-order".into()),Some(UnixNanos::from(0)),None,None,None)).await.unwrap();
+    assert_eq!(summary.len(),1);
+    assert_eq!(summary[0].ts_event,UnixNanos::from(50));
+    for (start,end) in [(Some(UnixNanos::from(100)),None),(None,Some(UnixNanos::from(250)))] {
+        let error=ExecutionClient::generate_fill_reports(&client,GenerateFillReports::new(UUID4::new(),UnixNanos::from(300),None,Some("scoped-order".into()),start,end,None,None)).await.unwrap_err();
+        assert!(error.to_string().contains("partial execution-time window"));
+    }
+    *state_error.lock().unwrap() = Some((Code::NotFound, "missing scoped order".into()));
+    assert!(
+        ExecutionClient::generate_fill_reports(
+            &client,
+            GenerateFillReports::new(
+                UUID4::new(),
+                UnixNanos::from(300),
+                None,
+                Some("scoped-order".into()),
+                None,
+                None,
+                None,
+                None
+            )
+        )
+        .await
+        .is_err()
+    );
+}

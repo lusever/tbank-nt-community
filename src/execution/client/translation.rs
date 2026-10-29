@@ -1330,6 +1330,171 @@ fn average_price_from_stream_trades(
     bounded_nautilus_price_decimal(total_value / total_quantity).map(Some)
 }
 
+/// The existing cumulative reconciliation identity for a final broker order without stages.
+/// The caller must require a whole-order time window: `ts_event` is the broker order time,
+/// not a reconstructed execution timestamp. No shared execution projection is consumed.
+pub(super) fn fill_reports_from_final_order_summary_query(
+    account_id: AccountId,
+    state: &OrderState,
+    metadata: &TbankInstrumentMetadata,
+    venue_order_id: &str,
+    client_order_id: Option<&str>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<TbankFillReport>> {
+    anyhow::ensure!(
+        state.stages.is_empty()
+            && state.lots_executed > 0
+            && metadata.lot > 0
+            && state.lots_requested >= state.lots_executed,
+        "invalid cumulative final-order snapshot"
+    );
+    let ts_event = timestamp_to_unix_nanos(
+        state
+            .order_date
+            .as_ref()
+            .context("cumulative snapshot requires broker order timestamp")?,
+    )?;
+    let report = order_status_report_from_state_with_metadata(
+        account_id,
+        state.clone(),
+        ts_init,
+        metadata.instrument_id.parse()?,
+        metadata.lot,
+        Some(metadata),
+    )?;
+    anyhow::ensure!(
+        matches!(
+            report.order_status,
+            OrderStatus::Filled | OrderStatus::Canceled
+        ),
+        "cumulative fill snapshot requires a final filled or canceled order"
+    );
+    let average = report
+        .avg_px
+        .context("cumulative fill snapshot has no execution average")?;
+    let side = report
+        .order_side
+        .context("cumulative fill snapshot has no order side")?;
+    let quantity = report.filled_qty.as_decimal();
+    let trade_id = synthetic_fill_trade_id("reconciled", venue_order_id, quantity);
+    let projection = Arc::new(Mutex::new(TbankFillProjection::default()));
+    let fill = crate::execution::projections::project_cumulative_order_fill_with_publication(
+        &projection,
+        venue_order_id,
+        &trade_id,
+        quantity,
+        average * quantity,
+        commission_from_money_value(state.executed_commission.as_ref())?,
+        |_| Ok(()),
+    )?
+    .context("final cumulative snapshot produced no execution quantity")?;
+    let report = FillReport::new(
+        account_id,
+        report.instrument_id,
+        venue_order_id.into(),
+        trade_id.as_str().into(),
+        side,
+        fill.quantity,
+        fill.price,
+        fill_report_commission(fill.commission),
+        LiquiditySide::NoLiquiditySide,
+        client_order_id.and_then(nonempty_client_order_id),
+        None,
+        ts_event,
+        ts_init,
+        Some(UUID4::new()),
+    );
+    Ok(vec![TbankFillReport::new(
+        report,
+        fill.commission,
+        TbankFillCommissionSource::OrderStateQuery,
+    )])
+}
+
+/// Reconstructs exact broker stages of one explicitly queried order, independently of streams
+/// and account-wide operation IDs. A partial stage list cannot be an authoritative snapshot.
+pub(super) fn fill_reports_from_order_state_query(
+    account_id: AccountId,
+    state: &OrderState,
+    metadata: &TbankInstrumentMetadata,
+    venue_order_id: &str,
+    client_order_id: Option<&str>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<TbankFillReport>> {
+    anyhow::ensure!(
+        state.lots_executed >= 0 && metadata.lot > 0,
+        "invalid executed lots or instrument lot"
+    );
+    let mut lots = 0_i64;
+    let mut trade_ids = HashSet::new();
+    let mut stages = Vec::with_capacity(state.stages.len());
+    for stage in &state.stages {
+        anyhow::ensure!(stage.quantity > 0, "order stage has non-positive quantity");
+        anyhow::ensure!(
+            !stage.trade_id.is_empty() && trade_ids.insert(stage.trade_id.as_str()),
+            "order stage has empty or duplicate trade identity"
+        );
+        lots = lots
+            .checked_add(stage.quantity)
+            .context("order stage quantity overflow")?;
+        let price = price_from_money_value_for_instrument(
+            stage.price.as_ref().context("order stage has no price")?,
+            Some(metadata),
+        )?;
+        let ts_event = timestamp_to_unix_nanos(
+            stage
+                .execution_time
+                .as_ref()
+                .context("order stage has no execution timestamp")?,
+        )?;
+        stages.push((stage, price, ts_event));
+    }
+    anyhow::ensure!(
+        lots == state.lots_executed,
+        "order stage list does not cover executed lots; refusing partial fill reports"
+    );
+    if stages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let commission = TbankFillCommission::from(commission_from_money_value(
+        state.executed_commission.as_ref(),
+    )?);
+    let weights = stages
+        .iter()
+        .map(|(stage, price, _)| Decimal::from(stage.quantity) * price.as_decimal().abs())
+        .collect::<Vec<_>>();
+    let commissions = allocate_operation_commission(commission, &weights)?;
+    let side = order_side_for_fill(state.direction)?;
+    let instrument_id = metadata.instrument_id.parse()?;
+    stages
+        .into_iter()
+        .zip(commissions)
+        .map(|((stage, price, ts_event), commission)| {
+            let report = FillReport::new(
+                account_id,
+                instrument_id,
+                venue_order_id.into(),
+                stage.trade_id.as_str().into(),
+                side,
+                lots_to_quantity(stage.quantity, metadata.lot)?,
+                price,
+                fill_report_commission(commission),
+                LiquiditySide::NoLiquiditySide,
+                client_order_id.and_then(nonempty_client_order_id),
+                None,
+                ts_event,
+                ts_init,
+                Some(UUID4::new()),
+            );
+            Ok(TbankFillReport::new(
+                report,
+                commission,
+                TbankFillCommissionSource::OrderStateQuery,
+            ))
+        })
+        .collect()
+}
+
 pub(super) fn fill_reports_from_order_state_stream(
     state: &order_state_stream_response::OrderState,
     venue_order_id: &str,
