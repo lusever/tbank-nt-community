@@ -30,10 +30,11 @@ pub const TBANK_SUBMIT_METHOD_PARAM: &str = "tbank_submit_method";
 impl TbankSubmitMethod {
     /// Sets this method without removing unrelated command parameters.
     pub fn apply(self, params: &mut nautilus_core::Params) {
-        params.insert(
-            TBANK_SUBMIT_METHOD_PARAM.into(),
-            serde_json::to_value(self).expect("enum serialization"),
-        );
+        TbankSubmitOptions {
+            method: Some(self),
+            ..TbankSubmitOptions::default()
+        }
+        .apply(params);
     }
 
     /// Decodes the command parameter, rejecting malformed or unknown values.
@@ -60,21 +61,31 @@ pub const TBANK_SUBMIT_DEADLINE_PARAM: &str = "tbank_submit_deadline_ns";
 impl TbankSubmitOptions {
     /// Encodes typed options without removing unrelated Params.
     pub fn apply(self, params: &mut nautilus_core::Params) {
+        if self == Self::default() {
+            return;
+        }
+        let mut values = params.to_shared_map();
         if let Some(method) = self.method {
-            method.apply(params);
+            values.insert(
+                TBANK_SUBMIT_METHOD_PARAM.into(),
+                serde_json::to_value(method)
+                    .expect("enum serialization")
+                    .into(),
+            );
         }
         if let Some(deadline) = self.deadline {
-            params.insert(
+            values.insert(
                 TBANK_SUBMIT_DEADLINE_PARAM.into(),
-                serde_json::json!(deadline.as_u64()),
+                serde_json::json!(deadline.as_u64()).into(),
             );
         }
         if let Some(confirm) = self.confirm_margin_trade {
-            params.insert(
+            values.insert(
                 crate::execution::TBANK_CONFIRM_MARGIN_TRADE_PARAM.into(),
-                serde_json::json!(confirm),
+                serde_json::json!(confirm).into(),
             );
         }
+        *params = nautilus_core::Params::from_shared(values);
     }
     /// Decodes options strictly. Unsupported and malformed values fail before RPC.
     pub fn from_params(params: Option<&nautilus_core::Params>) -> anyhow::Result<Self> {

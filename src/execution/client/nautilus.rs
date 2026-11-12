@@ -373,6 +373,22 @@ pub(super) fn position_report_matches_command(
         .is_none_or(|instrument_id| report.instrument_id == instrument_id)
 }
 
+fn deny_cancel(
+    emitter: &ExecutionEventEmitter,
+    cmd: &nautilus_common::messages::execution::CancelOrder,
+    reason: &str,
+) {
+    emitter.emit_order_cancel_denied_event(
+        cmd.strategy_id,
+        cmd.instrument_id,
+        cmd.client_order_id,
+        cmd.venue_order_id,
+        reason,
+        current_unix_nanos(),
+        Some(cmd.command_id),
+    );
+}
+
 pub(super) async fn submit_prepared_nautilus_order_list(
     client: &mut TbankExecutionRuntime,
     prepared: Vec<(PreparedNautilusOrder, ClientOrderId)>,
@@ -389,7 +405,11 @@ pub(super) async fn submit_prepared_nautilus_order_list(
                 emitter.emit_order_denied(&order, "order-list submit deadline leaves no dispatch window");
                 return;
             }
-            emitter.emit_order_submitted(&order);
+            if let Err(error) = emitter.try_emit_order_submitted(&order) {
+                client.remove_unresolved_broker_order_route(client_order_id.as_str());
+                tracing::error!(%error, %client_order_id, "could not publish T-Bank order submission");
+                return;
+            }
             if let Err(error) = submit_prepared_nautilus_order(&mut client, prepared, emitter, recovery_deadline).await {
                 tracing::error!(%error, %client_order_id, "failed to submit order-list leg to T-Bank");
             }
@@ -1027,7 +1047,11 @@ impl ExecutionClient for TbankExecutionClient {
                 crate::grpc::limiter::diagnostic_with_context(
                     0, "SubmitOrder", "preflight_finished", Some(client_order_id.as_str()), None,
                 );
-                emitter.emit_order_submitted(&order);
+                if let Err(error) = emitter.try_emit_order_submitted(&order) {
+                client.remove_unresolved_broker_order_route(client_order_id.as_str());
+                tracing::error!(%error, %client_order_id, "could not publish T-Bank order submission");
+                return;
+            }
                 if let Err(error) = submit_prepared_nautilus_order(
                     &mut client,
                     prepared,
@@ -1174,13 +1198,14 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         cmd: nautilus_common::messages::execution::ModifyOrder,
     ) -> anyhow::Result<()> {
-        self.runtime.emitter.emit_order_modify_rejected_event(
+        self.runtime.emitter.emit_order_modify_denied_event(
             cmd.strategy_id,
             cmd.instrument_id,
             cmd.client_order_id,
             cmd.venue_order_id,
             "T-Bank adapter does not support modify_order; cancel and submit a replacement",
             current_unix_nanos(),
+            Some(cmd.command_id),
         );
         Ok(())
     }
@@ -1189,7 +1214,10 @@ impl ExecutionClient for TbankExecutionClient {
         &self,
         cmd: nautilus_common::messages::execution::CancelOrder,
     ) -> anyhow::Result<()> {
-        self.runtime.ensure_lifecycle_active()?;
+        if let Err(error) = self.runtime.ensure_lifecycle_active() {
+            deny_cancel(&self.runtime.emitter, &cmd, &error.to_string());
+            return Err(error.into());
+        }
         if let Ok(order) = self.core.get_order(&cmd.client_order_id) {
             let order_type = nautilus_model::orders::Order::order_type(&order);
             if let Some(venue_order_id) = nautilus_model::orders::Order::venue_order_id(&order) {
@@ -1222,7 +1250,8 @@ impl ExecutionClient for TbankExecutionClient {
         let mut client = self.runtime.clone();
         let emitter = self.runtime.emitter.clone();
         let account_id = self.runtime.account_id();
-        self.task_owner
+        let admission_cmd = cmd.clone();
+        let result = self.task_owner
             .spawn_mutating_command_task(&self.runtime, "cancel_order", async move {
                 let client_order_id = cmd.client_order_id.to_string();
                 let venue_order_id = cmd.venue_order_id.map(|id| id.to_string());
@@ -1242,19 +1271,7 @@ impl ExecutionClient for TbankExecutionClient {
                             %client_order_id,
                             "failed to resolve T-Bank cancel target"
                         );
-                        if matches!(
-                            classify_command_failure(&command_error),
-                            CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
-                        ) {
-                            emitter.emit_order_cancel_rejected_event(
-                                cmd.strategy_id,
-                                cmd.instrument_id,
-                                cmd.client_order_id,
-                                cmd.venue_order_id,
-                                &command_error.to_string(),
-                                current_unix_nanos(),
-                            );
-                        }
+                        deny_cancel(&emitter, &cmd, &command_error.to_string());
                         return;
                     }
                 };
@@ -1292,14 +1309,7 @@ impl ExecutionClient for TbankExecutionClient {
                         {
                             Ok(Ok(Ok(identity))) => identity,
                             Ok(Ok(Err(reason))) => {
-                                emitter.emit_order_cancel_rejected_event(
-                                    cmd.strategy_id,
-                                    cmd.instrument_id,
-                                    cmd.client_order_id,
-                                    cmd.venue_order_id,
-                                    &reason,
-                                    current_unix_nanos(),
-                                );
+                                deny_cancel(&emitter, &cmd, &reason);
                                 return;
                             }
                             Ok(Err(_)) | Err(_) => {
@@ -1319,14 +1329,7 @@ impl ExecutionClient for TbankExecutionClient {
                                         %reason,
                                         "rejecting T-Bank cancel after its broker identity deadline"
                                     );
-                                    emitter.emit_order_cancel_rejected_event(
-                                        cmd.strategy_id,
-                                        cmd.instrument_id,
-                                        cmd.client_order_id,
-                                        cmd.venue_order_id,
-                                        reason,
-                                        current_unix_nanos(),
-                                    );
+                                    deny_cancel(&emitter, &cmd, reason);
                                     return;
                                 };
                                 identity
@@ -1343,67 +1346,77 @@ impl ExecutionClient for TbankExecutionClient {
                         %client_order_id,
                         "failed to cancel T-Bank order"
                     );
-                    if matches!(
-                        classify_command_failure(&error),
-                        CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
-                    ) {
-                        emitter.emit_order_cancel_rejected_event(
-                            cmd.strategy_id,
-                            cmd.instrument_id,
-                            cmd.client_order_id,
-                            cmd.venue_order_id,
-                            &error.to_string(),
-                            current_unix_nanos(),
-                        );
-                    } else {
-                        match client.recover_ambiguous_cancel(identity.clone()).await {
-                            Ok(TbankCancelRecoveryOutcome::Canceled) => {
-                                if identity.route == TbankBrokerOrderRoute::RegularOrder {
-                                    // Reconciliation already published both authoritative state and fills.
-                                    return;
-                                }
-                                let ts_event = current_unix_nanos();
-                                client.lifecycle_active.run_if_active(|| {
-                                    emitter.send_order_event(OrderEventAny::Canceled(
-                                        OrderCanceled::new(
-                                            cmd.trader_id,
-                                            cmd.strategy_id,
-                                            cmd.instrument_id,
-                                            cmd.client_order_id,
-                                            UUID4::new(),
-                                            ts_event,
-                                            ts_event,
-                                            true,
-                                            cmd.venue_order_id,
-                                            Some(account_id),
-                                            None,
-                                        ),
-                                    ));
-                                });
+                    match classify_command_failure(&error) {
+                        CommandFailure::NotSent(reason) => {
+                            deny_cancel(&emitter, &cmd, &reason);
+                            return;
+                        }
+                        CommandFailure::VenueRejected(reason) => {
+                            emitter.emit_order_cancel_rejected_event(
+                                cmd.strategy_id,
+                                cmd.instrument_id,
+                                cmd.client_order_id,
+                                cmd.venue_order_id,
+                                &reason,
+                                current_unix_nanos(),
+                                Some(cmd.command_id),
+                            );
+                            return;
+                        }
+                        CommandFailure::Ambiguous(_) => {}
+                    }
+                    match client.recover_ambiguous_cancel(identity.clone()).await {
+                        Ok(TbankCancelRecoveryOutcome::Canceled) => {
+                            if identity.route == TbankBrokerOrderRoute::RegularOrder {
+                                // Reconciliation already published both authoritative state and fills.
+                                return;
                             }
-                            Ok(TbankCancelRecoveryOutcome::Active) => {
-                                client.lifecycle_active.run_if_active(|| {
-                                    emitter.emit_order_cancel_rejected_event(
+                            let ts_event = current_unix_nanos();
+                            client.lifecycle_active.run_if_active(|| {
+                                let mut event = OrderCanceled::new(
+                                        cmd.trader_id,
                                         cmd.strategy_id,
                                         cmd.instrument_id,
                                         cmd.client_order_id,
+                                        UUID4::new(),
+                                        ts_event,
+                                        ts_event,
+                                        true,
                                         cmd.venue_order_id,
-                                        "broker reconciliation confirmed the order was not cancelled",
-                                        current_unix_nanos(),
-                                    );
-                                });
-                            }
-                            Err(recovery_error) => {
-                                tracing::warn!(
-                                    %recovery_error,
-                                    %client_order_id,
-                                    "T-Bank cancel outcome recovery remained unresolved"
+                                        Some(account_id),
+                                        None,
                                 );
-                            }
+                                event.causation_id = Some(cmd.command_id);
+                                emitter.send_order_event(OrderEventAny::Canceled(event));
+                            });
+                        }
+                        Ok(TbankCancelRecoveryOutcome::Active) => {
+                            client.lifecycle_active.run_if_active(|| {
+                                emitter.emit_order_cancel_rejected_event(
+                                    cmd.strategy_id,
+                                    cmd.instrument_id,
+                                    cmd.client_order_id,
+                                    cmd.venue_order_id,
+                                    "broker reconciliation confirmed the order was not cancelled",
+                                    current_unix_nanos(),
+                                    Some(cmd.command_id),
+                                );
+                            });
+                        }
+                        Err(recovery_error) => {
+                            tracing::warn!(
+                                %recovery_error,
+                                %client_order_id,
+                                "T-Bank cancel outcome recovery remained unresolved"
+                            );
                         }
                     }
                 }
-            })?;
+            });
+        if let Err(error) = result {
+            deny_cancel(&self.runtime.emitter, &admission_cmd, &error.to_string());
+            return Err(error.into());
+        }
         Ok(())
     }
 

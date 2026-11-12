@@ -132,11 +132,9 @@ fn both_sources_with_identical_timestamps_survive_a_fresh_process() -> anyhow::R
                 snapshot(TbankBookSource::Dealer, seq),
             ]
         })
+        .map(Data::Custom)
         .collect::<Vec<_>>();
-    for group in nautilus_persistence::common::custom::group_custom_data_by_type(rows.iter()) {
-        let batch = group.into_iter().cloned().collect::<Vec<_>>();
-        catalog.write_custom_data_batch(&batch, None, None, Some(false))?;
-    }
+    catalog.write_data_enum(&rows, None, None, Some(false))?;
     verify(&path)?;
     let status = Command::new(std::env::current_exe()?)
         .args(["--exact", "catalog_fresh_process_reader", "--nocapture"])

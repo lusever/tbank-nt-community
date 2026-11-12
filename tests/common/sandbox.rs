@@ -812,6 +812,7 @@ fn execution_event_kind(event: &ExecutionEvent) -> &'static str {
         ExecutionEvent::Report(ExecutionReport::Position(_)) => "position_report",
         ExecutionEvent::Report(ExecutionReport::MassStatus(_)) => "mass_status_report",
         ExecutionEvent::Account(_) => "account",
+        ExecutionEvent::Data(_) => "data",
     }
 }
 

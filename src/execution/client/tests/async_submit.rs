@@ -29,6 +29,51 @@ async fn async_submit_client(service: MockOrdersService) -> super::TbankExecutio
         .unwrap();
     client
 }
+#[tokio::test]
+async fn closed_execution_channel_prevents_single_and_list_broker_submits() {
+    let service = MockOrdersService::default();
+    let sync_calls = service.calls.clone();
+    let async_calls = service.async_calls.clone();
+    let mut client = async_submit_client(service).await;
+    client.runtime.instruments.lock().unwrap()
+        .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(receiver);
+    client.runtime.emitter.set_sender(sender);
+
+    let single = submit_order_cmd(None);
+    let first = single.order_init.clone();
+    let mut second = first.clone();
+    second.client_order_id = ClientOrderId::from("order-list-second");
+    let ids = [first.client_order_id, second.client_order_id];
+    nautilus_common::clients::ExecutionClient::submit_order(&client, single).unwrap();
+    wait_for_closed_channel_submit_tasks(&client).await;
+
+    nautilus_common::clients::ExecutionClient::submit_order_list(
+        &client,
+        submit_order_list_cmd(vec![first, second]),
+    ).unwrap();
+    wait_for_closed_channel_submit_tasks(&client).await;
+
+    assert!(sync_calls.lock().unwrap().is_empty());
+    assert!(async_calls.lock().unwrap().is_empty());
+    assert!(client.unresolved_submits().is_empty());
+    let index = client.runtime.broker_order_index.lock().unwrap();
+    for id in ids {
+        assert!(index.route_for_client_order_id(id.as_str()).is_none());
+    }
+}
+
+async fn wait_for_closed_channel_submit_tasks(client: &TbankExecutionClient) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !client.task_owner.operation_tasks.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("submission task did not finish");
+}
+
 fn async_order(id: &str) -> TbankSubmitOrder {
     let mut order = pending_submit_order(id);
     order.submit_method = crate::execution::TbankSubmitMethod::PostOrderAsync;
@@ -254,17 +299,15 @@ async fn quota_expiry_is_not_sent_and_does_not_leave_an_unknown_order() {
 #[test]
 fn typed_submit_options_reject_malformed_values_and_expired_deadlines() {
     use crate::execution::{TBANK_SUBMIT_METHOD_PARAM, TbankSubmitMethod, TbankSubmitOptions};
-    let mut params = Params::new();
     for value in [
         serde_json::json!(false),
         serde_json::json!("automatic"),
         serde_json::json!(null),
     ] {
-        params.insert(TBANK_SUBMIT_METHOD_PARAM.into(), value);
+        let params = Params::new([(TBANK_SUBMIT_METHOD_PARAM.into(), value)].into());
         assert!(TbankSubmitOptions::from_params(Some(&params)).is_err());
     }
-    params = Params::new();
-    params.insert("consumer".into(), serde_json::json!("preserved"));
+    let mut params = Params::new([("consumer".into(), serde_json::json!("preserved"))].into());
     TbankSubmitOptions {
         method: Some(TbankSubmitMethod::PostOrderAsync),
         deadline: Some(UnixNanos::from(1)),
@@ -280,7 +323,7 @@ fn typed_submit_options_reject_malformed_values_and_expired_deadlines() {
 #[test]
 fn typed_submit_options_preserve_implicit_method_selection() {
     use crate::execution::{TBANK_SUBMIT_METHOD_PARAM, TbankSubmitOptions};
-    let mut params = Params::new();
+    let mut params = Params::empty();
     TbankSubmitOptions {
         method: None,
         deadline: Some(UnixNanos::from(10)),

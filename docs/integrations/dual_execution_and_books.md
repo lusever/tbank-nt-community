@@ -1,7 +1,7 @@
 # Explicit execution methods and independent book sources
 
 The contracts are pinned to Invest API Release_1.51 (`798f880d8010ef4fffe74d0f63d7e5a0d57f23f7`)
-and NautilusTrader rc7 (`55c0e82053142bce3a5cba4de4221d3929c2d3bc`).
+and NautilusTrader rc9 (`da6b57aefdd62b44f675e434ffcfefca7f4025dd`).
 No protobuf update or separate execution engine is required.
 
 ## Submitting a command
@@ -109,20 +109,18 @@ Every writer and fresh reader process must call `register_tbank_custom_data()`. 
 codecs are registered process-locally. Preserve the full DataType produced by
 `TbankBookSubscription::data_type()` when wrapping or persisting a snapshot.
 
-On rc7, group custom records by **full DataType**, then write each group:
+On rc9, pass the mixed batch to the catalog. Keep each snapshot's full DataType and
+`instrument--source--depth` identifier so sources with overlapping timestamps write separate files.
 
 ```rust,ignore
-use nautilus_persistence::common::custom::group_custom_data_by_type;
-for group in group_custom_data_by_type(custom_records.iter()) {
-    let batch = group.into_iter().cloned().collect::<Vec<_>>();
-    catalog.write_custom_data_batch(&batch, None, None, Some(false))?;
-}
+use nautilus_model::data::Data;
+
+let batch: Vec<Data> = custom_records.into_iter().map(Data::Custom).collect();
+catalog.write_data_enum(&batch, None, None, Some(false))?;
 ```
 
-A mixed `write_data_enum` batch is not supported by this contract. Source only in metadata with a
-shared identifier is also insufficient: overlapping timestamps can collide in catalog filenames.
-The identifiers above separate those files. File locations, recording windows and recorder
-ownership remain in the consumer (`nt-otc`).
+The same identifiers and payload schema are used for rc7 recordings. The consumer
+(`nt-otc`) groups and sorts indexed recording parts to preserve row references.
 
 Reproduce without credentials, using a new empty catalog directory:
 

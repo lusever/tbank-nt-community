@@ -2,11 +2,10 @@ use super::TbankCommandError;
 
 #[test]
 fn confirm_margin_trade_param_overrides_global_default() {
-    let mut params = Params::new();
-    params.insert(TBANK_CONFIRM_MARGIN_TRADE_PARAM.to_string(), json!(false));
+    let params = Params::new([(TBANK_CONFIRM_MARGIN_TRADE_PARAM.to_string(), json!(false))].into());
     assert!(!confirm_margin_trade_for_submit(true, Some(&params)));
 
-    params.insert(TBANK_CONFIRM_MARGIN_TRADE_PARAM.to_string(), json!(true));
+    let params = Params::new([(TBANK_CONFIRM_MARGIN_TRADE_PARAM.to_string(), json!(true))].into());
     assert!(confirm_margin_trade_for_submit(false, Some(&params)));
 
     assert!(confirm_margin_trade_for_submit(true, None));
@@ -1057,7 +1056,7 @@ async fn explicit_broker_submit_rejection_emits_upstream_rejected_event() {
         Some(ExecutionEvent::Order(OrderEventAny::Submitted(_)))
     ));
     let mut rejected_order_id = None;
-    let mut cancel_rejection_reason = None;
+    let mut cancel_denial_reason = None;
     for _ in 0..2 {
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
             .await
@@ -1068,15 +1067,15 @@ async fn explicit_broker_submit_rejection_emits_upstream_rejected_event() {
                 assert!(event.reason.as_str().contains("not enough buying power"));
                 rejected_order_id = Some(event.client_order_id);
             }
-            ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
-                cancel_rejection_reason = Some(event.reason.to_string());
+            ExecutionEvent::Order(OrderEventAny::CancelDenied(event)) => {
+                cancel_denial_reason = Some(event.reason.to_string());
             }
             event => panic!("unexpected event after rejected submit: {event:?}"),
         }
     }
     let rejected_order_id = rejected_order_id.expect("submit rejection event was not emitted");
-    assert!(cancel_rejection_reason
-        .expect("pending cancel was not rejected with its submit")
+    assert!(cancel_denial_reason
+        .expect("pending cancel was not denied after submit rejection")
         .contains("submission was rejected"));
     assert_eq!(
         client
@@ -1212,7 +1211,7 @@ async fn successful_submit_emits_submitted_then_accepted_report() {
 }
 
 #[test]
-fn unsupported_modify_emits_upstream_modify_rejected_event() {
+fn unsupported_modify_emits_correlated_modify_denied_event() {
     let mut client = test_client(TbankExecutionClientConfig {
         account_id: Some("account-1".to_string()),
         ..TbankExecutionClientConfig::default()
@@ -1235,13 +1234,15 @@ fn unsupported_modify_emits_upstream_modify_rejected_event() {
         None,
     );
 
+    let command_id = cmd.command_id;
     <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::modify_order(&client, cmd)
         .unwrap();
 
     let event = receiver.try_recv().unwrap();
-    let ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)) = event else {
-        panic!("expected OrderModifyRejected");
+    let ExecutionEvent::Order(OrderEventAny::ModifyDenied(event)) = event else {
+        panic!("expected OrderModifyDenied");
     };
+    assert_eq!(event.causation_id, Some(command_id));
     assert!(
         event
             .reason
@@ -1293,6 +1294,7 @@ async fn cancel_event_for_broker_error(code: Code) -> Option<ExecutionEvent> {
         None,
         None,
     );
+    let original_cmd = cmd.clone();
     <TbankExecutionClient as nautilus_common::clients::ExecutionClient>::cancel_order(&client, cmd)
         .unwrap();
 
@@ -1303,10 +1305,52 @@ async fn cancel_event_for_broker_error(code: Code) -> Option<ExecutionEvent> {
     })
     .await
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+    let event = tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
         .await
         .ok()
-        .flatten()
+        .flatten();
+    if let Some(ExecutionEvent::Order(OrderEventAny::CancelRejected(rejected))) = &event {
+        use nautilus_model::{
+            events::{OrderPendingCancel, OrderSubmitted},
+            orders::{Order, OrderAny},
+        };
+
+        assert_eq!(rejected.causation_id, Some(original_cmd.command_id));
+        let account_id = client.runtime.account_id();
+        let mut init = submit_order_cmd(None).order_init;
+        init.client_order_id = original_cmd.client_order_id;
+        init.strategy_id = original_cmd.strategy_id;
+        let mut order: OrderAny = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(OrderSubmitted::new(
+            original_cmd.trader_id,
+            original_cmd.strategy_id,
+            original_cmd.instrument_id,
+            original_cmd.client_order_id,
+            account_id,
+            UUID4::new(),
+            original_cmd.ts_init,
+            original_cmd.ts_init,
+        ))).unwrap();
+        for command_id in [original_cmd.command_id, UUID4::new()] {
+            let mut pending = OrderPendingCancel::new(
+                original_cmd.trader_id,
+                original_cmd.strategy_id,
+                original_cmd.instrument_id,
+                original_cmd.client_order_id,
+                Some(account_id),
+                UUID4::new(),
+                original_cmd.ts_init,
+                original_cmd.ts_init,
+                false,
+                original_cmd.venue_order_id,
+            );
+            pending.causation_id = Some(command_id);
+            order.apply(OrderEventAny::PendingCancel(pending)).unwrap();
+        }
+        order.apply(OrderEventAny::CancelRejected(rejected.clone())).unwrap();
+        assert_eq!(order.status(), OrderStatus::PendingCancel);
+    }
+    event
 }
 
 #[tokio::test]
@@ -1458,7 +1502,7 @@ async fn pending_cancel_without_broker_identity_is_rejected_and_releases_operati
         .expect("pending cancel emitted no outcome");
     assert!(matches!(
         event,
-        ExecutionEvent::Order(OrderEventAny::CancelRejected(event))
+        ExecutionEvent::Order(OrderEventAny::CancelDenied(event))
             if event.reason.as_str().contains("broker order identity remained unresolved")
     ));
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1481,7 +1525,7 @@ async fn pending_cancel_without_broker_identity_is_rejected_and_releases_operati
 }
 
 #[tokio::test]
-async fn unresolved_broker_identity_emits_cancel_rejected() {
+async fn unresolved_broker_identity_emits_cancel_denied() {
     let mut client = test_client(TbankExecutionClientConfig::default());
     activate_test_lifecycle(&client);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1505,10 +1549,10 @@ async fn unresolved_broker_identity_emits_cancel_rejected() {
     let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
         .await
         .unwrap()
-        .expect("expected cancel rejection event");
+        .expect("expected cancel denial event");
     assert!(matches!(
         event,
-        ExecutionEvent::Order(OrderEventAny::CancelRejected(_))
+        ExecutionEvent::Order(OrderEventAny::CancelDenied(_))
     ));
 }
 

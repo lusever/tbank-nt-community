@@ -5230,7 +5230,9 @@ impl TbankExecutionRuntime {
             })?;
         if let Some(sender) = self.current_data_event_sender() {
             sender
-                .send(DataEvent::Instrument(instrument))
+                .send(DataEvent::Data(nautilus_model::data::Data::from(
+                    instrument,
+                )))
                 .map_err(|error| {
                     TbankAdapterError::ConversionError(format!(
                         "failed to publish current futures instrument definition: {error}"

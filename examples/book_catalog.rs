@@ -1,9 +1,7 @@
 //! Reproduce source-separated recording and fresh-process reading without a broker connection.
 use nautilus_core::UnixNanos;
 use nautilus_model::{data::Data, identifiers::InstrumentId};
-use nautilus_persistence::{
-    backend::parquet::catalog::ParquetDataCatalog, common::custom::group_custom_data_by_type,
-};
+use nautilus_persistence::backend::parquet::catalog::ParquetDataCatalog;
 use std::path::Path;
 use tbank_nt_community::{
     TbankBookSource, TbankBookSubscription, TbankOrderBookSnapshot,
@@ -12,6 +10,24 @@ use tbank_nt_community::{
 fn key(source: TbankBookSource) -> TbankBookSubscription {
     TbankBookSubscription::new(InstrumentId::from("SBER_TQBR.MOEX"), source, 10).unwrap()
 }
+fn snapshot(source: TbankBookSource, n: u64) -> nautilus_model::data::CustomData {
+    TbankOrderBookSnapshot {
+        instrument_id: key(source).instrument_id,
+        source,
+        depth: 10,
+        is_consistent: true,
+        bids: vec![TbankOrderBookLevel {
+            price: rust_decimal::Decimal::new(123456789123, 9),
+            quantity_lots: n as i64,
+        }],
+        asks: vec![],
+        broker_timestamp: UnixNanos::from(n * 100),
+        ts_event: UnixNanos::from(n * 100),
+        ts_init: UnixNanos::from(n * 100 + 10),
+    }
+    .into_custom_data()
+}
+
 fn main() -> anyhow::Result<()> {
     register_tbank_custom_data();
     let args = std::env::args().collect::<Vec<_>>();
@@ -27,29 +43,10 @@ fn main() -> anyhow::Result<()> {
         let mut batch = Vec::new();
         for source in [TbankBookSource::Exchange, TbankBookSource::Dealer] {
             for n in 1..=3_u64 {
-                batch.push(
-                    TbankOrderBookSnapshot {
-                        instrument_id: key(source).instrument_id,
-                        source,
-                        depth: 10,
-                        is_consistent: true,
-                        bids: vec![TbankOrderBookLevel {
-                            price: rust_decimal::Decimal::new(123456789123, 9),
-                            quantity_lots: n as i64,
-                        }],
-                        asks: vec![],
-                        broker_timestamp: UnixNanos::from(n * 100),
-                        ts_event: UnixNanos::from(n * 100),
-                        ts_init: UnixNanos::from(n * 100 + 10),
-                    }
-                    .into_custom_data(),
-                );
+                batch.push(Data::Custom(snapshot(source, n)));
             }
         }
-        for group in group_custom_data_by_type(batch.iter()) {
-            let rows = group.into_iter().cloned().collect::<Vec<_>>();
-            catalog.write_custom_data_batch(&rows, None, None, Some(false))?;
-        }
+        catalog.write_data_enum(&batch, None, None, Some(false))?;
         println!("wrote 3 exchange + 3 dealer snapshots");
     } else {
         anyhow::ensure!(args[1] == "read", "expected write or read");
@@ -67,20 +64,10 @@ fn main() -> anyhow::Result<()> {
                 true,
             )?;
             anyhow::ensure!(rows.len() == 3, "lost records for {source:?}");
-            for row in &rows {
-                let Data::Custom(c) = row else {
-                    anyhow::bail!("non-custom record")
-                };
-                anyhow::ensure!(c.data_type == dt, "routing changed");
-                let book = c
-                    .data
-                    .as_any()
-                    .downcast_ref::<TbankOrderBookSnapshot>()
-                    .unwrap();
+            for (i, row) in rows.iter().enumerate() {
                 anyhow::ensure!(
-                    book.source == source
-                        && book.bids[0].price == rust_decimal::Decimal::new(123456789123, 9),
-                    "payload changed"
+                    *row == Data::Custom(snapshot(source, i as u64 + 1)),
+                    "payload or routing changed for {source:?} at row {i}"
                 );
             }
             println!("{} records={} source={source:?}", ids[0], rows.len());

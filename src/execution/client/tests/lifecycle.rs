@@ -2144,7 +2144,7 @@ async fn worker_futures_margin_refresh_publishes_instrument_to_runner() {
     let metadata = refresh.await.unwrap().unwrap();
 
     let event = receiver.try_recv().expect("worker must publish updated instrument");
-    let nautilus_common::messages::DataEvent::Instrument(instrument) = event else {
+    let nautilus_common::messages::DataEvent::Data(nautilus_model::data::Data::Instrument(instrument)) = event else {
         panic!("expected instrument update, got {event:?}");
     };
     assert_eq!(instrument.id().to_string(), metadata.instrument_id);

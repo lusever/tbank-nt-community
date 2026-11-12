@@ -278,7 +278,10 @@ impl TbankInstrumentMetadata {
         })
     }
 
-    fn insert_trading_flags(info: &mut Params, metadata: &Self) {
+    fn insert_trading_flags(
+        info: &mut indexmap::IndexMap<String, serde_json::Value>,
+        metadata: &Self,
+    ) {
         info.insert(
             "api_trade_available".to_string(),
             metadata.api_trade_available.into(),
@@ -696,7 +699,7 @@ pub fn build_equity_instrument(
     let timestamp = get_atomic_clock_realtime().get_time_ns();
     let instrument_id = metadata.instrument_id.parse::<InstrumentId>()?;
     let price_increment = metadata.min_price_increment.normalize().to_string();
-    let mut info = Params::new();
+    let mut info = indexmap::IndexMap::new();
     info.insert(
         "instrument_uid".to_string(),
         metadata.instrument_uid.clone().into(),
@@ -725,7 +728,7 @@ pub fn build_equity_instrument(
         Some(Decimal::ZERO),
         Some(Decimal::ZERO),
         None,
-        Some(info),
+        Some(Params::new(info)),
         timestamp,
         timestamp,
     )?))
@@ -752,7 +755,7 @@ pub fn build_futures_instrument(
             metadata.instrument_id
         )
     })?;
-    let mut info = Params::new();
+    let mut info = indexmap::IndexMap::new();
     info.insert(
         "instrument_uid".to_string(),
         metadata.instrument_uid.clone().into(),
@@ -830,7 +833,7 @@ pub fn build_futures_instrument(
             Some(margin_rate),
             Some(margin_rate),
             None,
-            Some(info),
+            Some(Params::new(info)),
             timestamp,
             timestamp,
         )?,
@@ -862,7 +865,7 @@ pub fn build_index_instrument(
     let price_precision = u8::try_from(price_increment.scale())?;
     let timestamp = get_atomic_clock_realtime().get_time_ns();
     let instrument_id = instrument_id.parse::<InstrumentId>()?;
-    let mut info = Params::new();
+    let mut info = indexmap::IndexMap::new();
     info.insert("instrument_uid".to_string(), indicative.uid.clone().into());
     info.insert("figi".to_string(), indicative.figi.clone().into());
     info.insert(
@@ -882,7 +885,7 @@ pub fn build_index_instrument(
             Price::from_decimal_dp(price_increment, price_precision)?,
             Quantity::from("1"),
             None,
-            Some(info),
+            Some(Params::new(info)),
             timestamp,
             timestamp,
         )?,
@@ -1463,12 +1466,12 @@ mod tests {
 
     #[test]
     fn cached_instrument_requires_current_trading_metadata() {
-        let mut info = Params::new();
+        let mut info = indexmap::IndexMap::new();
         info.insert("required_tests".to_string(), "".into());
         info.insert("api_trade_available".to_string(), true.into());
         info.insert("sell_available".to_string(), true.into());
 
-        assert!(TbankInstrumentMetadata::trading_flags_from_info(&info).is_none());
+        assert!(TbankInstrumentMetadata::trading_flags_from_info(&Params::new(info)).is_none());
     }
 
     #[test]

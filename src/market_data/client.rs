@@ -979,7 +979,9 @@ fn publish_instrument_definitions(
 ) -> Result<()> {
     for instrument in instruments {
         sender
-            .send(DataEvent::Instrument(instrument))
+            .send(DataEvent::Data(nautilus_model::data::Data::from(
+                instrument,
+            )))
             .map_err(|error| TbankAdapterError::DataEventPublicationFailed(error.to_string()))?;
     }
     Ok(())
@@ -5704,6 +5706,8 @@ fn nautilus_order_book_depth_from_orderbook(
     )
 }
 
+#[cfg(test)]
+mod history_tests;
 mod nautilus;
 
 #[cfg(test)]
@@ -6218,7 +6222,7 @@ mod tests {
         assert!(instrument_metadata.read().unwrap()["new-uid"].preserve_instrument_id);
         assert!(matches!(
             current_receiver.try_recv(),
-            Ok(DataEvent::Instrument(_))
+            Ok(DataEvent::Data(Data::Instrument(_)))
         ));
     }
 
@@ -6730,7 +6734,7 @@ mod tests {
     }
 
     #[test]
-    fn nautilus_trade_command_updates_restore_subscription_registry() {
+    fn failed_nautilus_trade_subscription_does_not_enter_restore_registry() {
         use nautilus_common::{clients::DataClient, messages::data::SubscribeTrades};
         use nautilus_core::{UUID4, UnixNanos};
 
@@ -6746,15 +6750,76 @@ mod tests {
         );
 
         assert!(DataClient::subscribe_trades(&mut client, command).is_err());
+        assert!(client.restore_subscription_requests().is_empty());
+    }
+
+    fn subscription_test_client() -> (
+        TbankDataClient,
+        tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        nautilus_common::live::runner::replace_data_event_sender(sender);
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let credentials = Arc::new(SecretString::from("test-token"));
+        let interceptor = TbankAuthInterceptor::new(credentials.clone()).unwrap();
+        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        client.connection = Some(TbankDataConnection::Live(TbankGrpcClients::new(
+            channel,
+            interceptor,
+        )));
+        client.active_credentials = Some(credentials);
+        client.start_snapshot_task_reaper().unwrap();
+        (client, receiver)
+    }
+
+    #[tokio::test]
+    async fn nautilus_bar_batch_reports_accepted_members_and_unsubscribes_by_full_type() {
+        use nautilus_common::messages::data::SubscriptionError;
+        use nautilus_core::UUID4;
+
+        let (mut client, _events) = subscription_test_client();
+        let other = BarType::new(
+            InstrumentId::from("GAZP_TQBR.MOEX"),
+            sber_bar_type().spec(),
+            AggregationSource::External,
+        );
+        let command = SubscribeBars::new(
+            [sber_bar_type(), sber_hour_bar_type(), other].as_slice(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        let error = DataClient::subscribe_bars(&mut client, command)
+            .unwrap_err()
+            .downcast::<SubscriptionError>()
+            .unwrap();
+        assert_eq!(error.bar_types_accepted, [sber_bar_type(), other]);
+        let unsubscribe = UnsubscribeBars::new(
+            [sber_hour_bar_type(), other].as_slice(),
+            Some(*TBANK_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        DataClient::unsubscribe_bars(&mut client, &unsubscribe).unwrap();
+        assert_eq!(
+            client.bar_subscriptions,
+            HashMap::from([(sber_id(), sber_bar_type())])
+        );
         assert_eq!(client.restore_subscription_requests().len(), 1);
     }
 
-    #[test]
-    fn nautilus_restore_and_unsubscribe_use_the_current_route_for_stable_identity() {
+    #[tokio::test]
+    async fn nautilus_restore_and_unsubscribe_use_the_current_route_for_stable_identity() {
         use nautilus_common::{clients::DataClient, messages::data::UnsubscribeTrades};
         use nautilus_core::{UUID4, UnixNanos};
 
-        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let (mut client, _events) = subscription_test_client();
         let subscribe = SubscribeTrades::new(
             sber_id(),
             Some(*TBANK_CLIENT_ID),
@@ -6765,7 +6830,7 @@ mod tests {
             None,
         );
 
-        assert!(DataClient::subscribe_trades(&mut client, subscribe).is_err());
+        DataClient::subscribe_trades(&mut client, subscribe).unwrap();
         let fallback_requests = client.restore_subscription_requests();
         let Some(market_data_request::Payload::SubscribeTradesRequest(request)) =
             &fallback_requests[0].payload
@@ -6802,11 +6867,11 @@ mod tests {
         assert!(client.restore_subscription_requests().is_empty());
     }
 
-    #[test]
-    fn nautilus_quote_restore_uses_the_depth_one_order_book_stream() {
+    #[tokio::test]
+    async fn nautilus_quote_restore_uses_the_depth_one_order_book_stream() {
         use nautilus_core::UUID4;
 
-        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let (mut client, _events) = subscription_test_client();
         let command = SubscribeQuotes::new(
             sber_id(),
             Some(*TBANK_CLIENT_ID),
@@ -6817,7 +6882,7 @@ mod tests {
             None,
         );
 
-        assert!(DataClient::subscribe_quotes(&mut client, command).is_err());
+        DataClient::subscribe_quotes(&mut client, command).unwrap();
         let requests = client.restore_subscription_requests();
         let Some(market_data_request::Payload::SubscribeOrderBookRequest(request)) =
             &requests[0].payload
@@ -6827,14 +6892,14 @@ mod tests {
         assert_eq!(request.instruments[0].depth, 1);
     }
 
-    #[test]
-    fn nautilus_depth_restore_replaces_and_removes_all_previous_depths() {
+    #[tokio::test]
+    async fn nautilus_depth_restore_replaces_and_removes_all_previous_depths() {
         use std::num::NonZeroUsize;
 
         use nautilus_core::UUID4;
 
-        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
-        for depth in [5, 10] {
+        let (mut client, _events) = subscription_test_client();
+        for depth in [20, 10] {
             let command = SubscribeBookDepth::new(
                 sber_id(),
                 BookType::L2_MBP,
@@ -6847,7 +6912,7 @@ mod tests {
                 None,
                 None,
             );
-            assert!(DataClient::subscribe_book_depth(&mut client, command).is_err());
+            DataClient::subscribe_book_depth(&mut client, command).unwrap();
         }
 
         let requests = client.restore_subscription_requests();
@@ -6873,14 +6938,14 @@ mod tests {
         assert!(client.restore_subscription_requests().is_empty());
     }
 
-    #[test]
-    fn nautilus_depth_accepts_only_tbank_supported_depths() {
+    #[tokio::test]
+    async fn nautilus_depth_accepts_only_tbank_supported_depths() {
         use std::num::NonZeroUsize;
 
         use nautilus_core::UUID4;
 
         for requested_depth in [1, 10, 20, 30, 40, 50] {
-            let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+            let (mut client, _events) = subscription_test_client();
             let command = SubscribeBookDepth::new(
                 sber_id(),
                 BookType::L2_MBP,
@@ -6893,7 +6958,7 @@ mod tests {
                 None,
                 None,
             );
-            assert!(DataClient::subscribe_book_depth(&mut client, command).is_err());
+            DataClient::subscribe_book_depth(&mut client, command).unwrap();
             let requests = client.restore_subscription_requests();
             assert_eq!(requests.len(), 1, "depth {requested_depth}");
             let Some(market_data_request::Payload::SubscribeOrderBookRequest(request)) =
@@ -6928,13 +6993,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn nautilus_quote_and_depth_one_share_restore_stream_until_both_unsubscribe() {
+    #[tokio::test]
+    async fn nautilus_quote_and_depth_one_share_restore_stream_until_both_unsubscribe() {
         use std::num::NonZeroUsize;
 
         use nautilus_core::UUID4;
 
-        let mut client = TbankDataClient::new(TbankDataClientConfig::default());
+        let (mut client, _events) = subscription_test_client();
         let quote = SubscribeQuotes::new(
             sber_id(),
             Some(*TBANK_CLIENT_ID),
@@ -6944,7 +7009,7 @@ mod tests {
             None,
             None,
         );
-        assert!(DataClient::subscribe_quotes(&mut client, quote).is_err());
+        DataClient::subscribe_quotes(&mut client, quote).unwrap();
         let depth = SubscribeBookDepth::new(
             sber_id(),
             BookType::L2_MBP,
@@ -6957,7 +7022,7 @@ mod tests {
             None,
             None,
         );
-        assert!(DataClient::subscribe_book_depth(&mut client, depth).is_err());
+        DataClient::subscribe_book_depth(&mut client, depth).unwrap();
         assert_eq!(client.restore_subscription_requests().len(), 1);
 
         let quote = UnsubscribeQuotes::new(

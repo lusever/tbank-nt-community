@@ -66,7 +66,7 @@ impl TbankBookSubscription {
     }
     /// Full routing metadata and collision-free catalog identifier.
     pub fn data_type(self) -> DataType {
-        let mut metadata = Params::new();
+        let mut metadata = indexmap::IndexMap::new();
         metadata.insert(
             "instrument_id".into(),
             serde_json::json!(self.instrument_id.to_string()),
@@ -75,7 +75,7 @@ impl TbankBookSubscription {
         metadata.insert("depth".into(), serde_json::json!(self.depth));
         DataType::new(
             "TbankOrderBookSnapshot",
-            Some(metadata),
+            Some(Params::new(metadata)),
             Some(format!(
                 "{}--{}--{}",
                 self.instrument_id,

@@ -1,4 +1,5 @@
 use super::*;
+use nautilus_common::clients::{execute_bar_subscriptions, execute_instrument_subscriptions};
 
 fn request_timestamp_to_datetime(
     timestamp: jiff::Timestamp,
@@ -113,91 +114,123 @@ impl DataClient for TbankDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        self.quote_subscriptions.insert(cmd.instrument_id);
-        // Nautilus quotes are projected from the exchange order book at depth one, so the restore
-        // snapshot is keyed by the stable instrument identity and resolves its broker route when
-        // the request is rebuilt.
-        self.sync_nautilus_order_book_registry(cmd.instrument_id);
-        self.schedule_quote_stream()
+        execute_instrument_subscriptions(&cmd.instrument_ids, |id| {
+            if self.quote_subscriptions.insert(id) {
+                if let Err(error) = self.schedule_quote_stream() {
+                    self.quote_subscriptions.remove(&id);
+                    return Err(error);
+                }
+                self.sync_nautilus_order_book_registry(id);
+            }
+            Ok(())
+        })
     }
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
-        let stream_id = self.stream_id(cmd.instrument_id);
-        self.trade_subscriptions.insert(cmd.instrument_id);
-        self.subscriptions
-            .subscribe_trades_for_instrument(cmd.instrument_id, stream_id);
-        self.schedule_trade_stream(cmd.instrument_id)
+        execute_instrument_subscriptions(&cmd.instrument_ids, |id| {
+            if !self.trade_subscriptions.contains(&id) {
+                self.schedule_trade_stream(id)?;
+                self.trade_subscriptions.insert(id);
+                self.subscriptions
+                    .subscribe_trades_for_instrument(id, self.stream_id(id));
+            }
+            Ok(())
+        })
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
-        let spec = cmd.bar_type.spec();
-        if spec.aggregation != BarAggregation::Minute || spec.step.get() != 1 {
-            anyhow::bail!("T-Bank data client supports only 1-minute bars in v1");
-        }
-        let stream_id = self.stream_id(cmd.bar_type.instrument_id());
-        self.subscriptions
-            .subscribe_bars_1m_for_instrument(cmd.bar_type.instrument_id(), stream_id);
-        self.bar_subscriptions
-            .insert(cmd.bar_type.instrument_id(), cmd.bar_type);
-        self.schedule_bar_streams()
+        execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
+            let spec = bar_type.spec();
+            anyhow::ensure!(
+                spec.aggregation == BarAggregation::Minute && spec.step.get() == 1,
+                "T-Bank data client supports only 1-minute bars in v1"
+            );
+            let id = bar_type.instrument_id();
+            if let Some(existing) = self.bar_subscriptions.get(&id) {
+                anyhow::ensure!(
+                    *existing == bar_type,
+                    "T-Bank already has a different bar subscription for {id}"
+                );
+                return Ok(());
+            }
+            self.bar_subscriptions.insert(id, bar_type);
+            if let Err(error) = self.schedule_bar_streams() {
+                self.bar_subscriptions.remove(&id);
+                return Err(error);
+            }
+            self.subscriptions
+                .subscribe_bars_1m_for_instrument(id, self.stream_id(id));
+            Ok(())
+        })
     }
 
     fn subscribe_book_depth(&mut self, cmd: SubscribeBookDepth) -> anyhow::Result<()> {
-        if cmd.book_type != BookType::L2_MBP {
-            anyhow::bail!("T-Bank data client supports only L2_MBP order book depth");
-        }
+        anyhow::ensure!(
+            cmd.book_type == BookType::L2_MBP,
+            "T-Bank data client supports only L2_MBP order book depth"
+        );
         let requested_depth = cmd.depth.map_or(DEPTH10_LEN, |depth| depth.get());
-        if !matches!(requested_depth, 1 | 10 | 20 | 30 | 40 | 50) {
-            anyhow::bail!("T-Bank supports order book depths 1, 10, 20, 30, 40, and 50");
-        }
+        anyhow::ensure!(
+            matches!(requested_depth, 1 | 10 | 20 | 30 | 40 | 50),
+            "T-Bank supports order book depths 1, 10, 20, 30, 40, and 50"
+        );
         let depth = requested_depth as i32;
-        self.order_book_depth_subscriptions
-            .insert(cmd.instrument_id, depth);
-        self.sync_nautilus_order_book_registry(cmd.instrument_id);
-        self.schedule_order_book_depth_stream(cmd.instrument_id, depth)
+        execute_instrument_subscriptions(&cmd.instrument_ids, |id| {
+            if self.order_book_depth_subscriptions.get(&id) != Some(&depth) {
+                self.schedule_order_book_depth_stream(id, depth)?;
+                self.order_book_depth_subscriptions.insert(id, depth);
+                self.sync_nautilus_order_book_registry(id);
+            }
+            Ok(())
+        })
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        self.quote_subscriptions.remove(&cmd.instrument_id);
-        self.sync_nautilus_order_book_registry(cmd.instrument_id);
-        self.schedule_quote_stream()
+        execute_instrument_subscriptions(&cmd.instrument_ids, |id| {
+            if self.quote_subscriptions.remove(&id) {
+                if let Err(error) = self.schedule_quote_stream() {
+                    self.quote_subscriptions.insert(id);
+                    return Err(error);
+                }
+                self.sync_nautilus_order_book_registry(id);
+            }
+            Ok(())
+        })
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        let stream_id = self.stream_id(cmd.instrument_id);
-        self.trade_subscriptions.remove(&cmd.instrument_id);
-        self.subscriptions
-            .unsubscribe_trades_for_instrument(cmd.instrument_id, stream_id);
-        self.abort_stream(&stream_task_key(
-            "trades",
-            &cmd.instrument_id.to_string(),
-            "all",
-        ))?;
-        Ok(())
+        execute_instrument_subscriptions(&cmd.instrument_ids, |id| {
+            self.abort_stream(&stream_task_key("trades", &id.to_string(), "all"))?;
+            self.trade_subscriptions.remove(&id);
+            self.subscriptions
+                .unsubscribe_trades_for_instrument(id, self.stream_id(id));
+            Ok(())
+        })
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
-        let instrument_id = cmd.bar_type.instrument_id();
-        let stream_id = self.stream_id(instrument_id);
-        self.bar_subscriptions.remove(&cmd.bar_type.instrument_id());
-        self.subscriptions
-            .unsubscribe_bars_1m_for_instrument(instrument_id, stream_id);
-        self.schedule_bar_streams()
+        execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
+            let id = bar_type.instrument_id();
+            if self.bar_subscriptions.get(&id) == Some(&bar_type) {
+                self.bar_subscriptions.remove(&id);
+                if let Err(error) = self.schedule_bar_streams() {
+                    self.bar_subscriptions.insert(id, bar_type);
+                    return Err(error);
+                }
+                self.subscriptions
+                    .unsubscribe_bars_1m_for_instrument(id, self.stream_id(id));
+            }
+            Ok(())
+        })
     }
 
     fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
-        self.order_book_depth_subscriptions
-            .remove(&cmd.instrument_id);
-        let stream_id = self.stream_id(cmd.instrument_id);
-        self.subscriptions
-            .unsubscribe_depth_books_for_instrument(cmd.instrument_id, stream_id);
-        self.sync_nautilus_order_book_registry(cmd.instrument_id);
-        self.abort_stream(&stream_task_key(
-            "book_depth",
-            &cmd.instrument_id.to_string(),
-            "book",
-        ))?;
-        Ok(())
+        execute_instrument_subscriptions(&cmd.instrument_ids, |id| {
+            self.abort_stream(&stream_task_key("book_depth", &id.to_string(), "book"))?;
+            self.order_book_depth_subscriptions.remove(&id);
+            self.sync_nautilus_order_book_registry(id);
+            Ok(())
+        })
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
@@ -212,7 +245,7 @@ impl DataClient for TbankDataClient {
         let request_timeout = self.config.historical_candle_request_timeout;
         let indicative_instruments = self.config.indicative_instruments.clone();
         let sender = get_data_event_sender();
-        let instrument_id = request.instrument_id;
+        let instrument_id = request.single_instrument_id()?;
         let resolved_client_id = request.client_id.unwrap_or_else(|| self.client_id());
         let request_id = request.request_id;
         let start = request.start;
@@ -297,7 +330,7 @@ impl DataClient for TbankDataClient {
         let retries = self.config.historical_candle_max_retries as usize;
         let indicative_instruments = self.config.indicative_instruments.clone();
         let sender = get_data_event_sender();
-        let bar_type = request.bar_type;
+        let bar_type = request.single_bar_type()?;
         let instrument_id = bar_type.instrument_id();
         let interval = crate::historical::TbankBarInterval::try_from_bar_type(bar_type)?;
         let resolved_client_id = request.client_id.unwrap_or_else(|| self.client_id());

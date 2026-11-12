@@ -1,7 +1,7 @@
 # T-Bank adapter capability matrix
 
 This matrix describes the current source of `tbank-nt-community` (based on `0.4.0`) with NautilusTrader
-`v2.0.0rc7`.
+`v2.0.0rc9`.
 
 ## Instruments and data
 
