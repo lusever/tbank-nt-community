@@ -14,8 +14,9 @@ This matrix describes the current source of `tbank-nt-community` (based on `0.4.
 | Live quotes and trades | Supported | T-Bank market-data streams; quote subscriptions are chunked to 300 instruments per stream and prices use canonical instrument precision |
 | Order book snapshots | Supported | `SubscribeBookDepth`; supports T-Bank depths 1, 10, 20, 30, 40, and 50 levels; defaults to 10; native venue deltas are unavailable |
 | External bars | Supported | Sparse streamed candles; pre-ACK data is buffered, an acknowledged stream opens before startup/reconnect `GetCandles` recovery, and all recovery shares one request limiter |
-| Historical bars | Supported | `RequestBars` on the main data client; requests are chunked |
-| Historical trades | Limited | `RequestTrades` on the main data client; T-Bank guarantees only the recent `GetLastTrades` window |
+| Historical bars | Supported | One `BarType` per `RequestBars`; use `request_group` to track multiple requests |
+| Historical trades | Limited | `RequestTrades` supports instrument lists within the last hour; `limit` requires one instrument |
+| History catalog write-back | Limited | `update_catalog=true` supports verified external LAST bars through the Nautilus `DataEngine` with `streaming`. Parquet rc9 records empty coverage adjacent to an existing file. Trade history cannot certify complete coverage. |
 | Archive/catalog downloader | Not provided | Archive ingestion and catalog policy belong in consumers |
 | OTC, dealer, ETF, bonds, currencies | Not supported | These instrument families remain outside the adapter scope |
 

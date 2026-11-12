@@ -1437,7 +1437,7 @@ async fn reset_requires_observing_session_task_failure() {
         .lock()
         .unwrap()
         .insert("SBER_TQBR.MOEX".to_string(), sber_metadata());
-    let task = client
+    client
         .task_owner
         .session_tasks
         .spawner()
@@ -1446,9 +1446,14 @@ async fn reset_requires_observing_session_task_failure() {
             panic!("session worker failed");
         })
         .unwrap();
-    while !task.is_finished() {
-        tokio::task::yield_now().await;
-    }
+    // In rc9 the TaskRef is marked finished before the group releases its token.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !client.task_owner.session_tasks.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session task did not leave the group");
 
     assert!(ExecutionClient::reset(&mut client).is_err());
     assert!(!client.runtime.instruments.lock().unwrap().is_empty());

@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarType, TradeTick},
-    enums::{AggressorSide, BarAggregation},
+    enums::{AggressorSide, BarAggregation, PriceType},
     identifiers::InstrumentId,
     types::{Price, Quantity},
 };
@@ -126,6 +126,29 @@ impl TbankBarInterval {
         }
     }
 
+    // GetCandles limits from the pinned marketdata.proto. For calendar-month
+    // and year limits use conservative fixed durations.
+    fn catalog_window(self) -> (ChronoDuration, i32) {
+        let (duration, max_rows) = match self {
+            Self::Sec5 => (ChronoDuration::minutes(200), 2500),
+            Self::Sec10 => (ChronoDuration::minutes(200), 1250),
+            Self::Sec30 => (ChronoDuration::hours(20), 2500),
+            Self::Min1 => (ChronoDuration::days(1), 2400),
+            Self::Min2 => (ChronoDuration::days(1), 1200),
+            Self::Min3 => (ChronoDuration::days(1), 750),
+            Self::Min5 => (ChronoDuration::weeks(1), 2400),
+            Self::Min10 => (ChronoDuration::weeks(1), 1200),
+            Self::Min15 => (ChronoDuration::weeks(3), 2400),
+            Self::Min30 => (ChronoDuration::weeks(3), 1200),
+            Self::Hour1 | Self::Hour2 => (ChronoDuration::days(84), 2400),
+            Self::Hour4 => (ChronoDuration::days(84), 700),
+            Self::Day1 => (ChronoDuration::days(6 * 365), 2400),
+        };
+        let period = ChronoDuration::nanoseconds(self.duration_nanos() as i64);
+        // Leave room below the row cap even if both window endpoints contribute.
+        (duration.min(period * (max_rows - 2)), max_rows)
+    }
+
     pub(crate) fn try_from_bar_type(bar_type: BarType) -> anyhow::Result<Self> {
         let spec = bar_type.spec();
         match (spec.aggregation, spec.step.get()) {
@@ -151,6 +174,7 @@ impl TbankBarInterval {
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedTbankInstrument {
     pub(crate) instrument_uid: String,
+    figi: String,
     pub(crate) ticker: String,
     pub(crate) class_code: String,
     pub(crate) instrument_kind: String,
@@ -292,6 +316,7 @@ impl TbankHistoricalClient {
             .with_context(|| format!("FindInstrument returned no {ticker} index"))?;
         Ok(ResolvedTbankInstrument {
             instrument_uid: instrument.uid,
+            figi: instrument.figi,
             ticker: instrument.ticker,
             class_code: instrument.class_code,
             instrument_kind: "index".to_string(),
@@ -321,9 +346,48 @@ impl TbankHistoricalClient {
         to: DateTime<Utc>,
         limit: Option<usize>,
         retries: usize,
-    ) -> anyhow::Result<Vec<Bar>> {
-        let chunks = candle_chunks(from, to, interval)?;
-        let mut bars = Vec::new();
+        update_catalog: bool,
+        bars: &mut Vec<Bar>,
+    ) -> anyhow::Result<()> {
+        if update_catalog {
+            ensure!(
+                limit.is_none(),
+                "Catalog write-back requires an unlimited request"
+            );
+            ensure!(
+                bar_type.is_externally_aggregated()
+                    && bar_type.spec().price_type == PriceType::Last,
+                "GetCandles can certify coverage only for external LAST bars"
+            );
+        }
+        let (chunk_size, max_rows) = interval.catalog_window();
+        let period = ChronoDuration::nanoseconds(interval.duration_nanos() as i64);
+        let offset = match self.timestamp_mode {
+            TbankCandleTimestampMode::StartAsBarEnd => period,
+            TbankCandleTimestampMode::StartAsBarStart => ChronoDuration::zero(),
+        };
+        let (start, end, chunk_size, padding) = if update_catalog {
+            // Translate Nautilus event bounds into candle open times. Pad each
+            // edge so exact timestamps survive either endpoint convention.
+            let padding = ChronoDuration::nanoseconds(1);
+            (
+                from - offset,
+                to - offset,
+                chunk_size - padding * 2,
+                padding,
+            )
+        } else {
+            (from, to, interval.grpc_chunk(), ChronoDuration::zero())
+        };
+        let chunks = if update_catalog && start == end {
+            vec![(start, end)]
+        } else {
+            candle_chunks(start, end, chunk_size)?
+        };
+        let latest_close = end + period;
+        let fetch_started = Utc::now();
+        let event_bounds = datetime_to_nanos(from)?..=datetime_to_nanos(to)?;
+
         for (chunk_from, chunk_to) in chunks {
             let remaining = limit.map(|limit| limit.saturating_sub(bars.len()));
             if remaining == Some(0) {
@@ -332,12 +396,20 @@ impl TbankHistoricalClient {
             let request = GetCandlesRequest {
                 #[allow(deprecated)]
                 figi: None,
-                from: Some(unix_nanos_to_timestamp(datetime_to_nanos(chunk_from)?)?),
-                to: Some(unix_nanos_to_timestamp(datetime_to_nanos(chunk_to)?)?),
+                from: Some(unix_nanos_to_timestamp(datetime_to_nanos(
+                    chunk_from - padding,
+                )?)?),
+                to: Some(unix_nanos_to_timestamp(datetime_to_nanos(
+                    chunk_to + padding,
+                )?)?),
                 interval: interval.as_proto() as i32,
                 instrument_id: Some(resolved.stream_id()),
                 candle_source_type: Some(get_candles_request::CandleSource::Exchange as i32),
-                limit: remaining.and_then(|value| i32::try_from(value).ok()),
+                limit: if update_catalog {
+                    Some(max_rows)
+                } else {
+                    remaining.and_then(|value| i32::try_from(value).ok())
+                },
             };
             let mut attempt = 0usize;
             let response = loop {
@@ -365,36 +437,71 @@ impl TbankHistoricalClient {
                         );
                         tokio::time::sleep(delay).await;
                     }
-                    Err(status) => return Err(status.into()),
+                    Err(status) => {
+                        return Err(anyhow::Error::from(status)).with_context(|| {
+                            format!(
+                                "GetCandles failed for {bar_type} in [{chunk_from}, {chunk_to}]"
+                            )
+                        });
+                    }
                 }
             };
-            let force_zero_volume = resolved.instrument_kind == "index";
-            let mut chunk_bars = response
-                .candles
-                .iter()
-                .map(|candle| {
-                    historic_candle_to_bar(
-                        candle,
-                        bar_type,
-                        interval,
-                        self.timestamp_mode,
-                        force_zero_volume,
-                        resolved.lot_size,
-                        resolved.price_precision,
-                        resolved.quantity_precision,
+            let at_cap = response.candles.len() >= max_rows as usize;
+            let mut failure = None;
+            for candle in &response.candles {
+                match historic_candle_to_bar(
+                    candle,
+                    bar_type,
+                    interval,
+                    self.timestamp_mode,
+                    resolved.instrument_kind == "index",
+                    resolved.lot_size,
+                    resolved.price_precision,
+                    resolved.quantity_precision,
+                ) {
+                    Ok(bar) => {
+                        if update_catalog
+                            && !event_bounds.contains(&i128::from(bar.ts_event.as_u64()))
+                        {
+                            continue;
+                        }
+                        if update_catalog && !candle.is_complete {
+                            failure.get_or_insert_with(|| {
+                                anyhow::anyhow!(
+                                    "GetCandles returned an open candle at {}",
+                                    bar.ts_event
+                                )
+                            });
+                        }
+                        bars.push(bar);
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+            if update_catalog && at_cap {
+                failure.get_or_insert_with(|| {
+                    anyhow::anyhow!(
+                        "GetCandles reached its row cap ({max_rows}); response may be truncated"
                     )
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            bars.append(&mut chunk_bars);
+                });
+            }
+            if let Some(error) = failure {
+                return Err(error).with_context(|| {
+                    format!("GetCandles returned invalid or incomplete data for {bar_type} in [{chunk_from}, {chunk_to}]")
+                });
+            }
         }
-        dedup_bars(&mut bars);
-        if let Some(limit) = limit {
-            bars.truncate(limit);
-        }
-        Ok(bars)
+        // Even a sparse or empty reply cannot certify a window where a candle
+        // might still form. Use the time before the first RPC as the cutoff.
+        ensure!(
+            !update_catalog || latest_close <= fetch_started,
+            "GetCandles window for {bar_type} can include a candle that has not closed"
+        );
+        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_trades(
         &mut self,
         resolved: &ResolvedTbankInstrument,
@@ -402,12 +509,19 @@ impl TbankHistoricalClient {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         source: TbankTradeSource,
-        limit: Option<usize>,
-    ) -> anyhow::Result<Vec<TradeTick>> {
+        trades: &mut Vec<TradeTick>,
+    ) -> anyhow::Result<()> {
         let now = Utc::now();
-        if from < now - ChronoDuration::hours(1) {
-            bail!("GetLastTrades supports only the last guaranteed hour");
-        }
+        ensure!(
+            from <= to,
+            "invalid GetLastTrades range: start is after end"
+        );
+        ensure!(
+            from >= now - ChronoDuration::hours(1) && to <= now,
+            "GetLastTrades supports only the last hour"
+        );
+        let from = datetime_to_nanos(from)?;
+        let to = datetime_to_nanos(to)?;
         let response = self
             .clients
             .market_data
@@ -415,36 +529,49 @@ impl TbankHistoricalClient {
                 GetLastTradesRequest {
                     #[allow(deprecated)]
                     figi: None,
-                    from: Some(unix_nanos_to_timestamp(datetime_to_nanos(from)?)?),
-                    to: Some(unix_nanos_to_timestamp(datetime_to_nanos(to)?)?),
+                    from: Some(unix_nanos_to_timestamp(from)?),
+                    to: Some(unix_nanos_to_timestamp(to)?),
                     instrument_id: Some(resolved.stream_id()),
                     trade_source: source.as_proto() as i32,
                 },
                 self.request_timeout,
             ))
-            .await?
+            .await
+            .with_context(|| format!("GetLastTrades failed for {instrument_id} in [{from}, {to}]"))?
             .into_inner();
-        let price_precision = resolved.price_precision;
-        let quantity_precision = resolved.quantity_precision;
-        let mut trades = response
-            .trades
-            .iter()
-            .map(|trade| {
+        let mut failure = None;
+        for trade in &response.trades {
+            let result = (|| {
+                ensure!(
+                    (trade.instrument_uid.is_empty()
+                        || resolved.instrument_uid.is_empty()
+                        || trade.instrument_uid == resolved.instrument_uid)
+                        && (trade.figi.is_empty()
+                            || resolved.figi.is_empty()
+                            || trade.figi == resolved.figi),
+                    "GetLastTrades returned a different instrument for {instrument_id}"
+                );
                 tbank_trade_to_nautilus(
                     trade,
                     instrument_id,
                     resolved.preserve_requested_instrument_id,
                     resolved.lot_size,
-                    price_precision,
-                    quantity_precision,
+                    resolved.price_precision,
+                    resolved.quantity_precision,
                 )
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        trades.sort_by_key(|trade| trade.ts_event.as_u64());
-        if let Some(limit) = limit {
-            trades.truncate(limit);
+            })();
+            match result {
+                Ok(tick) => {
+                    if (from..=to).contains(&i128::from(tick.ts_event.as_u64())) {
+                        trades.push(tick);
+                    }
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
-        Ok(trades)
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -465,6 +592,7 @@ fn resolved_from_metadata(
     ensure_canonical_resolution(requested, &metadata.instrument_id)?;
     Ok(ResolvedTbankInstrument {
         instrument_uid: metadata.instrument_uid,
+        figi: metadata.figi,
         ticker: metadata.ticker,
         class_code: metadata.class_code,
         instrument_kind: instrument_kind.to_string(),
@@ -493,12 +621,11 @@ fn ensure_canonical_resolution(
 fn candle_chunks(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-    interval: TbankBarInterval,
+    chunk: ChronoDuration,
 ) -> anyhow::Result<Vec<(DateTime<Utc>, DateTime<Utc>)>> {
     if from >= to {
         bail!("invalid historical range: from must be before to");
     }
-    let chunk = interval.grpc_chunk();
     let mut result = Vec::new();
     let mut cursor = from;
     while cursor < to {
@@ -597,7 +724,7 @@ fn tbank_trade_to_nautilus(
     } else {
         requested_instrument_id
     };
-    Ok(TradeTick::new(
+    TradeTick::new_checked(
         instrument_id,
         price_from_decimal(
             quotation_to_decimal(trade.price.as_ref().context("missing trade price")?),
@@ -612,7 +739,7 @@ fn tbank_trade_to_nautilus(
         nautilus_model::identifiers::TradeId::new(format!("{}", ts.as_u64())),
         ts,
         ts,
-    ))
+    )
 }
 
 fn quantity_from_lots(value_lots: i64, lot_size: u32, precision: u8) -> anyhow::Result<Quantity> {
@@ -627,9 +754,9 @@ fn quantity_from_lots(value_lots: i64, lot_size: u32, precision: u8) -> anyhow::
 
 fn price_from_decimal(value: Decimal, precision: u8) -> anyhow::Result<Price> {
     let rounded = value.round_dp(u32::from(precision));
-    Ok(Price::from(
-        format!("{rounded:.precision$}", precision = usize::from(precision)).as_str(),
-    ))
+    format!("{rounded:.precision$}", precision = usize::from(precision))
+        .parse::<Price>()
+        .map_err(anyhow::Error::msg)
 }
 
 fn quantity_from_i64(value: i64, precision: u8) -> anyhow::Result<Quantity> {
@@ -643,7 +770,7 @@ fn datetime_to_nanos(value: DateTime<Utc>) -> anyhow::Result<i128> {
         .context("timestamp out of range")
 }
 
-fn dedup_bars(bars: &mut Vec<Bar>) {
+pub(crate) fn dedup_bars(bars: &mut Vec<Bar>) {
     bars.sort_by_key(|bar| bar.ts_event.as_u64());
     let mut seen = BTreeSet::new();
     bars.retain(|bar| seen.insert(bar.ts_event.as_u64()));
@@ -663,7 +790,7 @@ mod tests {
     fn chunks_minute_candles_by_day() {
         let from = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let to = Utc.with_ymd_and_hms(2025, 1, 3, 12, 0, 0).unwrap();
-        let chunks = candle_chunks(from, to, TbankBarInterval::Min1).unwrap();
+        let chunks = candle_chunks(from, to, TbankBarInterval::Min1.grpc_chunk()).unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(
             chunks[0],

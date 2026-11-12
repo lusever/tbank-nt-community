@@ -79,8 +79,9 @@ zeroize = "1"
 
 [dev-dependencies]
 nautilus-persistence = { version = "=0.68.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc9" }
-nautilus-data = { version = "=0.68.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc9" }
+nautilus-data = { version = "=0.68.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc9", features = ["streaming"] }
 nautilus-model = { version = "=0.68.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc9", features = ["test-support"] }
+tempfile = "3"
 tokio-stream = { version = "0.1.19", features = ["net"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "std"] }
 tonic = { version = "0.14.6", default-features = false, features = ["router", "server"] }

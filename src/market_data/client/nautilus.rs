@@ -1,5 +1,26 @@
 use super::*;
-use nautilus_common::clients::{execute_bar_subscriptions, execute_instrument_subscriptions};
+use nautilus_common::{
+    clients::{execute_bar_subscriptions, execute_instrument_subscriptions},
+    messages::data::{DataRequestFailed, DataResponseEnvelope, IntoInstrumentIds},
+};
+
+fn history_event(
+    response: DataResponse,
+    failure: Option<String>,
+    update_catalog: bool,
+) -> DataEvent {
+    if let Some(reason) = failure {
+        DataEvent::RequestFailed(DataRequestFailed {
+            request_id: *response.correlation_id(),
+            reason,
+            response: Some(response),
+        })
+    } else if update_catalog {
+        DataEvent::ResponseEnvelope(DataResponseEnvelope::new(response, true, None))
+    } else {
+        DataEvent::Response(response)
+    }
+}
 
 fn request_timestamp_to_datetime(
     timestamp: jiff::Timestamp,
@@ -9,6 +30,20 @@ fn request_timestamp_to_datetime(
     let sub_nanos = u32::try_from(nanos.rem_euclid(1_000_000_000))?;
     chrono::DateTime::from_timestamp(seconds, sub_nanos)
         .ok_or_else(|| anyhow::anyhow!("historical request timestamp is out of range"))
+}
+
+fn request_bounds(
+    start: Option<jiff::Timestamp>,
+    end: Option<jiff::Timestamp>,
+) -> anyhow::Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    Ok((
+        request_timestamp_to_datetime(
+            start.ok_or_else(|| anyhow::anyhow!("historical request requires start"))?,
+        )?,
+        request_timestamp_to_datetime(
+            end.ok_or_else(|| anyhow::anyhow!("historical request requires end"))?,
+        )?,
+    ))
 }
 
 impl TbankDataClient {
@@ -234,6 +269,11 @@ impl DataClient for TbankDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let instrument_ids = request.instrument_ids.into_instrument_ids()?;
+        anyhow::ensure!(
+            instrument_ids.len() == 1 || request.limit.is_none(),
+            "A record limit is unsupported for multi-instrument requests",
+        );
         let spawner = self.session_tasks.spawner().map_err(anyhow::Error::from)?;
         let clients = self
             .grpc_clients_ref()
@@ -245,13 +285,15 @@ impl DataClient for TbankDataClient {
         let request_timeout = self.config.historical_candle_request_timeout;
         let indicative_instruments = self.config.indicative_instruments.clone();
         let sender = get_data_event_sender();
-        let instrument_id = request.single_instrument_id()?;
         let resolved_client_id = request.client_id.unwrap_or_else(|| self.client_id());
         let request_id = request.request_id;
         let start = request.start;
         let end = request.end;
         let limit = request.limit.map(|limit| limit.get());
         let params = request.params;
+        let update_catalog = params
+            .as_ref()
+            .is_some_and(|params| params.get_bool("update_catalog") == Some(true));
         let start_nanos = start
             .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
             .transpose()?;
@@ -264,53 +306,66 @@ impl DataClient for TbankDataClient {
             "historical-trades-request",
             TaskCancellation::new(),
             async move {
-                let result = async {
-                    let mut historical = crate::historical::TbankHistoricalClient::new(
-                        clients,
-                        timestamp_mode,
-                        request_timeout,
-                        indicative_instruments,
-                    );
-                    let resolved = historical.resolve_instrument(instrument_id).await?;
-                    let from = request_timestamp_to_datetime(
-                        start.ok_or_else(|| anyhow::anyhow!("request_trades requires start"))?,
-                    )?;
-                    let to = request_timestamp_to_datetime(
-                        end.ok_or_else(|| anyhow::anyhow!("request_trades requires end"))?,
-                    )?;
-                    historical
-                        .request_trades(
-                            &resolved,
-                            instrument_id,
-                            from,
-                            to,
-                            crate::historical::DEFAULT_TRADE_SOURCE,
-                            limit,
-                        )
-                        .await
-                }
-                .await;
-
-                match result {
-                    Ok(trades) => {
-                        let response = DataResponse::Trades(TradesResponse::new(
-                            request_id,
-                            resolved_client_id,
-                            instrument_id,
-                            trades,
-                            start_nanos,
-                            end_nanos,
-                            now_unix_nanos(),
-                            params,
-                        ));
-                        publication.if_current(session_generation, || {
-                            if let Err(error) = sender.send(DataEvent::Response(response)) {
-                                tracing::error!(%error, "failed to publish T-Bank trades response");
+                let mut trades = Vec::new();
+                let mut failures = Vec::new();
+                match request_bounds(start, end) {
+                    Ok((from, to)) => {
+                        let mut historical = crate::historical::TbankHistoricalClient::new(
+                            clients,
+                            timestamp_mode,
+                            request_timeout,
+                            indicative_instruments,
+                        );
+                        for &instrument_id in &instrument_ids {
+                            let result = async {
+                                let resolved = historical.resolve_instrument(instrument_id).await?;
+                                historical
+                                    .request_trades(
+                                        &resolved,
+                                        instrument_id,
+                                        from,
+                                        to,
+                                        crate::historical::DEFAULT_TRADE_SOURCE,
+                                        &mut trades,
+                                    )
+                                    .await
                             }
-                        });
+                            .await;
+                            if let Err(error) = result {
+                                failures.push(format!("{instrument_id}: {error:#}"));
+                            }
+                        }
                     }
-                    Err(error) => tracing::error!(%error, "T-Bank request_trades failed"),
+                    Err(error) => failures.push(format!("{instrument_ids:?}: {error:#}")),
                 }
+
+                trades.sort_by_key(|trade| trade.ts_event);
+                if let Some(limit) = limit {
+                    trades.truncate(limit);
+                }
+                if update_catalog {
+                    failures.push(
+                        "GetLastTrades does not certify complete coverage for catalog write-back"
+                            .to_string(),
+                    );
+                }
+                let response = DataResponse::Trades(TradesResponse::new(
+                    request_id,
+                    resolved_client_id,
+                    instrument_ids,
+                    trades,
+                    start_nanos,
+                    end_nanos,
+                    now_unix_nanos(),
+                    params,
+                ));
+                let failure = (!failures.is_empty()).then(|| failures.join("; "));
+                let event = history_event(response, failure, update_catalog);
+                publication.if_current(session_generation, || {
+                    if let Err(error) = sender.send(event) {
+                        tracing::error!(%error, "failed to publish T-Bank trades response");
+                    }
+                });
             },
         )?;
 
@@ -339,6 +394,9 @@ impl DataClient for TbankDataClient {
         let end = request.end;
         let limit = request.limit.map(|limit| limit.get());
         let params = request.params;
+        let update_catalog = params
+            .as_ref()
+            .is_some_and(|params| params.get_bool("update_catalog") == Some(true));
         let start_nanos = start
             .map(nautilus_core::datetime::try_datetime_to_unix_nanos)
             .transpose()?;
@@ -351,7 +409,9 @@ impl DataClient for TbankDataClient {
             "historical-bars-request",
             TaskCancellation::new(),
             async move {
+                let mut bars = Vec::new();
                 let result = async {
+                    let (from, to) = request_bounds(start, end)?;
                     let mut historical = crate::historical::TbankHistoricalClient::new(
                         clients,
                         timestamp_mode,
@@ -359,38 +419,43 @@ impl DataClient for TbankDataClient {
                         indicative_instruments,
                     );
                     let resolved = historical.resolve_instrument(instrument_id).await?;
-                    let from = request_timestamp_to_datetime(
-                        start.ok_or_else(|| anyhow::anyhow!("request_bars requires start"))?,
-                    )?;
-                    let to = request_timestamp_to_datetime(
-                        end.ok_or_else(|| anyhow::anyhow!("request_bars requires end"))?,
-                    )?;
                     historical
-                        .request_bars(&resolved, bar_type, interval, from, to, limit, retries)
+                        .request_bars(
+                            &resolved,
+                            bar_type,
+                            interval,
+                            from,
+                            to,
+                            limit,
+                            retries,
+                            update_catalog,
+                            &mut bars,
+                        )
                         .await
                 }
                 .await;
 
-                match result {
-                    Ok(bars) => {
-                        let response = DataResponse::Bars(BarsResponse::new(
-                            request_id,
-                            resolved_client_id,
-                            bar_type,
-                            bars,
-                            start_nanos,
-                            end_nanos,
-                            now_unix_nanos(),
-                            params,
-                        ));
-                        publication.if_current(session_generation, || {
-                            if let Err(error) = sender.send(DataEvent::Response(response)) {
-                                tracing::error!(%error, "failed to publish T-Bank bars response");
-                            }
-                        });
-                    }
-                    Err(error) => tracing::error!(%error, "T-Bank request_bars failed"),
+                crate::historical::dedup_bars(&mut bars);
+                if let Some(limit) = limit {
+                    bars.truncate(limit);
                 }
+                let response = DataResponse::Bars(BarsResponse::new(
+                    request_id,
+                    resolved_client_id,
+                    bar_type,
+                    bars,
+                    start_nanos,
+                    end_nanos,
+                    now_unix_nanos(),
+                    params,
+                ));
+                let failure = result.err().map(|error| format!("{error:#}"));
+                let event = history_event(response, failure, update_catalog);
+                publication.if_current(session_generation, || {
+                    if let Err(error) = sender.send(event) {
+                        tracing::error!(%error, "failed to publish T-Bank bars response");
+                    }
+                });
             },
         )?;
 
