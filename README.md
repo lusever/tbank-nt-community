@@ -19,7 +19,7 @@ Rust-нативный адаптер API T-Bank Invest для NautilusTrader.
 
 | tbank-nt-community | NautilusTrader | Rust | Контракты T-Bank |
 | --- | --- | --- | --- |
-| Текущий checkout | `v2.0.0rc9` | `1.99.1` | Release 1.51 |
+| Тег `v0.5.0` | `v2.0.0rc9` | `1.99.1` | Release 1.51 |
 | Тег `v0.4.0` | `v2.0.0rc7` | `1.99.0` | Release 1.51 |
 
 ## Область поддержки
@@ -58,13 +58,13 @@ Rust-нативный адаптер API T-Bank Invest для NautilusTrader.
 tbank-nt-community = { path = "../nautilus-tbank" }
 ```
 
-Для ранее выпущенной версии с Nautilus rc7 используйте тег:
+Для воспроизводимой Git-зависимости используйте неизменяемый тег релиза:
 
 ```toml
-tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.4.0" }
+tbank-nt-community = { git = "https://github.com/lusever/tbank-nt-community.git", tag = "v0.5.0" }
 ```
 
-Для текущего checkout закрепите все прямые зависимости Nautilus на теге `v2.0.0rc9` и версии `=0.68.0`. Смешивание источников из registry, ветки и Git-тега может создать
+Для версии `0.5.0` закрепите все прямые зависимости Nautilus на теге `v2.0.0rc9` и версии `=0.68.0`. Смешивание источников из registry, ветки и Git-тега может создать
 несовместимые дубликаты доменных типов Nautilus.
 
 Нативные trailing stop принимают значения Nautilus `TrailingOffsetType::Price` и
