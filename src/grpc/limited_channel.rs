@@ -667,8 +667,7 @@ mod tests {
         let error = tokio::time::timeout(Duration::from_secs(1), pending)
             .await
             .unwrap()
-            .err()
-            .expect("revoked call must fail locally");
+            .expect_err("revoked call must fail locally");
         assert_eq!(error.code(), tonic::Code::Cancelled);
         assert!(!marker.started());
         // The queue has just one slot. A stale cancelled ticket would prevent this new waiter.

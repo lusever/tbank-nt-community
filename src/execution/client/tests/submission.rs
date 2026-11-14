@@ -1347,7 +1347,7 @@ async fn cancel_event_for_broker_error(code: Code) -> Option<ExecutionEvent> {
             pending.causation_id = Some(command_id);
             order.apply(OrderEventAny::PendingCancel(pending)).unwrap();
         }
-        order.apply(OrderEventAny::CancelRejected(rejected.clone())).unwrap();
+        order.apply(OrderEventAny::CancelRejected(*rejected)).unwrap();
         assert_eq!(order.status(), OrderStatus::PendingCancel);
     }
     event
