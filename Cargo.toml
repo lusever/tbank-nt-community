@@ -60,7 +60,7 @@ nautilus-execution = { version = "=0.68.0", git = "https://github.com/nautechsys
 nautilus-live = { version = "=0.68.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc9" }
 nautilus-model = { version = "=0.68.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc9" }
 nautilus-serialization = { version = "=0.68.0", git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v2.0.0rc9", features = ["arrow"] }
-arrow = { version = "59.3.2", default-features = false }
+arrow = { version = "60.1.0", default-features = false }
 prost = { version = "0.14.4", default-features = false, features = ["std"] }
 prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
 rand = { version = "0.10.2", default-features = false, features = ["std", "thread_rng"] }
